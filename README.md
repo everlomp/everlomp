@@ -43,14 +43,12 @@ Folders that need to persist: /home /var/www /var/lib/mysql /usr/local/lsws
 
 Secrets used: key and 2fa
 
-Deploy with everlomp/everlomp:latest--vol1--var___www--vol2--var___lib___mysql--vol3--usr___local___lsws--sec1--2fa
-
 Get support and get involved at https://discord.gg/DAQszjKEBV (Evernode Community Discord)
 
 Dockerhub image: everlomp/everlomp:latest
 Github image: ghcr.io/everlomp/everlomp:latest
 
-Example deploy: evdevkit acquire -i ghcr.io/everlomp/everlomp:latest--vol1--var___www--vol2--var___lib___mysql--vol3--usr___local___lsws--sec1--2fa rAddr
+Example deploy: evdevkit acquire -i ghcr.io/everlomp/everlomp:latest--vol1--var___www--vol2--var___lib___mysql--vol3--usr___local___lsws--sec1--2fa--subdoman--mysubdomain rAddr
 
 Comment:
 This code has no guarantee, it's just a vision of how everlomp should look like. I hope someone forks this and make it better. For example, the decryption key secret could be loaded with less read permissions. Working on migration between servers could be worth while, it would be interesting to work on easily restoreable database snapshots. Processes should not leak any sensetive data, but I have not had time to review that.
