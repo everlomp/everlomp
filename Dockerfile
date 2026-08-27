@@ -663,14 +663,14 @@ COPY everlomp/everlomp-kopia-priv /usr/local/sbin/everlomp-kopia-priv
 
 RUN chown everlomp:everlomp \
         /home/everlomp/phpBB-3.3.17.zip \
-        /home/everlomp/wordpress-7.0.4.zip \
+        /home/everlomp/wordpress-6.6.7.zip \
         /home/everlomp/filegator_local.zip \
         /home/everlomp/external-installer-example.zip \
         /home/everlomp/terms.md && \
     chown -R everlomp:everlomp /home/everlomp/wpaddons && \
     chmod 0644 \
         /home/everlomp/phpBB-3.3.17.zip \
-        /home/everlomp/wordpress-7.0.4.zip \
+        /home/everlomp/wordpress-6.6.7.zip \
         /home/everlomp/filegator_local.zip \
         /home/everlomp/external-installer-example.zip \
         /home/everlomp/terms.md && \
