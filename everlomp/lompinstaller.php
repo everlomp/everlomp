@@ -30,8 +30,8 @@ $externalInstallerExampleFile = '/home/everlomp/external-installer-example.zip';
 $sshConfiguredFile       = '/var/www/.everlomp/ssh.configured';
 $contractEnvFile         = '/contract/env.vars';
 
-$scriptName = str_replace('\\', '/', (string) ($_SERVER['SCRIPT_NAME'] ?? '/lompinstaller.php'));
-$panelUrl = $scriptName !== '' && str_starts_with($scriptName, '/') ? $scriptName : '/lompinstaller.php';
+$scriptName = str_replace('\\', '/', (string) ($_SERVER['SCRIPT_NAME'] ?? '/install.php'));
+$panelUrl = $scriptName !== '' && str_starts_with($scriptName, '/') ? $scriptName : '/install.php';
 
 if (!isset($_SESSION['everlomp_key_replace_csrf']) || !is_string($_SESSION['everlomp_key_replace_csrf']) || strlen($_SESSION['everlomp_key_replace_csrf']) < 32) {
     $_SESSION['everlomp_key_replace_csrf'] = bin2hex(random_bytes(32));
@@ -1978,7 +1978,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $adminPassword = (string) ($_POST['drupal_admin_password'] ?? '');
         $adminPasswordConfirm = (string) ($_POST['drupal_admin_password_confirm'] ?? '');
         $dbMode = (string) ($_POST['db_mode'] ?? 'auto');
-        $localFileOnly = (string) ($_POST['local_file_only'] ?? '') === '1';
+        $installerSource = (string) ($_POST['drupal_installer_source'] ?? 'standard');
+        $localFileOnly = $installerSource === 'local';
+
+        $gitRepository = trim((string) ($_POST['drupal_git_repository'] ?? ''));
+        $gitRef = trim((string) ($_POST['drupal_git_ref'] ?? 'main'));
+        $gitDocumentRoot = trim((string) ($_POST['drupal_git_document_root'] ?? 'auto'));
+        $gitAuth = (string) ($_POST['drupal_git_auth'] ?? 'public');
+        $gitUsername = trim((string) ($_POST['drupal_git_username'] ?? ''));
+        $gitToken = (string) ($_POST['drupal_git_token'] ?? '');
 
         if ((string) ($_POST['accept_drupal_terms'] ?? '') !== '1') {
             $error = 'Accept the Drupal license terms before installing Drupal.';
@@ -2008,7 +2016,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $error = 'The Drupal admin passwords do not match.';
         } elseif (!in_array($dbMode, ['auto', 'existing'], true)) {
             $error = 'Invalid database mode.';
-        } else {
+        } elseif (!in_array($installerSource, ['standard', 'local', 'git'], true)) {
+            $error = 'Choose a valid Drupal installer source.';
+        } elseif ($installerSource === 'git') {
+            $gitParts = filter_var($gitRepository, FILTER_VALIDATE_URL) ? parse_url($gitRepository) : false;
+            if (
+                !is_array($gitParts)
+                || strtolower((string) ($gitParts['scheme'] ?? '')) !== 'https'
+                || trim((string) ($gitParts['host'] ?? '')) === ''
+                || isset($gitParts['user'])
+                || isset($gitParts['pass'])
+                || strlen($gitRepository) > 2048
+            ) {
+                $error = 'Enter a valid HTTPS Git repository URL without credentials in the URL.';
+            } elseif (
+                $gitRef === ''
+                || strlen($gitRef) > 255
+                || str_starts_with($gitRef, '-')
+                || preg_match('/[\s\r\n]/', $gitRef)
+            ) {
+                $error = 'Enter a valid Git branch, tag, or commit.';
+            } elseif (
+                $gitDocumentRoot === ''
+                || strlen($gitDocumentRoot) > 255
+                || str_starts_with($gitDocumentRoot, '/')
+                || preg_match('/[\r\n\0]/', $gitDocumentRoot)
+                || preg_match('#(?:^|/)\.\.(?:/|$)#', $gitDocumentRoot)
+            ) {
+                $error = 'Drupal document root must be auto or a relative path such as web or . and may not contain ..';
+            } elseif (!in_array($gitAuth, ['public', 'token'], true)) {
+                $error = 'Choose a valid Git repository access mode.';
+            } elseif ($gitAuth === 'token' && ($gitToken === '' || strlen($gitToken) > 4096 || preg_match('/[\r\n\0]/', $gitToken))) {
+                $error = 'Enter a valid access token for the private Git repository.';
+            } elseif ($gitAuth === 'token' && (strlen($gitUsername) > 255 || preg_match('/[\r\n\0]/', $gitUsername))) {
+                $error = 'Enter a valid Git username.';
+            }
+        }
+
+        if ($error === '') {
             $payload = [
                 'site_url'        => $siteUrl,
                 'site_name'       => $siteName,
@@ -2018,6 +2063,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'db_mode'         => $dbMode,
                 'local_file_only' => $localFileOnly,
             ];
+
+            if ($installerSource === 'git') {
+                $payload['git_repository'] = $gitRepository;
+                $payload['git_ref'] = $gitRef;
+                $payload['git_document_root'] = $gitDocumentRoot;
+                $payload['git_auth'] = $gitAuth;
+                $payload['git_username'] = $gitUsername;
+                $payload['git_token'] = $gitToken;
+            }
 
             if ($dbMode === 'auto') {
                 $dbName = trim((string) ($_POST['auto_db_name'] ?? 'drupal'));
@@ -2046,8 +2100,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             if ($error === '') {
+                $drupalHelper = $installerSource === 'git'
+                    ? '/usr/local/sbin/everlomp-drupal-git'
+                    : '/usr/local/sbin/everlomp-drupal';
+
                 [$code, $stdout, $stderr] = runEverlompHelper(
-                    '/usr/local/sbin/everlomp-drupal',
+                    $drupalHelper,
                     'install',
                     json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)
                 );
@@ -2802,10 +2860,64 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 </div>
 
 <h3>Installer source</h3>
+<div class="db-choice">
 <label class="db-option">
-<input type="checkbox" name="local_file_only" value="1">
-<span><strong>Install Drupal core with local file only</strong><span>Skip Drupal.org and install only from <code>/home/everlomp/drupal-11.4.5.tar.gz</code>. Otherwise Everlomp downloads 11.4.5, verifies its SHA-256, and falls back to the bundled archive on failure.</span></span>
+<input type="radio" name="drupal_installer_source" value="standard" checked onchange="toggleDrupalSource()">
+<span><strong>Standard Drupal installation</strong><span>Keep Everlomp's current installer path: download Drupal 11.4.5 from Drupal.org, verify its SHA-256, and fall back to the bundled archive if needed.</span></span>
 </label>
+<label class="db-option">
+<input type="radio" name="drupal_installer_source" value="local" onchange="toggleDrupalSource()">
+<span><strong>Bundled local archive only</strong><span>Skip Drupal.org and install only from <code>/home/everlomp/drupal-11.4.5.tar.gz</code>.</span></span>
+</label>
+<label class="db-option">
+<input type="radio" name="drupal_installer_source" value="git" onchange="toggleDrupalSource()">
+<span><strong>Git repository</strong><span>Fetch a Drupal 11 project from an HTTPS Git repository, run Composer when <code>composer.json</code> is present, then continue through this same Drupal installation process.</span></span>
+</label>
+</div>
+
+<div id="drupal-git-source-fields" class="hidden">
+<div class="split">
+<label>Repository URL
+<input type="url" id="drupal-git-repository" name="drupal_git_repository" maxlength="2048" placeholder="https://github.com/example/site.git">
+</label>
+<label>Branch / tag / commit
+<input type="text" name="drupal_git_ref" value="main" maxlength="255" placeholder="main">
+</label>
+</div>
+
+<label>Drupal document root
+<input type="text" name="drupal_git_document_root" value="auto" maxlength="255" placeholder="auto">
+<small>Leave this as <code>auto</code> to detect <code>web</code> first and then the repository root. You can still enter a custom relative path.</small>
+</label>
+
+<h4>Repository access</h4>
+<div class="db-choice">
+<label class="db-option">
+<input type="radio" name="drupal_git_auth" value="public" checked onchange="toggleDrupalGitAuth()">
+<span><strong>Public repository</strong><span>No Git credentials are stored.</span></span>
+</label>
+<label class="db-option">
+<input type="radio" name="drupal_git_auth" value="token" onchange="toggleDrupalGitAuth()">
+<span><strong>Private repository · access token</strong><span>The token uses Everlomp's existing secret storage mode: encrypted when the Everlomp key is enabled, plaintext secret storage when encryption is disabled.</span></span>
+</label>
+</div>
+
+<div id="drupal-git-token-fields" class="hidden">
+<div class="split">
+<label>Git username <small>(optional)</small>
+<input type="text" name="drupal_git_username" maxlength="255" placeholder="x-access-token">
+</label>
+<label>Access token
+<input type="password" id="drupal-git-token" name="drupal_git_token" maxlength="4096" autocomplete="new-password">
+</label>
+</div>
+<?php if ($keyMode === 'enabled'): ?>
+<div class="notice"><strong>Credential storage:</strong> the repository token will be encrypted at rest with the configured Everlomp secret key.</div>
+<?php else: ?>
+<div class="warning"><strong>Credential storage:</strong> Everlomp encryption is disabled, so the repository token will use the existing unencrypted secret-storage mode.</div>
+<?php endif; ?>
+</div>
+</div>
 
 <div class="warning"><strong>Email delivery:</strong> this Everlomp image does not include a local mail-transfer service. Configure an external mail provider/module after installation if the site needs reliable outbound mail.</div>
 
@@ -3154,7 +3266,7 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
 <div class="wizard-callout" style="margin-top:12px"><div class="wizard-callout-icon">↗</div><div class="host-rule"><strong>Domain-only access rule:</strong><br>Run this website through <code>https://your-domain.tld</code>. Never use <code>your-domain.tld:PORT</code>, a raw IP address, or a port-qualified public URL for Everlomp.</div></div>
 <div class="wizard-status-row"><span class="wizard-pill <?= $domainOnlyReady ? 'good' : 'warn' ?>">Domain host: <?= $domainOnlyReady ? 'valid' : 'fix required' ?></span><span class="wizard-pill <?= $realIpReady ? 'good' : 'warn' ?>">Real client IP: <?= $realIpReady ? 'active' : 'not ready' ?></span><span class="wizard-pill <?= $lswsPasswordConfigured ? 'good' : 'warn' ?>">WebAdmin: <?= $lswsPasswordConfigured ? 'secured' : 'password required' ?></span></div>
 <div class="meta"><div>Current Host header: <strong><?= h($host !== '' ? $host : 'missing') ?></strong></div><div>Direct/request peer: <strong><?= h($requestPeerIp !== '' ? $requestPeerIp : 'unknown') ?></strong></div><div>Forwarded client header: <strong><?= h($forwardedClientIp !== '' ? $forwardedClientIp : 'missing') ?></strong></div><?php if ($realIpTrustedProxy !== ''): ?><div>Trusted proxy peer: <strong><?= h($realIpTrustedProxy) ?></strong></div><?php endif; ?></div>
-<?php if (!$domainOnlyReady): ?><div class="warning"><strong>Do not continue on this URL.</strong> Open Everlomp through its final HTTPS domain without an explicit port. Example: <code>https://example.com/lompinstaller.php</code>, not <code>https://example.com:8443/lompinstaller.php</code>.</div><?php endif; ?>
+<?php if (!$domainOnlyReady): ?><div class="warning"><strong>Do not continue on this URL.</strong> Open Everlomp through its final HTTPS domain without an explicit port. Example: <code>https://example.com/install.php</code>, not <code>https://example.com:8443/install.php</code>.</div><?php endif; ?>
 <?php if (!$realIpReady): ?>
 <div class="wizard-divider"></div>
 <h3>Real client IP forwarding</h3>
@@ -3333,7 +3445,7 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <?php if ($kopiaConfigured): ?><div class="copy-field"><input data-dashboard-label="Kopia" data-dashboard-url id="finish-url-kopia" type="text" readonly value="<?= h($kopiaDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-kopia',this)">Copy</button></div><div class="copy-field"><input data-dashboard-label="Kopia Replication" data-dashboard-url id="finish-url-kopia-replication" type="text" readonly value="<?= h($kopiaReplicationDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-kopia-replication',this)">Copy</button></div><?php endif; ?>
 </div></div>
 </div>
-<div class="finish-warning" style="margin-top:16px"><h3>⚠ Remove the Everlomp installer when you are done.</h3><p>Leaving <strong>/lompinstaller.php</strong> exposed means leaving an administrative installation surface on the server. Removing it deletes the installer interface, the original redirecting bootstrap index if it is still unchanged, helper programs, installer metadata, bundled WordPress/Drupal/phpBB installation files, uploaded external-installer packages, and the installer’s passwordless web sudo permissions.</p><p><strong>It does not remove</strong> your installed primary application (WordPress, Drupal, phpBB, or external), FileGator, phpMyAdmin, OpenLiteSpeed, MariaDB, HotPocket, Kopia, SSH if you enabled it, or application/database data.</p><?php if ($primaryApp !== '' && $sshDecisionMade): ?><form method="post" onsubmit="return confirm('Permanently remove the Everlomp installer, helper programs, and bundled installation files? This cannot be undone from the installer.');"><input type="hidden" name="action" value="delete_everlomp_installfile"><div class="wizard-actions"><button type="submit">Permanently Remove Everlomp Installer</button></div></form><?php elseif ($primaryApp === ''): ?><div class="wizard-lock">Install a primary application before the installer can be removed.</div><?php else: ?><div class="wizard-lock">Choose whether SSH should be enabled before the installer can be removed.</div><?php endif; ?></div>
+<div class="finish-warning" style="margin-top:16px"><h3>⚠ Remove the Everlomp installer when you are done.</h3><p>Leaving <strong>/install.php</strong> exposed means leaving an administrative installation surface on the server. Removing it deletes the installer interface, the original redirecting bootstrap index if it is still unchanged, helper programs, installer metadata, bundled WordPress/Drupal/phpBB installation files, uploaded external-installer packages, and the installer’s passwordless web sudo permissions.</p><p><strong>It does not remove</strong> your installed primary application (WordPress, Drupal, phpBB, or external), FileGator, phpMyAdmin, OpenLiteSpeed, MariaDB, HotPocket, Kopia, SSH if you enabled it, or application/database data.</p><?php if ($primaryApp !== '' && $sshDecisionMade): ?><form method="post" onsubmit="return confirm('Permanently remove the Everlomp installer, helper programs, and bundled installation files? This cannot be undone from the installer.');"><input type="hidden" name="action" value="delete_everlomp_installfile"><div class="wizard-actions"><button type="submit">Permanently Remove Everlomp Installer</button></div></form><?php elseif ($primaryApp === ''): ?><div class="wizard-lock">Install a primary application before the installer can be removed.</div><?php else: ?><div class="wizard-lock">Choose whether SSH should be enabled before the installer can be removed.</div><?php endif; ?></div>
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(8)">← SSH</button><button type="button" class="secondary" onclick="showWizardStep(1)">Review from the beginning</button></div>
 </section>
 </main>
@@ -3805,7 +3917,38 @@ document.addEventListener('DOMContentLoaded', () => {
     const repositoryMode = document.getElementById('kopia-repository-mode');
     if (repositoryMode) updateKopiaRepositoryMode(repositoryMode);
     document.querySelectorAll('.schedule-mode-select').forEach(updateScheduleFields);
+    toggleDrupalSource();
+    toggleDrupalGitAuth();
 });
+
+function toggleDrupalSource(root = document) {
+    if (!root || !root.querySelector) return;
+    const selected = root.querySelector('input[name="drupal_installer_source"]:checked');
+    const gitFields = root.querySelector('#drupal-git-source-fields');
+    const repository = root.querySelector('#drupal-git-repository');
+    if (!selected || !gitFields) return;
+
+    const isGit = selected.value === 'git';
+    gitFields.classList.toggle('hidden', !isGit);
+    if (repository) repository.required = isGit;
+    if (isGit) toggleDrupalGitAuth(root);
+    else {
+        const token = root.querySelector('#drupal-git-token');
+        if (token) token.required = false;
+    }
+}
+
+function toggleDrupalGitAuth(root = document) {
+    if (!root || !root.querySelector) return;
+    const selected = root.querySelector('input[name="drupal_git_auth"]:checked');
+    const tokenFields = root.querySelector('#drupal-git-token-fields');
+    const token = root.querySelector('#drupal-git-token');
+    if (!selected || !tokenFields) return;
+
+    const usesToken = selected.value === 'token';
+    tokenFields.classList.toggle('hidden', !usesToken);
+    if (token) token.required = usesToken;
+}
 
 function toggleDb(prefix) {
     const checked = document.querySelector('input[name="db_mode"]:checked');
@@ -3875,6 +4018,9 @@ function wizardSummaryFieldLabel(field) {
         wp_admin_email:'WordPress admin email', wp_admin_password:'WordPress admin password',
         drupal_site_name:'Drupal site name', drupal_admin_user:'Drupal admin username',
         drupal_admin_email:'Drupal admin email', drupal_admin_password:'Drupal admin password',
+        drupal_installer_source:'Drupal installer source', drupal_git_repository:'Drupal Git repository',
+        drupal_git_ref:'Drupal Git ref', drupal_git_document_root:'Drupal document root',
+        drupal_git_auth:'Drupal Git access', drupal_git_username:'Drupal Git username', drupal_git_token:'Drupal Git token',
         phpbb_board_name:'phpBB board name', phpbb_board_description:'phpBB board description',
         phpbb_admin_user:'phpBB admin username', phpbb_admin_email:'phpBB admin email', phpbb_admin_password:'phpBB admin password',
         phpbb_smtp_enabled:'phpBB SMTP enabled', phpbb_smtp_host:'phpBB SMTP host', phpbb_smtp_port:'phpBB SMTP port',
@@ -4479,6 +4625,8 @@ function initializeDynamicControls(root = document) {
     if (offsite) toggleKopiaOffsite();
     const provider = root.querySelector ? root.querySelector('.offsite-provider-select') : null;
     if (provider) updateOffsiteProvider(provider);
+    toggleDrupalSource(root);
+    toggleDrupalGitAuth(root);
 }
 
 function escapeHtml(value) {
