@@ -1,0 +1,371 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${1:-}"
+WEB_ROOT="/var/www/html"
+INSTALL_FILE="$WEB_ROOT/install.php"
+DATABASE_CONFIGURED_FILE="/var/www/.everlomp/database.configured"
+LSWS_PASSWORD_CONFIGURED_FILE="/var/www/.everlomp/lsws-password.configured"
+PRIMARY_APP_FILE="/home/everlomp/primary-app"
+DRUPAL_INFO_FILE="/home/everlomp/drupal.json"
+SECRET_HELPER="/usr/local/sbin/everlomp-secret"
+DB_SECRET_STORE="/home/everlomp/secrets/drupal-db-password"
+DB_RUNTIME_FILE="/run/everlomp/web/drupal-db-password"
+LOCAL_SOCKET="/run/mysqld/mysqld.sock"
+PHP_BIN="/usr/local/lsws/lsphp85/bin/php"
+DRUPAL_RUNNER="/usr/local/lib/everlomp-drupal-runner.php"
+
+DRUPAL_VERSION="11.4.5"
+DRUPAL_ARCHIVE="drupal-${DRUPAL_VERSION}.tar.gz"
+DRUPAL_URL="https://ftp.drupal.org/files/projects/${DRUPAL_ARCHIVE}"
+DRUPAL_SHA256="c9444b40993332f4dd0e57968a20c6013ffcac384f3a3ea9f62e6a0bfddf24e6"
+DRUPAL_FALLBACK="/home/everlomp/${DRUPAL_ARCHIVE}"
+
+if [ "$ACTION" != "install" ]; then
+    echo "Usage: everlomp-drupal install" >&2
+    exit 64
+fi
+if [ ! -f "$DATABASE_CONFIGURED_FILE" ]; then
+    echo "Configure the MariaDB administrator account before installing Drupal." >&2
+    exit 2
+fi
+if [ ! -f "$LSWS_PASSWORD_CONFIGURED_FILE" ]; then
+    echo "Generate and save the OpenLiteSpeed WebAdmin password before installing Drupal." >&2
+    exit 3
+fi
+if [ -f "$PRIMARY_APP_FILE" ]; then
+    echo "A primary application is already installed." >&2
+    exit 4
+fi
+if [ ! -x "$PHP_BIN" ]; then
+    echo "OpenLiteSpeed PHP runtime is missing at $PHP_BIN." >&2
+    exit 5
+fi
+if [ ! -f "$DRUPAL_RUNNER" ]; then
+    echo "Drupal runner is missing at $DRUPAL_RUNNER." >&2
+    exit 6
+fi
+
+PAYLOAD="$(cat)"
+SITE_URL="$(printf '%s' "$PAYLOAD" | jq -er '.site_url')"
+SITE_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.site_name')"
+ADMIN_USER="$(printf '%s' "$PAYLOAD" | jq -er '.admin_user')"
+ADMIN_EMAIL="$(printf '%s' "$PAYLOAD" | jq -er '.admin_email')"
+ADMIN_PASS="$(printf '%s' "$PAYLOAD" | jq -er '.admin_password')"
+DB_MODE="$(printf '%s' "$PAYLOAD" | jq -er '.db_mode')"
+LOCAL_FILE_ONLY="$(printf '%s' "$PAYLOAD" | jq -r 'if .local_file_only == true then "1" else "0" end')"
+
+if [[ ! "$SITE_URL" =~ ^https://[^[:space:]]+$ ]]; then
+    echo "Invalid Drupal site URL." >&2
+    exit 7
+fi
+SITE_HOST="$(printf '%s' "$SITE_URL" | "$PHP_BIN" -r '$u=parse_url(stream_get_contents(STDIN)); if(!is_array($u)||empty($u["host"])||isset($u["port"])) exit(2); echo $u["host"];')" || {
+    echo "Drupal site URL must use an HTTPS domain without an explicit port." >&2
+    exit 7
+}
+if [ -z "$SITE_NAME" ] || [ "${#SITE_NAME}" -gt 120 ]; then
+    echo "Drupal site name is required and must be 120 characters or fewer." >&2
+    exit 8
+fi
+if [[ ! "$ADMIN_USER" =~ ^[A-Za-z0-9_.@-]{3,60}$ ]]; then
+    echo "Drupal admin username must be 3-60 characters." >&2
+    exit 9
+fi
+if [ "${#ADMIN_PASS}" -lt 12 ]; then
+    echo "Drupal admin password must be at least 12 characters." >&2
+    exit 10
+fi
+if [[ ! "$ADMIN_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+    echo "Invalid Drupal admin email." >&2
+    exit 11
+fi
+
+# Drupal 11 core requirements relevant to this image.
+MISSING_EXTENSIONS="$($PHP_BIN -r '
+$required=["date","dom","filter","gd","hash","json","openssl","pcre","pdo","pdo_mysql","session","SimpleXML","SPL","tokenizer","xml","zlib"];
+$missing=[]; foreach($required as $ext){ if(!extension_loaded($ext)) $missing[]=$ext; }
+echo implode(" ",$missing);
+')"
+if [ -n "$MISSING_EXTENSIONS" ]; then
+    echo "Drupal-required PHP extensions are missing: $MISSING_EXTENSIONS" >&2
+    exit 12
+fi
+
+TMP_BASE="$(mktemp -d /tmp/everlomp-drupal.XXXXXX)"
+TMP_ARCHIVE="$TMP_BASE/$DRUPAL_ARCHIVE"
+UNPACK_DIR="$TMP_BASE/unpack"
+SITE_DIR="$TMP_BASE/site"
+DB_NAME=""
+DB_USER=""
+DB_PASS=""
+DB_HOST=""
+DB_PORT=""
+DB_CREATED=0
+USER_CREATED=0
+FINISHED=0
+
+cleanup() {
+    status=$?
+    rm -rf "$TMP_BASE"
+    if [ "$FINISHED" -ne 1 ]; then
+        "$SECRET_HELPER" remove "$DB_SECRET_STORE" >/dev/null 2>&1 || true
+        rm -f "$DB_RUNTIME_FILE" || true
+    fi
+    if [ "$FINISHED" -ne 1 ] && [ "$DB_MODE" = "auto" ]; then
+        echo "[Everlomp] Drupal installation failed; rolling back auto-created database..." >&2
+        if [ "$DB_CREATED" -eq 1 ]; then
+            mariadb --protocol=socket --socket="$LOCAL_SOCKET" -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" || true
+        fi
+        if [ "$USER_CREATED" -eq 1 ]; then
+            mariadb --protocol=socket --socket="$LOCAL_SOCKET" -e "DROP USER IF EXISTS '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;" || true
+        fi
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+
+if [ "$DB_MODE" = "auto" ]; then
+    if [ ! -S "$LOCAL_SOCKET" ]; then
+        echo "Automatic database creation requires local MariaDB, but $LOCAL_SOCKET is unavailable." >&2
+        exit 13
+    fi
+    DB_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.database_name')"
+    if [[ ! "$DB_NAME" =~ ^[A-Za-z0-9_]{1,64}$ ]]; then
+        echo "Automatic database name may contain only letters, numbers, and underscores." >&2
+        exit 14
+    fi
+    INSTANCE_SUFFIX="site"
+    if [ -f /contract/env.vars ]; then
+        # shellcheck disable=SC1091
+        source /contract/env.vars
+        if [ -n "${INSTANCE_PUBKEY:-}" ]; then INSTANCE_SUFFIX="${INSTANCE_PUBKEY:0:8}"; fi
+    fi
+    INSTANCE_SUFFIX="$(printf '%s' "$INSTANCE_SUFFIX" | tr -cd 'A-Za-z0-9_' | cut -c1-12)"
+    [ -n "$INSTANCE_SUFFIX" ] || INSTANCE_SUFFIX="site"
+    DB_USER="dr_${INSTANCE_SUFFIX}_$(openssl rand -hex 2)"
+    DB_USER="${DB_USER:0:32}"
+    DB_PASS="$(openssl rand -hex 32)"
+    DB_HOST="localhost"
+    DB_PORT=""
+    DB_EXISTS="$(mariadb --protocol=socket --socket="$LOCAL_SOCKET" --batch --skip-column-names -e "SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';")"
+    if [ "$DB_EXISTS" != "0" ]; then
+        echo "Database '${DB_NAME}' already exists. Choose another name or use Existing Database mode." >&2
+        exit 15
+    fi
+    echo "[Everlomp] Creating Drupal database '${DB_NAME}'..."
+    mariadb --protocol=socket --socket="$LOCAL_SOCKET" <<SQL
+CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+SQL
+    DB_CREATED=1
+    mariadb --protocol=socket --socket="$LOCAL_SOCKET" <<SQL
+CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+    USER_CREATED=1
+elif [ "$DB_MODE" = "existing" ]; then
+    DB_HOST="$(printf '%s' "$PAYLOAD" | jq -er '.database_host')"
+    DB_PORT="$(printf '%s' "$PAYLOAD" | jq -r '.database_port // ""')"
+    DB_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.database_name')"
+    DB_USER="$(printf '%s' "$PAYLOAD" | jq -er '.database_user')"
+    DB_PASS="$(printf '%s' "$PAYLOAD" | jq -r '.database_password // ""')"
+    if [ -z "$DB_HOST" ] || [ "${#DB_HOST}" -gt 255 ]; then echo "Invalid database host." >&2; exit 16; fi
+    if [ -n "$DB_PORT" ] && { ! [[ "$DB_PORT" =~ ^[0-9]+$ ]] || [ "$DB_PORT" -lt 1 ] || [ "$DB_PORT" -gt 65535 ]; }; then echo "Invalid database port." >&2; exit 17; fi
+    if [ -z "$DB_NAME" ] || [ "${#DB_NAME}" -gt 64 ]; then echo "Invalid database name." >&2; exit 18; fi
+    if [ -z "$DB_USER" ] || [ "${#DB_USER}" -gt 128 ]; then echo "Invalid database username." >&2; exit 19; fi
+else
+    echo "Invalid database mode." >&2
+    exit 20
+fi
+
+validate_archive() {
+    local archive="$1"
+    [ -s "$archive" ] || return 1
+    echo "$DRUPAL_SHA256  $archive" | sha256sum -c - >/dev/null 2>&1 || return 1
+    tar -tzf "$archive" "drupal-${DRUPAL_VERSION}/core/lib/Drupal.php" >/dev/null 2>&1 || return 1
+    tar -tzf "$archive" "drupal-${DRUPAL_VERSION}/autoload.php" >/dev/null 2>&1 || return 1
+}
+
+USE_FALLBACK=0
+if [ "$LOCAL_FILE_ONLY" -eq 1 ]; then
+    echo "[Everlomp] Local-file-only mode selected."
+    USE_FALLBACK=1
+else
+    echo "[Everlomp] Fetching Drupal ${DRUPAL_VERSION} from Drupal.org..."
+    if curl -fL --retry 3 --connect-timeout 20 --max-time 240 "$DRUPAL_URL" -o "$TMP_ARCHIVE"; then
+        if validate_archive "$TMP_ARCHIVE"; then
+            echo "[Everlomp] Drupal download validated."
+        else
+            echo "[Everlomp] Drupal download failed SHA-256/structure validation; using bundled fallback." >&2
+            USE_FALLBACK=1
+        fi
+    else
+        echo "[Everlomp] Drupal download failed; using bundled fallback." >&2
+        USE_FALLBACK=1
+    fi
+fi
+
+if [ "$USE_FALLBACK" -eq 1 ]; then
+    if [ ! -f "$DRUPAL_FALLBACK" ]; then
+        echo "Bundled Drupal fallback archive is missing: $DRUPAL_FALLBACK" >&2
+        exit 21
+    fi
+    if ! validate_archive "$DRUPAL_FALLBACK"; then
+        echo "Bundled Drupal fallback archive is invalid or has the wrong SHA-256: $DRUPAL_FALLBACK" >&2
+        exit 22
+    fi
+    cp "$DRUPAL_FALLBACK" "$TMP_ARCHIVE"
+    echo "[Everlomp] Bundled Drupal ${DRUPAL_VERSION} fallback selected."
+fi
+
+mkdir -p "$UNPACK_DIR" "$SITE_DIR"
+tar -xzf "$TMP_ARCHIVE" -C "$UNPACK_DIR"
+cp -a "$UNPACK_DIR/drupal-${DRUPAL_VERSION}"/. "$SITE_DIR"/
+rm -rf "$UNPACK_DIR" "$TMP_ARCHIVE"
+
+mkdir -p "$SITE_DIR/sites/default/files"
+if [ ! -f "$SITE_DIR/sites/default/settings.php" ]; then
+    cp "$SITE_DIR/sites/default/default.settings.php" "$SITE_DIR/sites/default/settings.php"
+fi
+chmod 0775 "$SITE_DIR/sites/default" "$SITE_DIR/sites/default/files"
+chmod 0664 "$SITE_DIR/sites/default/settings.php"
+
+export EVERLOMP_DRUPAL_SITE_NAME="$SITE_NAME"
+export EVERLOMP_DRUPAL_ADMIN_USER="$ADMIN_USER"
+export EVERLOMP_DRUPAL_ADMIN_EMAIL="$ADMIN_EMAIL"
+export EVERLOMP_DRUPAL_ADMIN_PASSWORD="$ADMIN_PASS"
+export EVERLOMP_DRUPAL_DB_HOST="$DB_HOST"
+export EVERLOMP_DRUPAL_DB_PORT="$DB_PORT"
+export EVERLOMP_DRUPAL_DB_NAME="$DB_NAME"
+export EVERLOMP_DRUPAL_DB_USER="$DB_USER"
+export EVERLOMP_DRUPAL_DB_PASSWORD="$DB_PASS"
+
+echo "[Everlomp] Installing Drupal ${DRUPAL_VERSION}..."
+"$PHP_BIN" -d memory_limit=512M "$DRUPAL_RUNNER" install "$SITE_DIR"
+
+SETTINGS_FILE="$SITE_DIR/sites/default/settings.php"
+if [ ! -s "$SETTINGS_FILE" ]; then
+    echo "Drupal installer did not create sites/default/settings.php." >&2
+    exit 23
+fi
+
+printf '%s' "$DB_PASS" | "$SECRET_HELPER" write "$DB_SECRET_STORE"
+"$SECRET_HELPER" materialize-web "$DB_SECRET_STORE" "$DB_RUNTIME_FILE"
+
+python3 - "$SETTINGS_FILE" "$SITE_HOST" <<'PYSETTINGS'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+host = sys.argv[2]
+text = path.read_text()
+lines = text.splitlines(keepends=True)
+
+# Drupal's template contains a commented database example. Drupal 11's
+# SettingsEditor writes the real database connection with var_export(), which
+# normally produces "array (" syntax. Accept that as well as short-array syntax.
+assignment_re = re.compile(
+    r"^\s*\$databases\['default'\]\['default'\]\s*=\s*(?:array\s*\(|\[)\s*$"
+)
+password_re = re.compile(r"^(\s*)'password'\s*=>\s*.*?,\s*$")
+end_re = re.compile(r"^\s*(?:\)|\])\s*;\s*$")
+
+assignment_index = None
+for i, line in enumerate(lines):
+    if assignment_re.match(line.rstrip('\r\n')):
+        assignment_index = i
+        break
+
+if assignment_index is None:
+    raise SystemExit('Could not find the real Drupal default database settings assignment.')
+
+password_index = None
+password_indent = ''
+for i in range(assignment_index + 1, min(len(lines), assignment_index + 100)):
+    raw = lines[i].rstrip('\r\n')
+    match = password_re.match(raw)
+    if match:
+        password_index = i
+        password_indent = match.group(1)
+        break
+    if end_re.match(raw):
+        break
+
+if password_index is None:
+    raise SystemExit('Could not find Drupal database password inside the real database settings block.')
+
+newline = '\r\n' if lines[password_index].endswith('\r\n') else '\n'
+lines[password_index] = (
+    password_indent
+    + "'password' => trim((string) @file_get_contents('/run/everlomp/web/drupal-db-password'))," 
+    + newline
+)
+text = ''.join(lines)
+
+trusted = re.escape(host)
+marker = "\n// Everlomp Drupal hardening.\n"
+if marker not in text:
+    text += marker
+    text += "$settings['trusted_host_patterns'] = ['^" + trusted + "$'];\n"
+
+path.write_text(text)
+PYSETTINGS
+
+# Fail if the plaintext database password survived anywhere in settings.php.
+if grep -Fq -- "$DB_PASS" "$SETTINGS_FILE"; then
+    echo "Drupal database password remained in plaintext settings.php after secret rewrite." >&2
+    exit 24
+fi
+
+echo "[Everlomp] Publishing Drupal..."
+find "$WEB_ROOT" -mindepth 1 -maxdepth 1 ! -name install.php -exec rm -rf {} +
+cp -a "$SITE_DIR"/. "$WEB_ROOT"/
+
+chown -R nobody:nogroup "$WEB_ROOT"
+find "$WEB_ROOT" -type d -exec chmod 0755 {} \;
+find "$WEB_ROOT" -type f -exec chmod 0644 {} \;
+chmod 0755 "$WEB_ROOT/sites/default/files"
+chmod 0600 "$WEB_ROOT/sites/default/settings.php"
+if [ -f "$INSTALL_FILE" ]; then
+    chown nobody:nogroup "$INSTALL_FILE"
+    chmod 0644 "$INSTALL_FILE"
+fi
+
+"$SECRET_HELPER" materialize-web "$DB_SECRET_STORE" "$DB_RUNTIME_FILE"
+if ! runuser -u nobody -- test -r "$DB_RUNTIME_FILE"; then
+    echo "Drupal runtime DB password is not readable by the OpenLiteSpeed PHP worker." >&2
+    exit 25
+fi
+if ! cmp -s <(printf '%s' "$DB_PASS") "$DB_RUNTIME_FILE"; then
+    echo "Drupal runtime DB password does not match the stored credential." >&2
+    exit 26
+fi
+
+export EVERLOMP_DRUPAL_SITE_URL="$SITE_URL"
+if ! runuser -u nobody -- env EVERLOMP_DRUPAL_SITE_URL="$SITE_URL" "$PHP_BIN" -d display_errors=0 -d memory_limit=512M "$DRUPAL_RUNNER" verify "$WEB_ROOT" >/dev/null; then
+    echo "Drupal could not bootstrap with its final settings as the OpenLiteSpeed PHP worker." >&2
+    exit 27
+fi
+
+printf 'drupal\n' > "$PRIMARY_APP_FILE"
+chmod 0644 "$PRIMARY_APP_FILE"
+jq -n \
+    --arg site_url "$SITE_URL" \
+    --arg version "$DRUPAL_VERSION" \
+    --arg database "$DB_NAME" \
+    --arg database_user "$DB_USER" \
+    --arg database_host "$DB_HOST" \
+    --arg database_port "$DB_PORT" \
+    --arg database_mode "$DB_MODE" \
+    --arg installed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{site_url:$site_url,version:$version,database:$database,database_user:$database_user,database_host:$database_host,database_port:$database_port,database_mode:$database_mode,installed_at:$installed_at}' \
+    > "$DRUPAL_INFO_FILE"
+chmod 0644 "$DRUPAL_INFO_FILE"
+
+if [ -x /usr/local/lsws/bin/lswsctrl ]; then
+    /usr/local/lsws/bin/lswsctrl restart || echo "[Everlomp] Warning: OpenLiteSpeed restart failed." >&2
+fi
+"$SECRET_HELPER" materialize-web "$DB_SECRET_STORE" "$DB_RUNTIME_FILE"
+FINISHED=1
+echo "[Everlomp] Drupal ${DRUPAL_VERSION} installed successfully."
