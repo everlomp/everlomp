@@ -4,7 +4,7 @@ set -euo pipefail
 ACTION="${1:-}"
 
 WEB_ROOT="/var/www/html"
-INSTALL_FILE="$WEB_ROOT/install.php"
+INSTALL_FILE="$WEB_ROOT/lompinstaller.php"
 
 DATABASE_CONFIGURED_FILE="/var/www/.everlomp/database.configured"
 LSWS_PASSWORD_CONFIGURED_FILE="/var/www/.everlomp/lsws-password.configured"
@@ -281,7 +281,7 @@ validate_wordpress_zip() {
         return 1
     fi
 
-    if ! unzip -Z1 "$archive" | grep -qx 'wordpress/wp-admin/install.php'; then
+    if ! unzip -Z1 "$archive" | grep -qx 'wordpress/wp-admin/lompinstaller.php'; then
         return 1
     fi
 
@@ -581,7 +581,7 @@ echo "[Everlomp] Publishing WordPress..."
 find "$WEB_ROOT" \
     -mindepth 1 \
     -maxdepth 1 \
-    ! -name install.php \
+    ! -name lompinstaller.php \
     -exec rm -rf {} +
 
 cp -a "$TMP_DIR"/. "$WEB_ROOT"/
