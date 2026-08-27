@@ -1,0 +1,531 @@
+#!/bin/bash
+set -euo pipefail
+
+HELPER_VERSION="git-source-2026-08-27.2"
+
+ACTION="${1:-}"
+WEB_ROOT="/var/www/html"
+INSTALL_FILE="$WEB_ROOT/lompinstaller.php"
+PROJECT_DEST="/var/www/drupal-project"
+DATABASE_CONFIGURED_FILE="/var/www/.everlomp/database.configured"
+LSWS_PASSWORD_CONFIGURED_FILE="/var/www/.everlomp/lsws-password.configured"
+PRIMARY_APP_FILE="/home/everlomp/primary-app"
+DRUPAL_INFO_FILE="/home/everlomp/drupal.json"
+SECRET_HELPER="/usr/local/sbin/everlomp-secret"
+DB_SECRET_STORE="/home/everlomp/secrets/drupal-db-password"
+DB_RUNTIME_FILE="/run/everlomp/web/drupal-db-password"
+GIT_TOKEN_SECRET="/home/everlomp/secrets/drupal-git-token"
+LOCAL_SOCKET="/run/mysqld/mysqld.sock"
+PHP_BIN="/usr/local/lsws/lsphp85/bin/php"
+DRUPAL_RUNNER="/usr/local/lib/everlomp-drupal-runner.php"
+COMPOSER_BIN="/usr/local/bin/composer"
+BUILD_USER="everlomp-build"
+
+if [ "$ACTION" != "install" ]; then
+    echo "Usage: everlomp-drupal-git install" >&2
+    exit 64
+fi
+echo "[Everlomp] Drupal Git helper $HELPER_VERSION"
+if [ ! -f "$DATABASE_CONFIGURED_FILE" ]; then
+    echo "Configure the MariaDB administrator account before installing Drupal." >&2
+    exit 2
+fi
+if [ ! -f "$LSWS_PASSWORD_CONFIGURED_FILE" ]; then
+    echo "Generate and save the OpenLiteSpeed WebAdmin password before installing Drupal." >&2
+    exit 3
+fi
+if [ -f "$PRIMARY_APP_FILE" ]; then
+    echo "A primary application is already installed." >&2
+    exit 4
+fi
+if [ ! -x "$PHP_BIN" ]; then
+    echo "OpenLiteSpeed PHP runtime is missing at $PHP_BIN." >&2
+    exit 5
+fi
+if [ ! -f "$DRUPAL_RUNNER" ]; then
+    echo "Drupal runner is missing at $DRUPAL_RUNNER." >&2
+    exit 6
+fi
+if ! command -v git >/dev/null 2>&1; then
+    echo "Git is not installed in this Everlomp image." >&2
+    exit 7
+fi
+if ! id -u "$BUILD_USER" >/dev/null 2>&1; then
+    echo "Git build user '$BUILD_USER' is missing from this Everlomp image." >&2
+    exit 7
+fi
+
+PAYLOAD="$(cat)"
+SITE_URL="$(printf '%s' "$PAYLOAD" | jq -er '.site_url')"
+SITE_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.site_name')"
+ADMIN_USER="$(printf '%s' "$PAYLOAD" | jq -er '.admin_user')"
+ADMIN_EMAIL="$(printf '%s' "$PAYLOAD" | jq -er '.admin_email')"
+ADMIN_PASS="$(printf '%s' "$PAYLOAD" | jq -er '.admin_password')"
+DB_MODE="$(printf '%s' "$PAYLOAD" | jq -er '.db_mode')"
+GIT_REPOSITORY="$(printf '%s' "$PAYLOAD" | jq -er '.git_repository')"
+GIT_REF="$(printf '%s' "$PAYLOAD" | jq -r '.git_ref // "main"')"
+GIT_DOCROOT="$(printf '%s' "$PAYLOAD" | jq -r '.git_document_root // "auto"')"
+GIT_AUTH="$(printf '%s' "$PAYLOAD" | jq -r '.git_auth // "public"')"
+GIT_USERNAME="$(printf '%s' "$PAYLOAD" | jq -r '.git_username // ""')"
+GIT_TOKEN="$(printf '%s' "$PAYLOAD" | jq -r '.git_token // ""')"
+
+if [[ ! "$SITE_URL" =~ ^https://[^[:space:]]+$ ]]; then
+    echo "Invalid Drupal site URL." >&2
+    exit 8
+fi
+SITE_HOST="$(printf '%s' "$SITE_URL" | "$PHP_BIN" -r '$u=parse_url(stream_get_contents(STDIN)); if(!is_array($u)||empty($u["host"])||isset($u["port"])) exit(2); echo $u["host"];')" || {
+    echo "Drupal site URL must use an HTTPS domain without an explicit port." >&2
+    exit 8
+}
+if [ -z "$SITE_NAME" ] || [ "${#SITE_NAME}" -gt 120 ]; then
+    echo "Drupal site name is required and must be 120 characters or fewer." >&2
+    exit 9
+fi
+if [[ ! "$ADMIN_USER" =~ ^[A-Za-z0-9_.@-]{3,60}$ ]]; then
+    echo "Drupal admin username must be 3-60 characters." >&2
+    exit 10
+fi
+if [ "${#ADMIN_PASS}" -lt 12 ]; then
+    echo "Drupal admin password must be at least 12 characters." >&2
+    exit 11
+fi
+if [[ ! "$ADMIN_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+    echo "Invalid Drupal admin email." >&2
+    exit 12
+fi
+if [[ ! "$GIT_REPOSITORY" =~ ^https://[^[:space:]]+$ ]] || [ "${#GIT_REPOSITORY}" -gt 2048 ]; then
+    echo "Git repository must be an HTTPS URL." >&2
+    exit 13
+fi
+if [ -z "$GIT_REF" ] || [ "${#GIT_REF}" -gt 255 ] || [[ "$GIT_REF" = -* ]] || [[ "$GIT_REF" =~ [[:space:]] ]] || [[ "$GIT_REF" == *$'\r'* ]]; then
+    echo "Invalid Git branch, tag, or commit." >&2
+    exit 14
+fi
+if [ -z "$GIT_DOCROOT" ] || [ "${#GIT_DOCROOT}" -gt 255 ] || [[ "$GIT_DOCROOT" = /* ]] || [[ "$GIT_DOCROOT" == *$'\n'* ]] || [[ "$GIT_DOCROOT" == *$'\r'* ]]; then
+    echo "Drupal document root must be auto or a relative path such as web or ." >&2
+    exit 15
+fi
+if [[ "/$GIT_DOCROOT/" == *"/../"* ]] || [[ "$GIT_DOCROOT" == ".." ]]; then
+    echo "Drupal document root may not contain '..'." >&2
+    exit 15
+fi
+if [ "$GIT_AUTH" != "public" ] && [ "$GIT_AUTH" != "token" ]; then
+    echo "Invalid Git authentication mode." >&2
+    exit 16
+fi
+if [ "$GIT_AUTH" = "token" ]; then
+    if [ -z "$GIT_TOKEN" ]; then
+        echo "A Git access token is required for private repository access." >&2
+        exit 17
+    fi
+    if [ "${#GIT_TOKEN}" -gt 4096 ] || [[ "$GIT_TOKEN" == *$'\n'* ]] || [[ "$GIT_TOKEN" == *$'\r'* ]]; then
+        echo "Invalid Git access token." >&2
+        exit 17
+    fi
+    if [ -z "$GIT_USERNAME" ]; then
+        GIT_USERNAME="x-access-token"
+    fi
+    if [ "${#GIT_USERNAME}" -gt 255 ] || [[ "$GIT_USERNAME" == *$'\n'* ]] || [[ "$GIT_USERNAME" == *$'\r'* ]]; then
+        echo "Invalid Git username." >&2
+        exit 18
+    fi
+fi
+
+MISSING_EXTENSIONS="$($PHP_BIN -r '
+$required=["date","dom","filter","gd","hash","json","openssl","pcre","pdo","pdo_mysql","session","SimpleXML","SPL","tokenizer","xml","zlib"];
+$missing=[]; foreach($required as $ext){ if(!extension_loaded($ext)) $missing[]=$ext; }
+echo implode(" ",$missing);
+')"
+if [ -n "$MISSING_EXTENSIONS" ]; then
+    echo "Drupal-required PHP extensions are missing: $MISSING_EXTENSIONS" >&2
+    exit 19
+fi
+
+TMP_BASE="$(mktemp -d /tmp/everlomp-drupal-git.XXXXXX)"
+chmod 0711 "$TMP_BASE"
+PROJECT_DIR="$TMP_BASE/project"
+PUBLISH_DIR="$TMP_BASE/publish"
+COMPOSER_HOME="$TMP_BASE/composer-home"
+GIT_RUNTIME_DIR="/run/everlomp/git"
+GIT_TOKEN_RUNTIME="$GIT_RUNTIME_DIR/drupal-token"
+GIT_ASKPASS="$GIT_RUNTIME_DIR/drupal-askpass"
+DB_NAME=""
+DB_USER=""
+DB_PASS=""
+DB_HOST=""
+DB_PORT=""
+DB_CREATED=0
+USER_CREATED=0
+GIT_SECRET_SAVED=0
+PRE_WEB_ROOT="$TMP_BASE/pre-web-root"
+INSTALL_FILE_BACKUP="$TMP_BASE/lompinstaller.php"
+PRE_WEB_ROOT_SAVED=0
+PUBLISHED=0
+FINISHED=0
+
+cleanup() {
+    status=$?
+    rm -f "$GIT_TOKEN_RUNTIME" "$GIT_ASKPASS" || true
+    if [ "$FINISHED" -ne 1 ] && [ "$PUBLISHED" -eq 1 ]; then
+        echo "[Everlomp] Restoring the pre-install web root after failed Git publish..." >&2
+        rm -rf "$WEB_ROOT" "$PROJECT_DEST" || true
+        if [ "$PRE_WEB_ROOT_SAVED" -eq 1 ] && [ -e "$PRE_WEB_ROOT" ]; then
+            mv "$PRE_WEB_ROOT" "$WEB_ROOT" || true
+        else
+            mkdir -p "$WEB_ROOT" || true
+        fi
+    fi
+    if [ "$FINISHED" -ne 1 ]; then
+        "$SECRET_HELPER" remove "$DB_SECRET_STORE" >/dev/null 2>&1 || true
+        rm -f "$DB_RUNTIME_FILE" || true
+        if [ "$GIT_SECRET_SAVED" -eq 1 ]; then
+            "$SECRET_HELPER" remove "$GIT_TOKEN_SECRET" >/dev/null 2>&1 || true
+        fi
+    fi
+    if [ "$FINISHED" -ne 1 ] && [ "$DB_MODE" = "auto" ]; then
+        echo "[Everlomp] Drupal Git installation failed; rolling back auto-created database..." >&2
+        if [ "$DB_CREATED" -eq 1 ]; then
+            mariadb --protocol=socket --socket="$LOCAL_SOCKET" -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" || true
+        fi
+        if [ "$USER_CREATED" -eq 1 ]; then
+            mariadb --protocol=socket --socket="$LOCAL_SOCKET" -e "DROP USER IF EXISTS '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;" || true
+        fi
+    fi
+    rm -rf "$TMP_BASE"
+    exit "$status"
+}
+trap cleanup EXIT
+
+if [ "$DB_MODE" = "auto" ]; then
+    if [ ! -S "$LOCAL_SOCKET" ]; then
+        echo "Automatic database creation requires local MariaDB, but $LOCAL_SOCKET is unavailable." >&2
+        exit 20
+    fi
+    DB_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.database_name')"
+    if [[ ! "$DB_NAME" =~ ^[A-Za-z0-9_]{1,64}$ ]]; then
+        echo "Automatic database name may contain only letters, numbers, and underscores." >&2
+        exit 21
+    fi
+    INSTANCE_SUFFIX="site"
+    if [ -f /contract/env.vars ]; then
+        # shellcheck disable=SC1091
+        source /contract/env.vars
+        if [ -n "${INSTANCE_PUBKEY:-}" ]; then INSTANCE_SUFFIX="${INSTANCE_PUBKEY:0:8}"; fi
+    fi
+    INSTANCE_SUFFIX="$(printf '%s' "$INSTANCE_SUFFIX" | tr -cd 'A-Za-z0-9_' | cut -c1-12)"
+    [ -n "$INSTANCE_SUFFIX" ] || INSTANCE_SUFFIX="site"
+    DB_USER="dr_${INSTANCE_SUFFIX}_$(openssl rand -hex 2)"
+    DB_USER="${DB_USER:0:32}"
+    DB_PASS="$(openssl rand -hex 32)"
+    DB_HOST="localhost"
+    DB_PORT=""
+    DB_EXISTS="$(mariadb --protocol=socket --socket="$LOCAL_SOCKET" --batch --skip-column-names -e "SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';")"
+    if [ "$DB_EXISTS" != "0" ]; then
+        echo "Database '${DB_NAME}' already exists. Choose another name or use Existing Database mode." >&2
+        exit 22
+    fi
+    echo "[Everlomp] Creating Drupal database '${DB_NAME}'..."
+    mariadb --protocol=socket --socket="$LOCAL_SOCKET" <<SQL
+CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+SQL
+    DB_CREATED=1
+    mariadb --protocol=socket --socket="$LOCAL_SOCKET" <<SQL
+CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+    USER_CREATED=1
+elif [ "$DB_MODE" = "existing" ]; then
+    DB_HOST="$(printf '%s' "$PAYLOAD" | jq -er '.database_host')"
+    DB_PORT="$(printf '%s' "$PAYLOAD" | jq -r '.database_port // ""')"
+    DB_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.database_name')"
+    DB_USER="$(printf '%s' "$PAYLOAD" | jq -er '.database_user')"
+    DB_PASS="$(printf '%s' "$PAYLOAD" | jq -r '.database_password // ""')"
+    if [ -z "$DB_HOST" ] || [ "${#DB_HOST}" -gt 255 ]; then echo "Invalid database host." >&2; exit 23; fi
+    if [ -n "$DB_PORT" ] && { ! [[ "$DB_PORT" =~ ^[0-9]+$ ]] || [ "$DB_PORT" -lt 1 ] || [ "$DB_PORT" -gt 65535 ]; }; then echo "Invalid database port." >&2; exit 24; fi
+    if [ -z "$DB_NAME" ] || [ "${#DB_NAME}" -gt 64 ]; then echo "Invalid database name." >&2; exit 25; fi
+    if [ -z "$DB_USER" ] || [ "${#DB_USER}" -gt 128 ]; then echo "Invalid database username." >&2; exit 26; fi
+else
+    echo "Invalid database mode." >&2
+    exit 27
+fi
+
+# The submitted JSON can contain admin, DB, and Git credentials. All required
+# values are parsed now, so do not retain a second in-memory copy.
+PAYLOAD=''
+
+mkdir -p "$PROJECT_DIR" "$COMPOSER_HOME" "$GIT_RUNTIME_DIR"
+chmod 0700 "$COMPOSER_HOME" "$GIT_RUNTIME_DIR"
+
+if [ "$GIT_AUTH" = "token" ]; then
+    printf '%s' "$GIT_TOKEN" | "$SECRET_HELPER" write "$GIT_TOKEN_SECRET"
+    GIT_SECRET_SAVED=1
+    "$SECRET_HELPER" materialize "$GIT_TOKEN_SECRET" "$GIT_TOKEN_RUNTIME"
+    chmod 0600 "$GIT_TOKEN_RUNTIME"
+    cat > "$GIT_ASKPASS" <<'ASKPASS'
+#!/bin/sh
+case "$1" in
+    *Username*) printf '%s\n' "${EVERLOMP_GIT_USERNAME:-x-access-token}" ;;
+    *Password*) cat "${EVERLOMP_GIT_TOKEN_FILE:?}" ;;
+    *) exit 1 ;;
+esac
+ASKPASS
+    chmod 0700 "$GIT_ASKPASS"
+fi
+
+clone_repository() {
+    echo "[Everlomp] Fetching Drupal project from Git..."
+    git -C "$PROJECT_DIR" init -q
+    git -C "$PROJECT_DIR" remote add origin "$GIT_REPOSITORY"
+    if [ "$GIT_AUTH" = "token" ]; then
+        GIT_TERMINAL_PROMPT=0 \
+        GIT_ASKPASS="$GIT_ASKPASS" \
+        EVERLOMP_GIT_USERNAME="$GIT_USERNAME" \
+        EVERLOMP_GIT_TOKEN_FILE="$GIT_TOKEN_RUNTIME" \
+        git -C "$PROJECT_DIR" fetch --depth=1 --no-tags origin "$GIT_REF"
+    else
+        GIT_TERMINAL_PROMPT=0 git -C "$PROJECT_DIR" fetch --depth=1 --no-tags origin "$GIT_REF"
+    fi
+    git -C "$PROJECT_DIR" checkout -q --detach FETCH_HEAD
+}
+
+clone_repository
+GIT_COMMIT="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+rm -f "$GIT_TOKEN_RUNTIME" "$GIT_ASKPASS"
+unset GIT_TOKEN
+
+if [ -f "$PROJECT_DIR/composer.json" ]; then
+    if [ ! -x "$COMPOSER_BIN" ]; then
+        echo "This Git repository contains composer.json, but Composer is missing at $COMPOSER_BIN." >&2
+        exit 28
+    fi
+    if [ "$GIT_AUTH" = "token" ] && [[ "$GIT_REPOSITORY" =~ ^https://github\.com/ ]]; then
+        "$SECRET_HELPER" materialize "$GIT_TOKEN_SECRET" "$GIT_TOKEN_RUNTIME"
+        python3 - "$GIT_TOKEN_RUNTIME" "$COMPOSER_HOME/auth.json" <<'PYAUTH'
+from pathlib import Path
+import json, os, sys
+src, dst = map(Path, sys.argv[1:3])
+token = src.read_text().strip()
+dst.write_text(json.dumps({'github-oauth': {'github.com': token}}, separators=(',', ':')) + '\n')
+os.chmod(dst, 0o600)
+PYAUTH
+        rm -f "$GIT_TOKEN_RUNTIME"
+    fi
+    if [ ! -f "$PROJECT_DIR/composer.lock" ]; then
+        echo "[Everlomp] Warning: composer.lock is missing; Composer will resolve current dependency versions." >&2
+    fi
+    echo "[Everlomp] composer.json detected; installing PHP/Drupal dependencies as the unprivileged build user..."
+    chown -R "$BUILD_USER":"$BUILD_USER" "$PROJECT_DIR" "$COMPOSER_HOME"
+    runuser -u "$BUILD_USER" -- env \
+        COMPOSER_HOME="$COMPOSER_HOME" \
+        "$COMPOSER_BIN" install \
+            --working-dir="$PROJECT_DIR" \
+            --no-dev --prefer-dist --no-interaction --optimize-autoloader
+    chown -R root:root "$PROJECT_DIR" "$COMPOSER_HOME"
+fi
+
+is_drupal_root() {
+    local candidate="$1"
+    # Keep detection version-agnostic. These are structural Drupal-root markers,
+    # not a Drupal major/minor version check.
+    [ -f "$candidate/autoload.php" ] \
+        && [ -f "$candidate/core/lib/Drupal.php" ] \
+        && [ -f "$candidate/sites/default/default.settings.php" ]
+}
+
+if [ "$GIT_DOCROOT" = "auto" ]; then
+    if is_drupal_root "$PROJECT_DIR/web"; then
+        GIT_DOCROOT="web"
+    elif is_drupal_root "$PROJECT_DIR"; then
+        GIT_DOCROOT="."
+    else
+        echo "Could not auto-detect a supported Drupal document root. Checked 'web' and the repository root. Enter the correct relative document root manually." >&2
+        exit 30
+    fi
+    echo "[Everlomp] Auto-detected Drupal document root: $GIT_DOCROOT"
+fi
+
+DRUPAL_ROOT="$(realpath -m -- "$PROJECT_DIR/$GIT_DOCROOT")"
+case "$DRUPAL_ROOT" in
+    "$PROJECT_DIR"|"$PROJECT_DIR"/*) ;;
+    *) echo "Drupal document root escapes the checked-out project." >&2; exit 29 ;;
+esac
+if ! is_drupal_root "$DRUPAL_ROOT"; then
+    echo "No supported Drupal root was found at '${GIT_DOCROOT}'. Use 'auto', 'web', '.', or the correct relative document-root path." >&2
+    exit 30
+fi
+
+DRUPAL_VERSION="$(sed -n "s/^[[:space:]]*const VERSION = '\([^']*\)';.*/\1/p" "$DRUPAL_ROOT/core/lib/Drupal.php" | head -n1)"
+if [ -z "$DRUPAL_VERSION" ]; then
+    DRUPAL_VERSION="unknown"
+fi
+
+echo "[Everlomp] Git checkout $GIT_COMMIT contains Drupal $DRUPAL_VERSION."
+mkdir -p "$DRUPAL_ROOT/sites/default/files"
+if [ ! -f "$DRUPAL_ROOT/sites/default/default.settings.php" ]; then
+    echo "Drupal default.settings.php is missing from the selected document root." >&2
+    exit 32
+fi
+# Git source installs are fresh installs, matching Everlomp's standard Drupal path.
+cp "$DRUPAL_ROOT/sites/default/default.settings.php" "$DRUPAL_ROOT/sites/default/settings.php"
+chmod 0775 "$DRUPAL_ROOT/sites/default" "$DRUPAL_ROOT/sites/default/files"
+chmod 0664 "$DRUPAL_ROOT/sites/default/settings.php"
+
+echo "[Everlomp] Installing Drupal $DRUPAL_VERSION from Git source as an unprivileged build user..."
+chown -R "$BUILD_USER":"$BUILD_USER" "$PROJECT_DIR"
+runuser -u "$BUILD_USER" -- env \
+    EVERLOMP_DRUPAL_SITE_NAME="$SITE_NAME" \
+    EVERLOMP_DRUPAL_ADMIN_USER="$ADMIN_USER" \
+    EVERLOMP_DRUPAL_ADMIN_EMAIL="$ADMIN_EMAIL" \
+    EVERLOMP_DRUPAL_ADMIN_PASSWORD="$ADMIN_PASS" \
+    EVERLOMP_DRUPAL_DB_HOST="$DB_HOST" \
+    EVERLOMP_DRUPAL_DB_PORT="$DB_PORT" \
+    EVERLOMP_DRUPAL_DB_NAME="$DB_NAME" \
+    EVERLOMP_DRUPAL_DB_USER="$DB_USER" \
+    EVERLOMP_DRUPAL_DB_PASSWORD="$DB_PASS" \
+    "$PHP_BIN" -d memory_limit=512M "$DRUPAL_RUNNER" install "$DRUPAL_ROOT"
+
+SETTINGS_FILE="$DRUPAL_ROOT/sites/default/settings.php"
+if [ ! -s "$SETTINGS_FILE" ]; then
+    echo "Drupal installer did not create sites/default/settings.php." >&2
+    exit 33
+fi
+
+printf '%s' "$DB_PASS" | "$SECRET_HELPER" write "$DB_SECRET_STORE"
+"$SECRET_HELPER" materialize-web "$DB_SECRET_STORE" "$DB_RUNTIME_FILE"
+python3 - "$SETTINGS_FILE" "$SITE_HOST" <<'PYSETTINGS'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+host = sys.argv[2]
+text = path.read_text()
+lines = text.splitlines(keepends=True)
+assignment_re = re.compile(
+    r"^\s*\$databases\['default'\]\['default'\]\s*=\s*(?:array\s*\(|\[)\s*$"
+)
+password_re = re.compile(r"^(\s*)'password'\s*=>\s*.*?,\s*$")
+end_re = re.compile(r"^\s*(?:\)|\])\s*;\s*$")
+assignment_index = None
+for i, line in enumerate(lines):
+    if assignment_re.match(line.rstrip('\r\n')):
+        assignment_index = i
+        break
+if assignment_index is None:
+    raise SystemExit('Could not find the real Drupal default database settings assignment.')
+password_index = None
+password_indent = ''
+for i in range(assignment_index + 1, min(len(lines), assignment_index + 100)):
+    raw = lines[i].rstrip('\r\n')
+    match = password_re.match(raw)
+    if match:
+        password_index = i
+        password_indent = match.group(1)
+        break
+    if end_re.match(raw):
+        break
+if password_index is None:
+    raise SystemExit('Could not find Drupal database password inside the real database settings block.')
+newline = '\r\n' if lines[password_index].endswith('\r\n') else '\n'
+lines[password_index] = (
+    password_indent
+    + "'password' => trim((string) @file_get_contents('/run/everlomp/web/drupal-db-password'))," 
+    + newline
+)
+text = ''.join(lines)
+trusted = re.escape(host)
+marker = "\n// Everlomp Drupal hardening.\n"
+if marker not in text:
+    text += marker
+    text += "$settings['trusted_host_patterns'] = ['^" + trusted + "$'];\n"
+path.write_text(text)
+PYSETTINGS
+if grep -Fq -- "$DB_PASS" "$SETTINGS_FILE"; then
+    echo "Drupal database password remained in plaintext settings.php after secret rewrite." >&2
+    exit 34
+fi
+
+# Do not publish repository history or temporary Composer authentication.
+rm -rf "$PROJECT_DIR/.git" "$COMPOSER_HOME"
+
+echo "[Everlomp] Publishing Drupal Git project..."
+if [ -f "$INSTALL_FILE" ]; then
+    cp -a "$INSTALL_FILE" "$INSTALL_FILE_BACKUP"
+fi
+if [ -e "$PROJECT_DEST" ] || [ -L "$PROJECT_DEST" ]; then
+    echo "A stale Drupal Git project already exists at $PROJECT_DEST. Remove it before retrying." >&2
+    exit 35
+fi
+rm -rf "$PUBLISH_DIR"
+cp -a "$PROJECT_DIR" "$PUBLISH_DIR"
+PUBLISHED_ROOT="$(realpath -m -- "$PUBLISH_DIR/$GIT_DOCROOT")"
+if [ ! -f "$PUBLISHED_ROOT/autoload.php" ]; then
+    echo "Prepared Drupal document root disappeared before publish." >&2
+    exit 36
+fi
+
+chown -R nobody:nogroup "$PUBLISH_DIR"
+find "$PUBLISH_DIR" -type d -exec chmod 0755 {} \;
+find "$PUBLISH_DIR" -type f -exec chmod 0644 {} \;
+chmod 0755 "$PUBLISHED_ROOT/sites/default/files"
+chmod 0600 "$PUBLISHED_ROOT/sites/default/settings.php"
+
+if [ -e "$WEB_ROOT" ] || [ -L "$WEB_ROOT" ]; then
+    cp -a "$WEB_ROOT" "$PRE_WEB_ROOT"
+    PRE_WEB_ROOT_SAVED=1
+fi
+mv "$PUBLISH_DIR" "$PROJECT_DEST"
+PUBLISHED=1
+FINAL_ROOT="$(realpath -m -- "$PROJECT_DEST/$GIT_DOCROOT")"
+rm -rf "$WEB_ROOT"
+ln -s "$FINAL_ROOT" "$WEB_ROOT"
+if [ -f "$INSTALL_FILE_BACKUP" ]; then
+    cp -a "$INSTALL_FILE_BACKUP" "$WEB_ROOT/lompinstaller.php"
+    chown nobody:nogroup "$WEB_ROOT/lompinstaller.php"
+    chmod 0644 "$WEB_ROOT/lompinstaller.php"
+fi
+
+"$SECRET_HELPER" materialize-web "$DB_SECRET_STORE" "$DB_RUNTIME_FILE"
+if ! runuser -u nobody -- test -r "$DB_RUNTIME_FILE"; then
+    echo "Drupal runtime DB password is not readable by the OpenLiteSpeed PHP worker." >&2
+    exit 37
+fi
+if ! cmp -s <(printf '%s' "$DB_PASS") "$DB_RUNTIME_FILE"; then
+    echo "Drupal runtime DB password does not match the stored credential." >&2
+    exit 38
+fi
+export EVERLOMP_DRUPAL_SITE_URL="$SITE_URL"
+if ! runuser -u nobody -- env EVERLOMP_DRUPAL_SITE_URL="$SITE_URL" "$PHP_BIN" -d display_errors=0 -d memory_limit=512M "$DRUPAL_RUNNER" verify "$WEB_ROOT" >/dev/null; then
+    echo "Drupal could not bootstrap with its final Git-project settings as the OpenLiteSpeed PHP worker." >&2
+    exit 39
+fi
+
+printf 'drupal\n' > "$PRIMARY_APP_FILE"
+chmod 0644 "$PRIMARY_APP_FILE"
+jq -n \
+    --arg site_url "$SITE_URL" \
+    --arg version "$DRUPAL_VERSION" \
+    --arg database "$DB_NAME" \
+    --arg database_user "$DB_USER" \
+    --arg database_host "$DB_HOST" \
+    --arg database_port "$DB_PORT" \
+    --arg database_mode "$DB_MODE" \
+    --arg source "git" \
+    --arg repository "$GIT_REPOSITORY" \
+    --arg git_ref "$GIT_REF" \
+    --arg git_commit "$GIT_COMMIT" \
+    --arg document_root "$GIT_DOCROOT" \
+    --arg git_auth "$GIT_AUTH" \
+    --arg git_username "$GIT_USERNAME" \
+    --arg installed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{site_url:$site_url,version:$version,database:$database,database_user:$database_user,database_host:$database_host,database_port:$database_port,database_mode:$database_mode,source:$source,repository:$repository,git_ref:$git_ref,git_commit:$git_commit,document_root:$document_root,git_auth:$git_auth,git_username:$git_username,installed_at:$installed_at}' \
+    > "$DRUPAL_INFO_FILE"
+chmod 0644 "$DRUPAL_INFO_FILE"
+
+if [ -x /usr/local/lsws/bin/lswsctrl ]; then
+    /usr/local/lsws/bin/lswsctrl restart || echo "[Everlomp] Warning: OpenLiteSpeed restart failed." >&2
+fi
+"$SECRET_HELPER" materialize-web "$DB_SECRET_STORE" "$DB_RUNTIME_FILE"
+FINISHED=1
+echo "[Everlomp] Drupal $DRUPAL_VERSION installed successfully from Git commit $GIT_COMMIT."
