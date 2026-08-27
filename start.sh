@@ -69,7 +69,7 @@ migrate_protected_secret /var/www/.everlomp-secrets/ssh-host-keys.tar "$EVERLOMP
 migrate_protected_secret /home/everlomp/kopia/repository.password "$KOPIA_SECRETS/repository.password"
 migrate_protected_secret /home/everlomp/kopia/webui.password "$KOPIA_SECRETS/webui.password"
 migrate_protected_secret /home/everlomp/kopia/offsite.json "$KOPIA_SECRETS/offsite.json"
-
+migrate_protected_secret /var/www/.everlomp-secrets/drupal-db-password "$EVERLOMP_SECRETS/drupal-db-password"
 if [ -s /home/everlomp/kopia/offsite-s3.json ]; then
     if ! "$SECRET_HELPER" exists "$KOPIA_SECRETS/offsite.json" >/dev/null 2>&1; then
         legacy_offsite_tmp="$(mktemp /run/everlomp-offsite-migrate.XXXXXX)"
@@ -257,7 +257,9 @@ fi
 if /usr/local/sbin/everlomp-secret exists "$EVERLOMP_SECRETS/phpbb-db-password"; then
     /usr/local/sbin/everlomp-secret materialize-web "$EVERLOMP_SECRETS/phpbb-db-password" /run/everlomp/web/phpbb-db-password
 fi
-
+if /usr/local/sbin/everlomp-secret exists "$EVERLOMP_SECRETS/drupal-db-password"; then
+    /usr/local/sbin/everlomp-secret materialize-web "$EVERLOMP_SECRETS/drupal-db-password" /run/everlomp/web/drupal-db-password
+fi
 [ ! -f /etc/ssh/ssh_host_rsa_key ] && ssh-keygen -A
 
 chown everlomp:everlomp /home/everlomp
