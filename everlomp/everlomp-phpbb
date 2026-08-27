@@ -8,7 +8,7 @@ PHPBB_VERSIONCHECK_URL="https://raw.githubusercontent.com/phpbb/versioncheck/mas
 PHPBB_FALLBACK_ZIP="/home/everlomp/phpBB-${PHPBB_FALLBACK_VERSION}.zip"
 
 WEB_ROOT="/var/www/html"
-INSTALL_FILE="$WEB_ROOT/install.php"
+INSTALL_FILE="$WEB_ROOT/lompinstaller.php"
 
 DATABASE_CONFIGURED_FILE="/var/www/.everlomp/database.configured"
 LSWS_PASSWORD_CONFIGURED_FILE="/var/www/.everlomp/lsws-password.configured"
@@ -242,7 +242,7 @@ cleanup() {
         find "$WEB_ROOT" \
             -mindepth 1 \
             -maxdepth 1 \
-            ! -name install.php \
+            ! -name lompinstaller.php \
             -exec rm -rf {} + || true
 
         if [ -f "$INSTALL_FILE" ]; then
@@ -250,7 +250,7 @@ cleanup() {
 <?php
 declare(strict_types=1);
 
-header('Location: /install.php', true, 302);
+header('Location: /lompinstaller.php', true, 302);
 exit;
 PHP
             chown nobody:nogroup "$WEB_ROOT/index.php" || true
@@ -655,7 +655,7 @@ echo "[Everlomp] phpBB CLI install completed. Publishing files before final veri
 find "$WEB_ROOT" \
     -mindepth 1 \
     -maxdepth 1 \
-    ! -name install.php \
+    ! -name lompinstaller.php \
     -exec rm -rf {} +
 
 cp -a "$PHPBB_ROOT"/. "$WEB_ROOT"/
