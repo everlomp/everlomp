@@ -1,0 +1,49 @@
+{
+  "plugins": [
+    {
+      "name": "LiteSpeed Cache",
+      "description": "Official LiteSpeed caching and optimization plugin for WordPress. Integrates with OpenLiteSpeed server-level caching.",
+      "file": "",
+      "url": "https://wordpress.org/plugins/litespeed-cache/",
+      "default": true,
+      "slug": "litespeed-cache",
+      "activate": true
+    },
+    {
+      "name": "Pods",
+      "description": "Free, open-source WordPress custom content and fields framework.",
+      "file": "pods_local.zip",
+      "url": "https://wordpress.org/plugins/pods/",
+      "default": true,
+      "slug": "pods",
+      "activate": true
+    },
+    {
+      "name": "WP Mail SMTP",
+      "description": "Routes WordPress email through SMTP or supported mail providers to improve reliable email delivery.",
+      "file": "wp-mail-smtp_local.zip",
+      "url": "https://sv.wordpress.org/plugins/wp-mail-smtp/",
+      "default": true,
+      "slug": "wp-mail-smtp",
+      "activate": true
+    },
+    {
+      "name": "Query Monitor",
+      "description": "Developer tools panel for debugging database queries, PHP errors, hooks, HTTP requests, and WordPress performance.",
+      "file": "",
+      "url": "https://wordpress.org/plugins/query-monitor/",
+      "default": false,
+      "slug": "query-monitor",
+      "activate": true
+    },
+    {
+    "name": "Limit Login Attempts Reloaded",
+    "description": "Simple brute-force protection that limits failed login attempts and automatically locks out suspicious IP addresses.",
+    "file": "limit-login-attempts-reloaded_local.zip",
+    "url": "https://wordpress.org/plugins/limit-login-attempts-reloaded/",
+    "default": true,
+    "slug": "limit-login-attempts-reloaded",
+    "activate": true
+  }
+  ]
+}

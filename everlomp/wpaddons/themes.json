@@ -1,0 +1,48 @@
+{
+  "themes": [
+    {
+      "name": "Blocksy",
+      "description": "Fast, modern and highly customizable. Great for manually designing with Gutenberg, with strong WooCommerce support.",
+      "file": "blocksy_local.zip",
+      "wp_url": "https://wordpress.org/themes/blocksy/",
+      "author": "Creative Themes",
+      "author_url": "https://wordpress.org/themes/author/creativethemeshq/",
+      "website": "https://creativethemes.com/blocksy/",
+      "default": true,
+      "slug": "blocksy"
+    },
+    {
+      "name": "Kadence",
+      "description": "Lightweight and easy to customize, with a visual header/footer builder and strong global color and typography controls.",
+      "file": "kadence_local.zip",
+      "wp_url": "https://wordpress.org/themes/kadence/",
+      "author": "Nexcess / StellarWP",
+      "author_url": "https://wordpress.org/themes/author/stellarwp/",
+      "website": "https://www.kadencewp.com/",
+      "default": false,
+      "slug": "kadence"
+    },
+    {
+      "name": "Astra",
+      "description": "Very popular, fast and flexible. Works well with Gutenberg and major page builders and is easy to customize manually.",
+      "file": "astra_local.zip",
+      "wp_url": "https://wordpress.org/themes/astra/",
+      "author": "Brainstorm Force",
+      "author_url": "https://wordpress.org/themes/author/brainstormforce/",
+      "website": "https://wpastra.com/",
+      "default": false,
+      "slug": "astra"
+    },
+    {
+      "name": "GeneratePress",
+      "description": "Minimal, lightweight and performance-focused. A clean foundation for custom layouts, CSS and Gutenberg-based sites.",
+      "file": "generatepress_local.zip",
+      "wp_url": "https://wordpress.org/themes/generatepress/",
+      "author": "Tom",
+      "author_url": "https://wordpress.org/themes/author/edge22/",
+      "website": "https://generatepress.com/",
+      "default": false,
+      "slug": "generatepress"
+    }
+  ]
+}

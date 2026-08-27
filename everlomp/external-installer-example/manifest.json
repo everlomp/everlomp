@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "dummy-example",
+  "name": "Dummy Example App",
+  "version": "1.0.0",
+  "description": "A tiny example external installer that replaces the public web root with a static demo page.",
+  "type": "primary",
+  "entrypoint": "install.sh",
+  "site_path": "/",
+  "requires": {
+    "domain": true,
+    "openlitespeed_password": true,
+    "real_ip": true
+  },
+  "fields": [
+    {
+      "name": "site_title",
+      "type": "text",
+      "label": "Site title",
+      "required": true,
+      "default": "My Everlomp Example",
+      "max_length": 80,
+      "help": "This value is written into the example index.html page."
+    },
+    {
+      "name": "show_timestamp",
+      "type": "checkbox",
+      "label": "Include installation timestamp",
+      "default": true,
+      "help": "Demonstrates a boolean field passed to install.sh."
+    }
+  ]
+}
