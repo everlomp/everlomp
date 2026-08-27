@@ -37,7 +37,7 @@ The modification done to wordpress is that it fetches the database password from
 
 During installation you have the convenience of setting up backups, right now the native sql backup method is sqldump. Kopia would snapshot the sql backup folder and files, meaning that you need to import the sql database if you move server. 
 
-SSH access exist as-well.
+You have the ability to enable hotpocket, and SSH as-well.
 
 Folders that need to persist: /home /var/www /var/lib/mysql /usr/local/lsws
 
