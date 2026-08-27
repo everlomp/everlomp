@@ -4,6 +4,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 ENV GOTOOLCHAIN=auto
 
+LABEL org.opencontainers.image.source="https://github.com/everlomp/everlomp"
+
 RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && chmod +x /usr/sbin/policy-rc.d
 
