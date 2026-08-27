@@ -189,7 +189,12 @@ storage_pattern = re.compile(
     re.S,
 )
 text, count = storage_pattern.subn(
-    lambda m: m.group(1) + php_single_quote(root) + m.group(2),
+    lambda m: (
+        m.group(1)
+        + php_single_quote(root)
+        + ", LOCK_EX, \\League\\Flysystem\\Adapter\\Local::SKIP_LINKS"
+        + m.group(2)
+    ),
     text,
     count=1,
 )
