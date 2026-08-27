@@ -91,7 +91,7 @@ RUN wget -O - https://repo.litespeed.sh | bash
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        openlitespeed \
+        openlitespeed git \
         lsphp85 \
         lsphp85-common \
         lsphp85-curl \
