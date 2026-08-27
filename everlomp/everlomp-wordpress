@@ -281,7 +281,7 @@ validate_wordpress_zip() {
         return 1
     fi
 
-    if ! unzip -Z1 "$archive" | grep -qx 'wordpress/wp-admin/lompinstaller.php'; then
+    if ! unzip -Z1 "$archive" | grep -qx 'wordpress/wp-admin/install.php'; then
         return 1
     fi
 
