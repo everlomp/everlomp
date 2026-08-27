@@ -11,8 +11,8 @@ During the installation process you set an encryption key as a secret for the st
 You get access to a mariadb server through phpmyadmin (bruteforce protected), an openlitespeed server (bruteforceprotected), filegator (bruteforce protected) and kopia (bruteforce protected + optional 2FA in UI)
 
 The UI's can be found at
-/phpmyadmin/
-/openlitespeed/
+/phpmyadmin
+/openlitespeed
 /filegator
 /kopia
 
