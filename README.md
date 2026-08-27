@@ -31,9 +31,9 @@ Kopia is a wonderful snapshot tool that allow for encrypted and remotely stored 
 3. The ability to add/adjust replication locations.
 4. Encrypted password storage instead of plaintext (Decrypted with secrets into runtime)
 
-Nativelly you can install wordpress and phpbb during the installation wizard. You also have the ability to create your own zip files with installation instructions, a dummy zip is available for download.
+Nativelly you can install wordpress, drupal and phpbb during the installation wizard. You also have the ability to create your own zip files with installation instructions, a dummy zip is available for download.
 
-The modification done to wordpress is that it fetches the database password from runtime instead of having it visible in plaintext. PHPBB got the same perk. If encryption is used, then the passwords are decrypted during container start and loaded into runtime. 
+The modification done to wordpress is that it fetches the database password from runtime instead of having it visible in plaintext. Drupal and PHPBB got the same perk. If encryption is used, then the passwords are decrypted during container start and loaded into runtime. 
 
 During installation you have the convenience of setting up backups, right now the native sql backup method is sqldump. Kopia would snapshot the sql backup folder and files, meaning that you need to import the sql database if you move server. 
 
