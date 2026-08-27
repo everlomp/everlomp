@@ -629,10 +629,12 @@ RUN mkdir -p \
     chmod 0755 /home/everlomp
 
 COPY everlomp/index.php /var/www/html/index.php
-COPY everlomp/install.php /var/www/html/install.php
+COPY everlomp/lompinstaller.php /var/www/html/lompinstaller.php
 
 COPY everlomp/terms.md /home/everlomp/terms.md
-
+COPY everlomp/everlomp-drupal /usr/local/sbin/everlomp-drupal
+COPY everlomp/everlomp-drupal-runner.php /usr/local/lib/everlomp-drupal-runner.php
+COPY everlomp/drupal-11.4.5.tar.gz /home/everlomp/drupal-11.4.5.tar.gz
 COPY everlomp/everlomp-database /usr/local/sbin/everlomp-database
 COPY everlomp/everlomp-wordpress /usr/local/sbin/everlomp-wordpress
 COPY everlomp/everlomp-phpbb /usr/local/sbin/everlomp-phpbb
@@ -666,6 +668,7 @@ RUN chown everlomp:everlomp \
         /home/everlomp/wordpress-6.6.7.zip \
         /home/everlomp/filegator_local.zip \
         /home/everlomp/external-installer-example.zip \
+        /home/everlomp/drupal-11.4.5.tar.gz \
         /home/everlomp/terms.md && \
     chown -R everlomp:everlomp /home/everlomp/wpaddons && \
     chmod 0644 \
@@ -685,6 +688,7 @@ RUN chown everlomp:everlomp \
         /usr/local/sbin/everlomp-backup-scheduler \
         /usr/local/sbin/everlomp-key \
         /usr/local/sbin/everlomp-secret \
+        /usr/local/sbin/everlomp-drupal \
         /usr/local/sbin/everlomp-kopia-priv && \
     chmod 0644 /etc/cron.d/everlomp-backup && \
     install -d -o everlomp -g everlomp -m 0700 /home/everlomp/kopia && \
@@ -710,7 +714,8 @@ RUN chmod 0755 \
         /usr/local/sbin/everlomp-lsws-password && \
     chmod 0644 \
         /var/www/html/index.php \
-        /var/www/html/install.php && \
+        /usr/local/lib/everlomp-drupal-runner.php \
+        /var/www/html/lompinstaller.php && \
    printf '%s\n' \
         'nobody ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-database' \
         'nobody ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-wordpress' \
@@ -752,6 +757,9 @@ RUN chmod 0755 \
         'www-data ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-hotpocket' \
         'nobody ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-ssh' \
         'www-data ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-ssh' \
+        'nobody ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-drupal' \
+        'www-data ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-drupal' \
+        'lsadm ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-drupal' \
         > /etc/sudoers.d/everlomp-web && \
     chmod 0440 /etc/sudoers.d/everlomp-web && \
     visudo -cf /etc/sudoers.d/everlomp-web && \
