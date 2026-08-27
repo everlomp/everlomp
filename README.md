@@ -48,7 +48,7 @@ Get support and get involved at https://discord.gg/DAQszjKEBV (Evernode Communit
 Dockerhub image: everlomp/everlomp:latest
 Github image: ghcr.io/everlomp/everlomp:latest
 
-Example deploy: evdevkit acquire -i ghcr.io/everlomp/everlomp:latest--vol1--var___www--vol2--var___lib___mysql--vol3--usr___local___lsws--sec1--2fa--subdoman--mysubdomain rAddr
+Example deploy: evdevkit acquire -i ghcr.io/everlomp/everlomp:latest--vol1--var___www--vol2--var___lib___mysql--vol3--usr___local___lsws--sec1--2fa--subdomain--mysubdomain rAddr
 
 Comment:
 This code has no guarantee, it's just a vision of how everlomp should look like. I hope someone forks this and make it better. For example, the decryption key secret could be loaded with less read permissions. Working on migration between servers could be worth while, it would be interesting to work on easily restoreable database snapshots. Processes should not leak any sensetive data, but I have not had time to review that. There are locally held fallback files for everything except kopia (as it is being rebuilt during installation with the modifications). The build tools were unreasonable large to include in the dockerfile... 
