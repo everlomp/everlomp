@@ -1649,8 +1649,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $size = (int) ($upload['size'] ?? 0);
             if (!preg_match('/\.zip$/i', $originalName)) {
                 $error = 'External installer packages must be uploaded as .zip files.';
-            } elseif ($size < 1 || $size > 10 * 1024 * 1024) {
-                $error = 'External installer ZIP must be between 1 byte and 10 MiB.';
+            } elseif ($size < 1 || $size > 100 * 1024 * 1024) {
+                $error = 'External installer ZIP must be between 1 byte and 100 MiB.';
             } elseif ($tmpName === '' || !is_uploaded_file($tmpName) || !is_readable($tmpName)) {
                 $error = 'The uploaded ZIP could not be read safely.';
             } else {
