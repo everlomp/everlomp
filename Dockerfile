@@ -613,6 +613,28 @@ RUN useradd -m -s /bin/bash everlomp && \
     usermod -aG sudo everlomp && \
     chmod 0755 /home/everlomp
 
+
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin everlomp-build
+RUN curl -fsSL \
+        https://getcomposer.org/download/2.10.3/composer.phar \
+        -o /usr/local/bin/composer.phar && \
+    echo '7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6  /usr/local/bin/composer.phar' | sha256sum -c - && \
+    chmod 0755 /usr/local/bin/composer.phar && \
+    printf '#!/bin/bash\nexec /usr/local/lsws/lsphp85/bin/php /usr/local/bin/composer.phar "$@"\n' \
+        > /usr/local/bin/composer && \
+    chmod 0755 /usr/local/bin/composer && \
+    /usr/local/bin/composer --version
+COPY everlomp/everlomp-drupal-git /usr/local/sbin/everlomp-drupal-git
+RUN chmod 0755 /usr/local/sbin/everlomp-drupal-git
+RUN printf '%s\n' \
+    'nobody ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-drupal-git' \
+    'www-data ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-drupal-git' \
+    'lsadm ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-drupal-git' \
+    > /etc/sudoers.d/everlomp-drupal-git && \
+    chmod 0440 /etc/sudoers.d/everlomp-drupal-git && \
+    visudo -cf /etc/sudoers.d/everlomp-drupal-git
+
+    
 RUN curl -fsSL \
         https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
         -o /usr/local/bin/wp-cli.phar && \
