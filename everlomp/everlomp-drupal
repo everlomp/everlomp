@@ -3,7 +3,7 @@ set -euo pipefail
 
 ACTION="${1:-}"
 WEB_ROOT="/var/www/html"
-INSTALL_FILE="$WEB_ROOT/install.php"
+INSTALL_FILE="$WEB_ROOT/lompinstaller.php"
 DATABASE_CONFIGURED_FILE="/var/www/.everlomp/database.configured"
 LSWS_PASSWORD_CONFIGURED_FILE="/var/www/.everlomp/lsws-password.configured"
 PRIMARY_APP_FILE="/home/everlomp/primary-app"
@@ -319,7 +319,7 @@ if grep -Fq -- "$DB_PASS" "$SETTINGS_FILE"; then
 fi
 
 echo "[Everlomp] Publishing Drupal..."
-find "$WEB_ROOT" -mindepth 1 -maxdepth 1 ! -name install.php -exec rm -rf {} +
+find "$WEB_ROOT" -mindepth 1 -maxdepth 1 ! -name lompinstaller.php -exec rm -rf {} +
 cp -a "$SITE_DIR"/. "$WEB_ROOT"/
 
 chown -R nobody:nogroup "$WEB_ROOT"
