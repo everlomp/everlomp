@@ -10,6 +10,7 @@ $databaseAdminUserFile  = '/var/www/.everlomp/database-admin-user';
 $lswsPasswordConfiguredFile = '/var/www/.everlomp/lsws-password.configured';
 $primaryAppFile         = '/home/everlomp/primary-app';
 $wordpressInfoFile      = '/home/everlomp/wordpress.json';
+$drupalInfoFile         = '/home/everlomp/drupal.json';
 $phpbbInfoFile          = '/home/everlomp/phpbb.json';
 $wpThemeManifestFile    = '/home/everlomp/wpaddons/themes.json';
 $wpPluginManifestFile   = '/home/everlomp/wpaddons/plugins.json';
@@ -712,6 +713,7 @@ $lswsPasswordConfigured = is_file($lswsPasswordConfiguredFile);
 $databaseAdminUser = readTextFile($databaseAdminUserFile);
 $primaryApp = readTextFile($primaryAppFile);
 $wordpressInfo = readJsonFile($wordpressInfoFile);
+$drupalInfo = readJsonFile($drupalInfoFile);
 $phpbbInfo = readJsonFile($phpbbInfoFile);
 $externalInstallers = readExternalInstallerPackages($externalInstallerDir);
 $externalInstalledId = externalInstallerIdFromPrimary($primaryApp);
@@ -766,6 +768,7 @@ if (
 }
 
 $wordpressInstalled = $primaryApp === 'wordpress';
+$drupalInstalled = $primaryApp === 'drupal';
 $phpbbInstalled = $primaryApp === 'phpbb';
 $phpmyadminInstalled = is_file($phpmyadminIndexFile);
 $hotpocketEnabled = is_file($hotpocketEnabledFile);
@@ -826,6 +829,9 @@ $kopiaReplicationDashboardUrl = $publicBaseUrl !== '' ? $publicBaseUrl . '/kopia
 $wordpressBaseUrl = rtrim((string) ($wordpressInfo['site_url'] ?? ''), '/');
 if ($wordpressBaseUrl === '') $wordpressBaseUrl = $publicBaseUrl;
 $wordpressAdminDashboardUrl = $wordpressBaseUrl !== '' ? $wordpressBaseUrl . '/wp-admin/' : '/wp-admin/';
+$drupalBaseUrl = rtrim((string) ($drupalInfo['site_url'] ?? ''), '/');
+if ($drupalBaseUrl === '') $drupalBaseUrl = $publicBaseUrl;
+$drupalAdminDashboardUrl = $drupalBaseUrl !== '' ? $drupalBaseUrl . '/admin/' : '/admin/';
 $phpbbBaseUrl = rtrim((string) ($phpbbInfo['site_url'] ?? ''), '/');
 if ($phpbbBaseUrl === '') $phpbbBaseUrl = $publicBaseUrl;
 $phpbbAdminDashboardUrl = $phpbbBaseUrl !== '' ? $phpbbBaseUrl . '/adm/' : '/adm/';
@@ -869,6 +875,10 @@ if (($_GET['database'] ?? '') === 'created') {
 
 if (($_GET['wordpress'] ?? '') === 'installed') {
     $message = 'WordPress installed successfully.';
+}
+
+if (($_GET['drupal'] ?? '') === 'installed') {
+    $message = 'Drupal installed successfully.';
 }
 
 if (($_GET['phpbb'] ?? '') === 'installed') {
@@ -1960,6 +1970,98 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    if ($action === 'install_drupal') {
+        $siteUrl = rtrim(trim((string) ($_POST['site_url'] ?? '')), '/');
+        $siteName = trim((string) ($_POST['drupal_site_name'] ?? ''));
+        $adminUser = trim((string) ($_POST['drupal_admin_user'] ?? ''));
+        $adminEmail = trim((string) ($_POST['drupal_admin_email'] ?? ''));
+        $adminPassword = (string) ($_POST['drupal_admin_password'] ?? '');
+        $adminPasswordConfirm = (string) ($_POST['drupal_admin_password_confirm'] ?? '');
+        $dbMode = (string) ($_POST['db_mode'] ?? 'auto');
+        $localFileOnly = (string) ($_POST['local_file_only'] ?? '') === '1';
+
+        if ((string) ($_POST['accept_drupal_terms'] ?? '') !== '1') {
+            $error = 'Accept the Drupal license terms before installing Drupal.';
+        } elseif (!$databaseConfigured) {
+            $error = 'Configure the MariaDB administrator account before installing Drupal.';
+        } elseif (!$lswsPasswordConfigured) {
+            $error = 'Generate and save the OpenLiteSpeed WebAdmin password before installing Drupal.';
+        } elseif (!$realIpReady) {
+            $error = 'Real client IP forwarding must work before installing Drupal; otherwise IP-based protection cannot identify the real visitor.';
+        } elseif (!$domainOnlyReady) {
+            $error = 'Open Everlomp through its HTTPS domain without an explicit port before installing Drupal. Do not use domain:port or a raw IP address.';
+        } elseif ($primaryApp !== '') {
+            $error = 'A primary application is already installed.';
+        } elseif (!filter_var($siteUrl, FILTER_VALIDATE_URL) || !str_starts_with($siteUrl, 'https://')) {
+            $error = 'Enter a valid HTTPS site URL.';
+        } elseif (parse_url($siteUrl, PHP_URL_PORT) !== null || filter_var((string) parse_url($siteUrl, PHP_URL_HOST), FILTER_VALIDATE_IP) !== false) {
+            $error = 'The Drupal site URL must use a domain without an explicit port. Use https://example.com, never domain:port or a raw IP.';
+        } elseif ($siteName === '' || strlen($siteName) > 120) {
+            $error = 'Drupal site name is required and must be 120 characters or fewer.';
+        } elseif (!preg_match('/^[A-Za-z0-9_.@-]{3,60}$/', $adminUser)) {
+            $error = 'Drupal admin username must be 3-60 characters.';
+        } elseif (!filter_var($adminEmail, FILTER_VALIDATE_EMAIL)) {
+            $error = 'Enter a valid Drupal admin email.';
+        } elseif (strlen($adminPassword) < 12) {
+            $error = 'Use a Drupal admin password with at least 12 characters.';
+        } elseif ($adminPassword !== $adminPasswordConfirm) {
+            $error = 'The Drupal admin passwords do not match.';
+        } elseif (!in_array($dbMode, ['auto', 'existing'], true)) {
+            $error = 'Invalid database mode.';
+        } else {
+            $payload = [
+                'site_url'        => $siteUrl,
+                'site_name'       => $siteName,
+                'admin_user'      => $adminUser,
+                'admin_email'     => $adminEmail,
+                'admin_password'  => $adminPassword,
+                'db_mode'         => $dbMode,
+                'local_file_only' => $localFileOnly,
+            ];
+
+            if ($dbMode === 'auto') {
+                $dbName = trim((string) ($_POST['auto_db_name'] ?? 'drupal'));
+                if (!preg_match('/^[A-Za-z0-9_]{1,64}$/', $dbName)) {
+                    $error = 'Automatic database name may contain only letters, numbers, and underscores.';
+                } else {
+                    $payload['database_name'] = $dbName;
+                }
+            } else {
+                $dbHost = trim((string) ($_POST['existing_db_host'] ?? ''));
+                $dbPort = trim((string) ($_POST['existing_db_port'] ?? ''));
+                $dbName = trim((string) ($_POST['existing_db_name'] ?? ''));
+                $dbUser = trim((string) ($_POST['existing_db_user'] ?? ''));
+                $dbPass = (string) ($_POST['existing_db_password'] ?? '');
+                $dbError = validateCommonDatabaseFields($dbHost, $dbPort, $dbName, $dbUser, $dbPass);
+
+                if ($dbError !== '') {
+                    $error = $dbError;
+                } else {
+                    $payload['database_host'] = $dbHost;
+                    $payload['database_port'] = $dbPort;
+                    $payload['database_name'] = $dbName;
+                    $payload['database_user'] = $dbUser;
+                    $payload['database_password'] = $dbPass;
+                }
+            }
+
+            if ($error === '') {
+                [$code, $stdout, $stderr] = runEverlompHelper(
+                    '/usr/local/sbin/everlomp-drupal',
+                    'install',
+                    json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)
+                );
+
+                if ($code === 0) {
+                    header('Location: ' . $panelUrl . '?drupal=installed');
+                    exit;
+                }
+
+                $error = $stderr !== '' ? $stderr : ($stdout !== '' ? $stdout : 'Drupal installation failed.');
+            }
+        }
+    }
+
     if ($action === 'install_phpbb') {
         $siteUrl = rtrim(trim((string) ($_POST['site_url'] ?? '')), '/');
         $boardName = trim((string) ($_POST['phpbb_board_name'] ?? ''));
@@ -2093,6 +2195,7 @@ $primaryApp = readTextFile($primaryAppFile);
 $externalInstallers = readExternalInstallerPackages($externalInstallerDir);
 $externalInstalledId = externalInstallerIdFromPrimary($primaryApp);
 $wordpressInstalled = $primaryApp === 'wordpress';
+$drupalInstalled = $primaryApp === 'drupal';
 $phpbbInstalled = $primaryApp === 'phpbb';
 $phpmyadminInstalled = is_file($phpmyadminIndexFile);
 $hotpocketEnabled = is_file($hotpocketEnabledFile);
@@ -2137,6 +2240,13 @@ $view = (string) ($_GET['install'] ?? '');
 $showBackupManager = (string) ($_GET['view'] ?? '') === 'backup';
 $showWordPressInstaller = (
     $view === 'wordpress'
+    && $primaryApp === ''
+    && $databaseConfigured
+    && $lswsPasswordConfigured
+);
+
+$showDrupalInstaller = (
+    $view === 'drupal'
     && $primaryApp === ''
     && $databaseConfigured
     && $lswsPasswordConfigured
@@ -2668,6 +2778,89 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 <div class="terms-scroll"><?php if ($everlompTerms !== ''): ?><?= h($everlompTerms) ?><?php else: ?>No terms text was found. Expected file: /home/everlomp/terms.md<?php endif; ?></div>
 </section>
 
+<?php elseif ($showDrupalInstaller): ?>
+
+<a target="_blank" rel="noopener noreferrer" class="back" href="<?= h($panelUrl) ?>">← Back to Everlomp</a>
+<section class="hero"><h2>Install Drupal.</h2><p>Install Drupal 11.4.5 with a fresh restricted local database, or use an existing MySQL/MariaDB database.</p></section>
+<?php if ($error !== ''): ?><div class="notice error"><?= h($error) ?></div><?php endif; ?>
+
+<section class="card full">
+<form method="post" autocomplete="off">
+<input type="hidden" name="action" value="install_drupal">
+
+<label>Site URL<input type="url" name="site_url" value="<?= h($detectedSiteUrl) ?>" required></label>
+<label>Site name<input type="text" name="drupal_site_name" maxlength="120" placeholder="My Drupal Site" required></label>
+
+<div class="split">
+<label>Drupal admin username<input type="text" name="drupal_admin_user" value="admin" maxlength="60" required></label>
+<label>Drupal admin email<input type="email" name="drupal_admin_email" value="admin@local.local" required></label>
+</div>
+
+<div class="split">
+<label>Drupal admin password<input type="password" name="drupal_admin_password" minlength="12" autocomplete="new-password" required></label>
+<label>Confirm Drupal admin password<input type="password" name="drupal_admin_password_confirm" minlength="12" autocomplete="new-password" required></label>
+</div>
+
+<h3>Installer source</h3>
+<label class="db-option">
+<input type="checkbox" name="local_file_only" value="1">
+<span><strong>Install Drupal core with local file only</strong><span>Skip Drupal.org and install only from <code>/home/everlomp/drupal-11.4.5.tar.gz</code>. Otherwise Everlomp downloads 11.4.5, verifies its SHA-256, and falls back to the bundled archive on failure.</span></span>
+</label>
+
+<div class="warning"><strong>Email delivery:</strong> this Everlomp image does not include a local mail-transfer service. Configure an external mail provider/module after installation if the site needs reliable outbound mail.</div>
+
+<h3>Database</h3>
+<div class="db-choice">
+<label class="db-option">
+<input type="radio" name="db_mode" value="auto" checked onchange="toggleDb('drupal')">
+<span><strong>Create one automatically</strong><span>Everlomp creates a local database, restricted DB user, and random password.</span></span>
+</label>
+<label class="db-option">
+<input type="radio" name="db_mode" value="existing" onchange="toggleDb('drupal')">
+<span><strong>Use an existing database</strong><span>Use any existing MySQL/MariaDB host, database, username, and password.</span></span>
+</label>
+</div>
+
+<div id="drupal-auto-db">
+<label>New database name<input type="text" name="auto_db_name" value="drupal" maxlength="64" pattern="[A-Za-z0-9_]+"></label>
+</div>
+
+<div id="drupal-existing-db" class="hidden">
+<div class="split">
+<label>Database host<input type="text" name="existing_db_host" value="localhost"></label>
+<label>Database port <small>(optional)</small><input type="text" name="existing_db_port" placeholder="3306"></label>
+</div>
+<div class="split">
+<label>Database name<input type="text" name="existing_db_name"></label>
+<label>Database username<input type="text" name="existing_db_user"></label>
+</div>
+<label>Database password<input type="password" name="existing_db_password" autocomplete="new-password"></label>
+</div>
+
+<div class="terms-agreements">
+<label class="terms-check">
+<input type="checkbox" name="accept_drupal_terms" value="1" required>
+<span>I have read and agree to the <a target="_blank" rel="noopener noreferrer" href="https://www.drupal.org/about/licensing">Drupal licensing terms (GPL-2.0-or-later)</a>.</span>
+</label>
+<label class="terms-check">
+<input type="checkbox" name="accept_everlomp_terms" value="1" required>
+<span>I have read and agreed to the <a target="_blank" rel="noopener noreferrer" href="#everlomp-installation-terms">terms and conditions for this app, visible on this installation page</a>.</span>
+</label>
+</div>
+
+<div class="actions">
+<button type="submit">Install Drupal</button>
+<a target="_blank" rel="noopener noreferrer" class="button secondary" href="<?= h($panelUrl) ?>">Cancel</a>
+</div>
+</form>
+</section>
+
+<section class="card full terms-card" id="everlomp-installation-terms">
+<h3>Terms and conditions for this installation</h3>
+<p>These terms are loaded from <code>/home/everlomp/terms.md</code>.</p>
+<div class="terms-scroll"><?php if ($everlompTerms !== ''): ?><?= h($everlompTerms) ?><?php else: ?>No terms text was found. Expected file: /home/everlomp/terms.md<?php endif; ?></div>
+</section>
+
 <?php elseif ($showPhpbbInstaller): ?>
 
 <a target="_blank" rel="noopener noreferrer" class="back" href="<?= h($panelUrl) ?>">← Back to Everlomp</a>
@@ -2883,6 +3076,8 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
         'FileGator' => $filegatorInstalled ? $fileGatorDashboardUrl : '',
         'WordPress site' => $wordpressInstalled ? ($wordpressBaseUrl !== '' ? $wordpressBaseUrl . '/' : '/') : '',
         'WordPress wp-admin' => $wordpressInstalled ? $wordpressAdminDashboardUrl : '',
+        'Drupal site' => $drupalInstalled ? ($drupalBaseUrl !== '' ? $drupalBaseUrl . '/' : '/') : '',
+        'Drupal Admin' => $drupalInstalled ? $drupalAdminDashboardUrl : '',
         'phpBB forum' => $phpbbInstalled ? ($phpbbBaseUrl !== '' ? $phpbbBaseUrl . '/' : '/') : '',
         'phpBB Admin' => $phpbbInstalled ? $phpbbAdminDashboardUrl : '',
         'External application' => $externalInstalledId !== '' ? $externalSiteUrl : '',
@@ -3007,12 +3202,17 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
 <section id="wizard-step-5" class="wizard-panel" data-step="5">
 <div class="wizard-kicker">Step 5 of 9 · Primary application</div>
 <h2 class="wizard-title">Choose what this server will run.</h2>
-<p class="wizard-lead">Availability is calculated from the server state. WordPress, phpBB, and uploaded external packages are primary-app alternatives: you can install one, not multiple. External package requirements are declared by their manifest.</p>
+<p class="wizard-lead">Availability is calculated from the server state. WordPress, Drupal, phpBB, and uploaded external packages are primary-app alternatives: you can install one, not multiple. External package requirements are declared by their manifest.</p>
 <div id="wizard-apps-content" class="wizard-choice-grid">
 <section class="choice-card <?= $wordpressInstalled ? 'recommended' : '' ?>">
 <span class="choice-badge"><?= $wordpressInstalled ? 'Installed' : ($primaryApp === '' ? 'Available' : 'Unavailable') ?></span><h3>WordPress</h3><p>CMS, blog, and website platform. The installer can auto-create a restricted local database or use an existing MySQL/MariaDB database. Outbound email requires an external SMTP/mail provider; WP Mail SMTP is available as an optional install add-on.</p>
 <div class="wizard-actions"><?php if ($wordpressInstalled): ?><a class="button" target="_blank" rel="noopener noreferrer" href="<?= h($wordpressBaseUrl !== '' ? $wordpressBaseUrl . '/' : '/') ?>">Open Site</a><a class="button secondary" target="_blank" rel="noopener noreferrer" href="<?= h($wordpressAdminDashboardUrl) ?>">Admin</a><?php elseif ($primaryApp === ''): ?><button type="button" onclick="openAppInstaller('wordpress')">Configure &amp; Install</button><?php else: ?><button type="button" disabled>Another primary app is installed</button><?php endif; ?></div>
 <?php if ($wordpressInstalled): ?><div class="access-box"><div class="access-box-title"><strong>WordPress wp-admin</strong></div><div class="copy-field"><input id="url-wordpress-admin" type="text" readonly value="<?= h($wordpressAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('url-wordpress-admin',this)">Copy URL</button></div></div><?php endif; ?>
+</section>
+<section class="choice-card <?= $drupalInstalled ? 'recommended' : '' ?>">
+<span class="choice-badge"><?= $drupalInstalled ? 'Installed' : ($primaryApp === '' ? 'Available' : 'Unavailable') ?></span><h3>Drupal</h3><p>Drupal 11 CMS with a pinned, SHA-256-verified core archive. Everlomp can auto-create a restricted MariaDB database, use existing credentials, and fall back to the bundled Drupal tarball when Drupal.org is unavailable.</p>
+<div class="wizard-actions"><?php if ($drupalInstalled): ?><a class="button" target="_blank" rel="noopener noreferrer" href="<?= h($drupalBaseUrl !== '' ? $drupalBaseUrl . '/' : '/') ?>">Open Site</a><a class="button secondary" target="_blank" rel="noopener noreferrer" href="<?= h($drupalAdminDashboardUrl) ?>">Admin</a><?php elseif ($primaryApp === ''): ?><button type="button" onclick="openAppInstaller('drupal')">Configure &amp; Install</button><?php else: ?><button type="button" disabled>Another primary app is installed</button><?php endif; ?></div>
+<?php if ($drupalInstalled): ?><div class="access-box"><div class="access-box-title"><strong>Drupal administration</strong></div><div class="copy-field"><input id="url-drupal-admin" type="text" readonly value="<?= h($drupalAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('url-drupal-admin',this)">Copy URL</button></div></div><?php endif; ?>
 </section>
 <section class="choice-card <?= $phpbbInstalled ? 'recommended' : '' ?>">
 <span class="choice-badge"><?= $phpbbInstalled ? 'Installed' : ($primaryApp === '' ? 'Available' : 'Unavailable') ?></span><h3>phpBB</h3><p>Community forum software. Like WordPress, it supports either an automatically created restricted database or existing database credentials. Outbound email requires an external SMTP server, which can be configured during installation.</p>
@@ -3074,7 +3274,7 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <div class="status good">● HotPocket enabled</div><h3>Smart-contract runtime is active</h3><p>Supervisor is configured to autostart HotPocket and keep it running. The bootstrap contract can run here so contracts can be deployed to this runtime.</p>
 <?php else: ?>
 <div class="wizard-callout"><div class="wizard-callout-icon">i</div><div><strong>This is the one installer opportunity to enable HotPocket.</strong><br>If you do not need smart contracts, leave it off. If you skip it and later remove the installer, the Everlomp installer will no longer be available to enable it for you.</div></div>
-<div class="wizard-choice-grid" style="margin-top:16px"><div class="choice-card recommended"><span class="choice-badge">For smart contracts</span><h3>Enable HotPocket</h3><p>Starts HotPocket now, enables autostart, and prepares the bootstrap-contract runtime for deployments.</p><form method="post" class="wizard-ajax-form"><input type="hidden" name="action" value="enable_hotpocket"><div class="terms-agreements"><label class="terms-check"><input type="checkbox" name="accept_hotpocket_terms" value="1" required><span>I accept the <a target="_blank" rel="noopener noreferrer" href="https://github.com/EvernodeXRPL/hpcore/blob/main/evernode-license.pdf">HotPocket license terms</a>.</span></label></div><div class="wizard-actions"><button type="submit">Enable HotPocket</button></div></form></div><div class="choice-card"><span class="choice-badge">Normal web apps</span><h3>Keep it off</h3><p>Recommended if you only need WordPress, phpBB, PHP/web files, or other non-smart-contract workloads.</p><div class="wizard-actions"><button type="button" class="secondary" onclick="skipHotPocket()">Continue without HotPocket</button></div></div></div>
+<div class="wizard-choice-grid" style="margin-top:16px"><div class="choice-card recommended"><span class="choice-badge">For smart contracts</span><h3>Enable HotPocket</h3><p>Starts HotPocket now, enables autostart, and prepares the bootstrap-contract runtime for deployments.</p><form method="post" class="wizard-ajax-form"><input type="hidden" name="action" value="enable_hotpocket"><div class="terms-agreements"><label class="terms-check"><input type="checkbox" name="accept_hotpocket_terms" value="1" required><span>I accept the <a target="_blank" rel="noopener noreferrer" href="https://github.com/EvernodeXRPL/hpcore/blob/main/evernode-license.pdf">HotPocket license terms</a>.</span></label></div><div class="wizard-actions"><button type="submit">Enable HotPocket</button></div></form></div><div class="choice-card"><span class="choice-badge">Normal web apps</span><h3>Keep it off</h3><p>Recommended if you only need WordPress, Drupal, phpBB, PHP/web files, or other non-smart-contract workloads.</p><div class="wizard-actions"><button type="button" class="secondary" onclick="skipHotPocket()">Continue without HotPocket</button></div></div></div>
 <?php endif; ?>
 </div>
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(5)">← Applications</button><button type="button" onclick="completeHotPocketStep()" <?= $hotpocketEnabled ? '' : 'disabled data-hotpocket-continue' ?>>Continue to Backups →</button></div>
@@ -3126,13 +3326,14 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <?php if ($phpmyadminInstalled): ?><div class="copy-field"><input data-dashboard-label="phpMyAdmin" data-dashboard-url id="finish-url-phpmyadmin" type="text" readonly value="<?= h($phpMyAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-phpmyadmin',this)">Copy</button></div><?php endif; ?>
 <?php if ($lswsPasswordConfigured): ?><div class="copy-field"><input data-dashboard-label="OpenLiteSpeed WebAdmin" data-dashboard-url id="finish-url-openlitespeed" type="text" readonly value="<?= h($openLiteSpeedDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-openlitespeed',this)">Copy</button></div><?php endif; ?>
 <?php if ($wordpressInstalled): ?><div class="copy-field"><input data-dashboard-label="WordPress wp-admin" data-dashboard-url id="finish-url-wordpress" type="text" readonly value="<?= h($wordpressAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-wordpress',this)">Copy</button></div><?php endif; ?>
+<?php if ($drupalInstalled): ?><div class="copy-field"><input data-dashboard-label="Drupal Admin" data-dashboard-url id="finish-url-drupal" type="text" readonly value="<?= h($drupalAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-drupal',this)">Copy</button></div><?php endif; ?>
 <?php if ($phpbbInstalled): ?><div class="copy-field"><input data-dashboard-label="phpBB Admin" data-dashboard-url id="finish-url-phpbb" type="text" readonly value="<?= h($phpbbAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-phpbb',this)">Copy</button></div><?php endif; ?>
 <?php if ($externalInstalledId !== ''): ?><div class="copy-field"><input data-dashboard-label="External application" data-dashboard-url id="finish-url-external" type="text" readonly value="<?= h($externalSiteUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-external',this)">Copy</button></div><?php endif; ?>
 <?php if ($filegatorInstalled): ?><div class="copy-field"><input data-dashboard-label="FileGator" data-dashboard-url id="finish-url-filegator" type="text" readonly value="<?= h($fileGatorDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-filegator',this)">Copy</button></div><?php endif; ?>
 <?php if ($kopiaConfigured): ?><div class="copy-field"><input data-dashboard-label="Kopia" data-dashboard-url id="finish-url-kopia" type="text" readonly value="<?= h($kopiaDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-kopia',this)">Copy</button></div><div class="copy-field"><input data-dashboard-label="Kopia Replication" data-dashboard-url id="finish-url-kopia-replication" type="text" readonly value="<?= h($kopiaReplicationDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-kopia-replication',this)">Copy</button></div><?php endif; ?>
 </div></div>
 </div>
-<div class="finish-warning" style="margin-top:16px"><h3>⚠ Remove the Everlomp installer when you are done.</h3><p>Leaving <strong>/install.php</strong> exposed means leaving an administrative installation surface on the server. Removing it deletes the installer interface, the original redirecting bootstrap index if it is still unchanged, helper programs, installer metadata, bundled WordPress/phpBB installation files, uploaded external-installer packages, and the installer’s passwordless web sudo permissions.</p><p><strong>It does not remove</strong> your installed primary application (WordPress, phpBB, or external), FileGator, phpMyAdmin, OpenLiteSpeed, MariaDB, HotPocket, Kopia, SSH if you enabled it, or application/database data.</p><?php if ($primaryApp !== '' && $sshDecisionMade): ?><form method="post" onsubmit="return confirm('Permanently remove the Everlomp installer, helper programs, and bundled installation files? This cannot be undone from the installer.');"><input type="hidden" name="action" value="delete_everlomp_installfile"><div class="wizard-actions"><button type="submit">Permanently Remove Everlomp Installer</button></div></form><?php elseif ($primaryApp === ''): ?><div class="wizard-lock">Install a primary application before the installer can be removed.</div><?php else: ?><div class="wizard-lock">Choose whether SSH should be enabled before the installer can be removed.</div><?php endif; ?></div>
+<div class="finish-warning" style="margin-top:16px"><h3>⚠ Remove the Everlomp installer when you are done.</h3><p>Leaving <strong>/install.php</strong> exposed means leaving an administrative installation surface on the server. Removing it deletes the installer interface, the original redirecting bootstrap index if it is still unchanged, helper programs, installer metadata, bundled WordPress/Drupal/phpBB installation files, uploaded external-installer packages, and the installer’s passwordless web sudo permissions.</p><p><strong>It does not remove</strong> your installed primary application (WordPress, Drupal, phpBB, or external), FileGator, phpMyAdmin, OpenLiteSpeed, MariaDB, HotPocket, Kopia, SSH if you enabled it, or application/database data.</p><?php if ($primaryApp !== '' && $sshDecisionMade): ?><form method="post" onsubmit="return confirm('Permanently remove the Everlomp installer, helper programs, and bundled installation files? This cannot be undone from the installer.');"><input type="hidden" name="action" value="delete_everlomp_installfile"><div class="wizard-actions"><button type="submit">Permanently Remove Everlomp Installer</button></div></form><?php elseif ($primaryApp === ''): ?><div class="wizard-lock">Install a primary application before the installer can be removed.</div><?php else: ?><div class="wizard-lock">Choose whether SSH should be enabled before the installer can be removed.</div><?php endif; ?></div>
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(8)">← SSH</button><button type="button" class="secondary" onclick="showWizardStep(1)">Review from the beginning</button></div>
 </section>
 </main>
@@ -3672,6 +3873,8 @@ function wizardSummaryFieldLabel(field) {
         db_username:'MariaDB admin username', db_password:'MariaDB admin password',
         site_url:'Site URL', site_title:'WordPress site title', wp_admin_user:'WordPress admin username',
         wp_admin_email:'WordPress admin email', wp_admin_password:'WordPress admin password',
+        drupal_site_name:'Drupal site name', drupal_admin_user:'Drupal admin username',
+        drupal_admin_email:'Drupal admin email', drupal_admin_password:'Drupal admin password',
         phpbb_board_name:'phpBB board name', phpbb_board_description:'phpBB board description',
         phpbb_admin_user:'phpBB admin username', phpbb_admin_email:'phpBB admin email', phpbb_admin_password:'phpBB admin password',
         phpbb_smtp_enabled:'phpBB SMTP enabled', phpbb_smtp_host:'phpBB SMTP host', phpbb_smtp_port:'phpBB SMTP port',
@@ -4098,13 +4301,11 @@ async function submitAppInstaller(event) {
             refreshWizardTransitionButtons();
             captureVisibleWizardDetails(document);
 
-            if (app === 'wordpress') {
-                showWizardNotice('WordPress installed successfully.', false);
-                showWizardStep(6);
-            } else {
-                showWizardNotice((app === 'phpbb' ? 'phpBB' : 'External application') + ' installed successfully.', false);
-                showWizardStep(6);
-            }
+            const appName = app === 'wordpress'
+                ? 'WordPress'
+                : (app === 'drupal' ? 'Drupal' : (app === 'phpbb' ? 'phpBB' : 'External application'));
+            showWizardNotice(appName + ' installed successfully.', false);
+            showWizardStep(6);
             return;
         }
         const error = doc.querySelector('.notice.error');
