@@ -13,7 +13,7 @@ SHOW_TIMESTAMP="$(jq -r '.fields.show_timestamp // false' <<<"$PAYLOAD")"
 
 # This example behaves like a primary application installer: preserve the
 # /install.php setup page while replacing everything else in the public web root.
-find /var/www/html -mindepth 1 -maxdepth 1 ! -name install.php -exec rm -rf -- {} +
+find /var/www/html -mindepth 1 -maxdepth 1 ! -name lompinstaller.php -exec rm -rf -- {} +
 
 TITLE_ESCAPED="$(python3 -c 'import html,sys; print(html.escape(sys.stdin.read()))' <<<"$SITE_TITLE")"
 TIMESTAMP_HTML=""
