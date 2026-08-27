@@ -50,4 +50,6 @@ Get support and get involved at https://discord.gg/DAQszjKEBV (Evernode Communit
 Dockerhub image: everlomp/everlomp:latest
 
 Comment:
-This code has no guarantee, it's just a vision of how everlomp should look like. I hope someone forks this and make it better. For example, the decryption key secret could be loaded with less read permissions. Working on migration between servers could be worth while, it would be interesting to work on easily restoreable database snapshots.
+This code has no guarantee, it's just a vision of how everlomp should look like. I hope someone forks this and make it better. For example, the decryption key secret could be loaded with less read permissions. Working on migration between servers could be worth while, it would be interesting to work on easily restoreable database snapshots. Processes should not leak any sensetive data, but I have not had time to review that.
+
+This project comes with no warranties, it need to be audited and improved to be considered fully safe.
