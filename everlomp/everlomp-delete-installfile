@@ -43,7 +43,7 @@ case "$PRIMARY_APP" in
         ;;
 esac
 
-INSTALL_FILE="${WEB_ROOT}/install.php"
+INSTALL_FILE="${WEB_ROOT}/lompinstaller.php"
 BOOTSTRAP_INDEX="${WEB_ROOT}/index.php"
 
 echo "[Everlomp] Primary application: $PRIMARY_APP"
@@ -89,7 +89,7 @@ if [ -f "$BOOTSTRAP_INDEX" ] && [ ! -L "$BOOTSTRAP_INDEX" ]; then
 <?php
 declare(strict_types=1);
 
-header('Location: /install.php', true, 302);
+header('Location: /lompinstaller.php', true, 302);
 exit;
 PHP
 )"
