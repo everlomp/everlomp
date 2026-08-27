@@ -1,0 +1,123 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG="/home/everlomp/backup.json"
+BACKUP_DIR="/home/everlomp/everbackups/sql"
+LOG_DIR="/var/log/everlomp"
+LOG_FILE="$LOG_DIR/sql-backup.log"
+LOCK_FILE="/run/everlomp-sql-backup.lock"
+SOCKET="/run/mysqld/mysqld.sock"
+
+mkdir -p "$LOG_DIR"
+touch "$LOG_FILE"
+chmod 0640 "$LOG_FILE" || true
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] SQL backup skipped: another backup is running." >> "$LOG_FILE"
+    exit 0
+fi
+
+update_state() {
+    local status="$1"
+    local file="${2:-}"
+    local detail="${3:-}"
+
+    mkdir -p /home/everlomp
+    [ -f "$CONFIG" ] || printf '{}\n' > "$CONFIG"
+
+    python3 - "$CONFIG" "$status" "$file" "$detail" <<'PY'
+from pathlib import Path
+import datetime, json, os, sys, tempfile
+
+path = Path(sys.argv[1])
+status, filename, detail = sys.argv[2:5]
+try:
+    data = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+data['sql_last_run'] = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z')
+data['sql_last_status'] = status
+if filename:
+    data['sql_last_file'] = filename
+if detail:
+    data['sql_last_detail'] = detail[-1000:]
+
+fd, tmp = tempfile.mkstemp(prefix='.backup.', dir=str(path.parent))
+os.close(fd)
+Path(tmp).write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
+os.replace(tmp, path)
+# backup.json contains UI/status data, not credentials. Keep it owned by
+# root but readable by both supported PHP runtime users (nobody/www-data).
+try:
+    os.chown(path, 0, 0)
+except Exception:
+    pass
+os.chmod(path, 0o644)
+PY
+}
+
+fail() {
+    local rc=$?
+    local msg="SQL backup failed with exit code $rc"
+    echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $msg" >> "$LOG_FILE"
+    update_state "failed" "" "$msg" || true
+    exit "$rc"
+}
+trap fail ERR
+
+if [ ! -S "$SOCKET" ]; then
+    echo "MariaDB socket is unavailable: $SOCKET" >&2
+    exit 2
+fi
+
+mkdir -p "$BACKUP_DIR"
+chmod 0700 "$BACKUP_DIR"
+
+KEEP=7
+if [ -f "$CONFIG" ]; then
+    value="$(jq -r '.sql_keep // 7' "$CONFIG" 2>/dev/null || echo 7)"
+    if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le 365 ]; then
+        KEEP="$value"
+    fi
+fi
+
+STAMP="$(date -u +'%Y%m%d-%H%M%S')"
+FINAL="$BACKUP_DIR/all-databases-$STAMP.sql.gz"
+TMP="$FINAL.tmp"
+
+umask 077
+
+echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Starting MariaDB logical backup." >> "$LOG_FILE"
+
+mariadb-dump \
+    --protocol=socket \
+    --socket="$SOCKET" \
+    --all-databases \
+    --single-transaction \
+    --quick \
+    --routines \
+    --events \
+    --triggers \
+    --hex-blob \
+    --skip-lock-tables \
+    | gzip -9 > "$TMP"
+
+mv "$TMP" "$FINAL"
+chmod 0600 "$FINAL"
+
+mapfile -t OLD < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'all-databases-*.sql.gz' -printf '%T@ %p\n' \
+    | sort -nr \
+    | awk -v keep="$KEEP" 'NR > keep {sub(/^[^ ]+ /, ""); print}')
+
+if [ "${#OLD[@]}" -gt 0 ]; then
+    rm -f -- "${OLD[@]}"
+fi
+
+SIZE="$(du -h "$FINAL" | awk '{print $1}')"
+echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] SQL backup complete: $FINAL ($SIZE), keeping $KEEP dumps." >> "$LOG_FILE"
+update_state "success" "$FINAL" "size=$SIZE keep=$KEEP"
+trap - ERR

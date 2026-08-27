@@ -1,0 +1,1135 @@
+#!/usr/bin/env python3
+import base64
+import contextlib
+import datetime as dt
+import fcntl
+import hmac
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+import pexpect
+
+BASE = Path('/home/everlomp/kopia')
+SECRET_ROOT = Path('/home/everlomp/secrets')
+KOPIA_SECRETS = SECRET_ROOT / 'kopia'
+CONFIG = BASE / 'replication.json'
+SECRETS = KOPIA_SECRETS / 'replication'
+SOURCE_PASSWORD = KOPIA_SECRETS / 'repository.password'
+PENDING_SOURCE_PASSWORD = KOPIA_SECRETS / 'repository.password.pending'
+REPO_CONFIG = KOPIA_SECRETS / 'repository.config'
+RUNTIME_REPO_CONFIG = BASE / '.replication-repository.config'
+WEB_PASSWORD = KOPIA_SECRETS / 'webui.password'
+KOPIA_CANDIDATES = [Path('/usr/local/bin/kopia'), Path('/usr/bin/kopia')]
+RCLONE = shutil.which('rclone') or '/usr/bin/rclone'
+SSH_KEYSCAN = shutil.which('ssh-keyscan') or '/usr/bin/ssh-keyscan'
+SSH = shutil.which('ssh') or '/usr/bin/ssh'
+SSH_KEYGEN = shutil.which('ssh-keygen') or '/usr/bin/ssh-keygen'
+LOCK = BASE / '.replication.lock'
+API_HOST = '127.0.0.1'
+API_PORT = 51516
+VALID_PROVIDERS = {'filesystem', 'sftp', 'webdav', 's3', 'from-config', 'rclone'}
+VALID_SCHEDULES = {'manual', 'hourly', 'every6h', 'every12h', 'daily', 'weekly'}
+PRIV_HELPER = '/usr/local/sbin/everlomp-kopia-priv'
+SUDO = '/usr/bin/sudo'
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+
+
+def ensure_dirs():
+    BASE.mkdir(parents=True, exist_ok=True)
+    os.chmod(BASE, 0o700)
+
+
+def atomic_json(path: Path, data, mode=0o600):
+    ensure_dirs()
+    fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write('\n')
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+@contextlib.contextmanager
+def state_lock(exclusive=True):
+    ensure_dirs()
+    fd = os.open(str(LOCK), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def load_state_unlocked():
+    if not CONFIG.exists():
+        return {'version': 1, 'replicas': []}
+    try:
+        data = json.loads(CONFIG.read_text(encoding='utf-8'))
+    except Exception:
+        return {'version': 1, 'replicas': []}
+    if not isinstance(data, dict):
+        return {'version': 1, 'replicas': []}
+    if not isinstance(data.get('replicas'), list):
+        data['replicas'] = []
+    data['version'] = 1
+    return data
+
+
+def load_state():
+    with state_lock(False):
+        return load_state_unlocked()
+
+
+def save_state(data):
+    with state_lock(True):
+        atomic_json(CONFIG, data)
+
+
+def _privileged(*args, input_data=None, capture_output=False, timeout=120):
+    return subprocess.run(
+        [SUDO, '-n', PRIV_HELPER, *map(str, args)],
+        input=input_data,
+        capture_output=capture_output,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _privileged_json(*args, payload=None, timeout=120):
+    if payload is None:
+        raw = None
+    elif isinstance(payload, bytes):
+        raw = payload
+    elif isinstance(payload, str):
+        raw = payload.encode('utf-8')
+    else:
+        raw = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    cp = _privileged(*args, input_data=raw, capture_output=True, timeout=timeout)
+    if cp.returncode != 0:
+        detail = (cp.stderr or cp.stdout or b'').decode(errors='replace').strip()
+        raise RuntimeError(detail or 'Privileged Kopia operation failed.')
+    try:
+        data = json.loads((cp.stdout or b'{}').decode('utf-8'))
+    except Exception as exc:
+        raise RuntimeError('Privileged Kopia worker returned an invalid response.') from exc
+    if not isinstance(data, dict):
+        raise RuntimeError('Privileged Kopia worker returned an invalid response.')
+    return data
+
+
+
+def protected_secret_exists(path):
+    raise RuntimeError('Direct secret access is disabled for the unprivileged replication service.')
+
+
+
+def protected_secret_read(path):
+    raise RuntimeError('Direct secret access is disabled for the unprivileged replication service.')
+
+
+
+def protected_secret_write(path, data):
+    raise RuntimeError('Direct secret access is disabled for the unprivileged replication service.')
+
+
+
+def protected_secret_remove(path):
+    raise RuntimeError('Direct secret access is disabled for the unprivileged replication service.')
+
+
+
+def refresh_repo_config():
+    # Repository configuration remains root-only. The privileged worker opens it.
+    return source_status().get('config_present', False)
+
+
+
+def secret_path(replica_id):
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,80}', replica_id):
+        raise ValueError('invalid replica id')
+    return SECRETS / f'{replica_id}.json'
+
+
+def load_secret(replica_id):
+    raise RuntimeError('Stored replica credentials are intentionally unavailable to the unprivileged service.')
+
+
+
+def save_secret(replica_id, data):
+    raise RuntimeError('Stored replica credentials are managed only by the privileged worker.')
+
+
+
+def kopia_bin():
+    for p in KOPIA_CANDIDATES:
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    raise RuntimeError('Kopia is not installed.')
+
+
+def source_env(refresh_config=True):
+    raise RuntimeError('The unprivileged replication service never opens the primary Kopia repository.')
+
+
+
+def source_status():
+    try:
+        return _privileged_json('source-status', timeout=30)
+    except Exception as exc:
+        return {
+            'connected': False,
+            'config_present': False,
+            'password_configured': False,
+            'detail': str(exc),
+        }
+
+
+
+def set_source_password(password):
+    if not isinstance(password, str) or len(password) < 1 or len(password) > 4096:
+        raise ValueError('Enter the repository encryption password.')
+    if any(c in password for c in ('\x00', '\r', '\n')):
+        raise ValueError('Repository password contains an unsupported control character.')
+    raise RuntimeError('Repository password operations are handled by the isolated Kopia admin endpoint.')
+
+
+
+def _supervisor_kopia(action):
+    raise RuntimeError('Supervisor control is not exposed to the unprivileged replication service.')
+
+
+
+def _wait_kopia_port(timeout=35):
+    # Kept for compatibility with older callers; password changes are now fully
+    # executed by the root-only worker.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(('127.0.0.1', 51515), timeout=1):
+                return
+        except OSError:
+            time.sleep(0.5)
+    raise RuntimeError('Kopia did not become ready after restart.')
+
+
+
+def _run_kopia_password_change(new_password):
+    raise RuntimeError('Repository password changes are performed only by the privileged worker.')
+
+
+
+def change_source_password(new_password):
+    if not isinstance(new_password, str) or len(new_password) < 12 or len(new_password) > 4096:
+        raise ValueError('Use a repository encryption password with at least 12 characters.')
+    if any(c in new_password for c in ('\x00', '\r', '\n')):
+        raise ValueError('Repository password contains an unsupported control character.')
+    raise RuntimeError('Repository password operations are handled by the isolated Kopia admin endpoint.')
+
+
+
+def clean_string(v, max_len, label, required=False):
+    if v is None:
+        v = ''
+    if not isinstance(v, str):
+        raise ValueError(f'{label} must be text.')
+    v = v.strip()
+    if required and not v:
+        raise ValueError(f'{label} is required.')
+    if len(v) > max_len or '\x00' in v or '\n' in v and label in {'Host', 'Endpoint'}:
+        raise ValueError(f'{label} is invalid.')
+    return v
+
+
+def parse_int(v, lo, hi, label):
+    try:
+        n = int(v)
+    except Exception:
+        raise ValueError(f'{label} must be a number.')
+    if n < lo or n > hi:
+        raise ValueError(f'{label} must be between {lo} and {hi}.')
+    return n
+
+
+
+
+def fetch_sftp_known_hosts(host, port=22, timeout=8):
+    host = clean_string(host, 255, 'Host', True)
+    port = parse_int(port, 1, 65535, 'Port')
+    if not Path(SSH_KEYSCAN).is_file() or not os.access(SSH_KEYSCAN, os.X_OK):
+        raise ValueError('ssh-keyscan is not installed in this image.')
+    try:
+        cp = subprocess.run(
+            [SSH_KEYSCAN, '-T', str(timeout), '-p', str(port), host],
+            capture_output=True, text=True, timeout=timeout + 4,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError('Timed out while fetching the SSH host key.')
+    lines = []
+    for raw in (cp.stdout or '').splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        if not (parts[1].startswith('ssh-') or parts[1].startswith('ecdsa-') or parts[1].startswith('sk-')):
+            continue
+        if line not in lines:
+            lines.append(line)
+    if not lines:
+        detail = (cp.stderr or '').strip().splitlines()
+        suffix = f' ({detail[-1]})' if detail else ''
+        raise ValueError('Could not fetch an SSH host key from the destination.' + suffix)
+    return '\n'.join(lines)
+
+
+def ensure_sftp_known_hosts(replica, secret):
+    if replica.get('provider') != 'sftp' or secret.get('known_hosts'):
+        return False
+    cfg = replica.get('config') or {}
+    secret['known_hosts'] = fetch_sftp_known_hosts(cfg.get('host'), cfg.get('port', 22))
+    return True
+
+def _redact(text, *secrets):
+    text = str(text or '')
+    for secret in secrets:
+        if isinstance(secret, str) and secret:
+            text = text.replace(secret, '[redacted]')
+    return text
+
+
+def _ssh_target(host, username):
+    host = clean_string(host, 255, 'Host', True)
+    username = clean_string(username, 255, 'Username', True)
+    if host.startswith('-') or re.search(r'\s', host):
+        raise ValueError('Invalid SSH host.')
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', username):
+        raise ValueError('SSH username contains unsupported characters.')
+    return host, username, f'{username}@{host}'
+
+
+def _known_hosts_file(tmpdir, known_hosts):
+    kh = Path(tmpdir) / 'known_hosts'
+    kh.write_text(known_hosts + ('\n' if known_hosts and not known_hosts.endswith('\n') else ''), encoding='utf-8')
+    os.chmod(kh, 0o600)
+    return kh
+
+
+def _ssh_common_args(host, port, username, known_hosts_file):
+    host, username, target = _ssh_target(host, username)
+    port = parse_int(port, 1, 65535, 'Port')
+    return [
+        '-p', str(port),
+        '-o', 'ConnectTimeout=10',
+        '-o', 'ConnectionAttempts=1',
+        '-o', 'StrictHostKeyChecking=yes',
+        '-o', f'UserKnownHostsFile={known_hosts_file}',
+        '-o', 'GlobalKnownHostsFile=/dev/null',
+        '-o', 'LogLevel=ERROR',
+        target,
+    ]
+
+
+def _ssh_with_password(host, port, username, password, known_hosts_file, command, timeout=30):
+    if not isinstance(password, str) or not password or len(password) > 4096 or any(c in password for c in ('\r', '\n', '\x00')):
+        raise ValueError('Enter a valid current remote SSH password.')
+    if not Path(SSH).is_file() or not os.access(SSH, os.X_OK):
+        raise ValueError('OpenSSH client is not installed in this image.')
+
+    args = _ssh_common_args(host, port, username, known_hosts_file)
+    args[0:0] = [
+        '-o', 'PreferredAuthentications=password,keyboard-interactive',
+        '-o', 'PubkeyAuthentication=no',
+        '-o', 'NumberOfPasswordPrompts=1',
+    ]
+    args.append(command)
+    child = pexpect.spawn(SSH, args, encoding='utf-8', timeout=timeout)
+    transcript = []
+    try:
+        idx = child.expect([r'(?i)password\s*:', pexpect.EOF, pexpect.TIMEOUT])
+        transcript.append(child.before or '')
+        if idx == 0:
+            child.sendline(password)
+            child.expect(pexpect.EOF)
+            transcript.append(child.before or '')
+        elif idx == 2:
+            raise ValueError('Timed out connecting to the remote SSH account.')
+        child.close()
+        text = _redact(''.join(transcript).strip(), password)
+        if child.exitstatus not in (0, None):
+            detail = [x.strip() for x in text.splitlines() if x.strip()]
+            raise ValueError(detail[-1] if detail else 'Remote SSH password authentication failed.')
+        if 'Permission denied' in text:
+            raise ValueError('Remote SSH password authentication failed.')
+        return text
+    finally:
+        if child.isalive():
+            child.close(force=True)
+
+
+def _change_remote_password(host, port, username, current_password, new_password, known_hosts_file, timeout=45):
+    if not isinstance(new_password, str) or len(new_password) < 12 or len(new_password) > 1024 or any(c in new_password for c in ('\r', '\n', '\x00')):
+        raise ValueError('New remote SSH password must be 12-1024 characters and contain no line breaks.')
+    args = _ssh_common_args(host, port, username, known_hosts_file)
+    args[0:0] = [
+        '-tt',
+        '-o', 'PreferredAuthentications=password,keyboard-interactive',
+        '-o', 'PubkeyAuthentication=no',
+        '-o', 'NumberOfPasswordPrompts=1',
+    ]
+    args.append('LC_ALL=C passwd')
+    child = pexpect.spawn(SSH, args, encoding='utf-8', timeout=timeout)
+    transcript = []
+    try:
+        # Authenticate the SSH connection itself.
+        idx = child.expect([r'(?i)password\s*:', pexpect.EOF, pexpect.TIMEOUT])
+        transcript.append(child.before or '')
+        if idx != 0:
+            if idx == 2:
+                raise ValueError('Timed out connecting to the remote SSH account.')
+            raise ValueError('Remote SSH password authentication failed.')
+        child.sendline(current_password)
+
+        new_prompts = 0
+        for _ in range(16):
+            idx = child.expect([
+                r'(?i)(?:current|old).*password[^:]*:',
+                r'(?i)new.*password[^:]*:',
+                r'(?i)(?:retype|repeat).*password[^:]*:',
+                r'(?i)password[^:]*:',
+                pexpect.EOF,
+                pexpect.TIMEOUT,
+            ])
+            transcript.append(child.before or '')
+            if idx == 0:
+                child.sendline(current_password)
+            elif idx == 1:
+                child.sendline(new_password)
+                new_prompts += 1
+            elif idx == 2:
+                child.sendline(new_password)
+            elif idx == 3:
+                # Some passwd/PAM variants use a generic Password: prompt.
+                child.sendline(current_password if new_prompts == 0 else new_password)
+            elif idx == 4:
+                break
+            else:
+                raise ValueError('Timed out while changing the remote SSH password.')
+        child.close()
+        text = _redact(''.join(transcript).strip(), current_password, new_password)
+        low = text.lower()
+        if child.exitstatus not in (0, None) or any(x in low for x in (
+            'password unchanged', 'authentication token manipulation error',
+            'permission denied', 'passwd: failure', 'password change failed',
+        )):
+            detail = [x.strip() for x in text.splitlines() if x.strip()]
+            raise ValueError(detail[-1] if detail else 'The remote server rejected the password change.')
+    finally:
+        if child.isalive():
+            child.close(force=True)
+
+
+def _ssh_with_key(host, port, username, keyfile, known_hosts_file, command='printf EVERLOMP_KEY_OK', timeout=25):
+    args = _ssh_common_args(host, port, username, known_hosts_file)
+    args[0:0] = [
+        '-i', str(keyfile),
+        '-o', 'BatchMode=yes',
+        '-o', 'PreferredAuthentications=publickey',
+        '-o', 'PasswordAuthentication=no',
+    ]
+    args.append(command)
+    cp = subprocess.run([SSH, *args], capture_output=True, text=True, timeout=timeout)
+    text = '\n'.join(x for x in [(cp.stdout or '').strip(), (cp.stderr or '').strip()] if x).strip()
+    if cp.returncode != 0:
+        lines = [x.strip() for x in text.splitlines() if x.strip()]
+        raise ValueError(lines[-1] if lines else 'SSH key authentication failed after installing the public key.')
+    return text
+
+
+def bootstrap_sftp_access(payload):
+    if not isinstance(payload, dict):
+        raise ValueError('Invalid SSH setup request.')
+    host = clean_string(payload.get('host'), 255, 'Host', True)
+    port = parse_int(payload.get('port', 22), 1, 65535, 'Port')
+    username = clean_string(payload.get('username'), 255, 'Username', True)
+    current_password = str(payload.get('current_password') or '')
+    known_hosts = str(payload.get('known_hosts') or '').strip()
+    change_password = bool(payload.get('change_password', False))
+    new_password = str(payload.get('new_password') or '')
+    new_password_confirm = str(payload.get('new_password_confirm') or '')
+    generate_keypair = bool(payload.get('generate_keypair', True))
+
+    if not current_password or len(current_password) > 4096 or any(c in current_password for c in ('\r', '\n', '\x00')):
+        raise ValueError('Enter a valid current remote SSH password.')
+    if change_password:
+        if new_password != new_password_confirm:
+            raise ValueError('The new remote SSH passwords do not match.')
+        if len(new_password) < 12 or len(new_password) > 1024 or any(c in new_password for c in ('\r', '\n', '\x00')):
+            raise ValueError('New remote SSH password must be 12-1024 characters and contain no line breaks.')
+    if not known_hosts:
+        known_hosts = fetch_sftp_known_hosts(host, port)
+
+    with tempfile.TemporaryDirectory(prefix='everlomp-sftp-bootstrap-', dir='/tmp') as td_raw:
+        td = Path(td_raw)
+        os.chmod(td, 0o700)
+        kh = _known_hosts_file(td, known_hosts)
+
+        # Verify the current password before making any change.
+        _ssh_with_password(host, port, username, current_password, kh, 'printf EVERLOMP_PASSWORD_OK')
+        effective_password = current_password
+        password_changed = False
+
+        if change_password:
+            _change_remote_password(host, port, username, current_password, new_password, kh)
+            effective_password = new_password
+            # Verify the new password in a fresh SSH connection before moving on.
+            _ssh_with_password(host, port, username, effective_password, kh, 'printf EVERLOMP_NEW_PASSWORD_OK')
+            password_changed = True
+
+        private_key = ''
+        public_key = ''
+        fingerprint = ''
+        if generate_keypair:
+            if not Path(SSH_KEYGEN).is_file() or not os.access(SSH_KEYGEN, os.X_OK):
+                raise ValueError('ssh-keygen is not installed in this image.')
+            keyfile = td / 'id_ed25519'
+            cp = subprocess.run(
+                [SSH_KEYGEN, '-q', '-t', 'ed25519', '-N', '', '-C', 'everlomp-kopia-backup', '-f', str(keyfile)],
+                capture_output=True, text=True, timeout=20,
+            )
+            if cp.returncode != 0 or not keyfile.is_file() or not Path(str(keyfile) + '.pub').is_file():
+                raise ValueError((cp.stderr or '').strip() or 'Could not generate the SSH keypair.')
+            os.chmod(keyfile, 0o600)
+            public_key = Path(str(keyfile) + '.pub').read_text(encoding='utf-8').strip()
+            private_key = keyfile.read_text(encoding='utf-8').strip()
+
+            quoted_key = shlex.quote(public_key)
+            install_cmd = (
+                'set -eu; umask 077; mkdir -p "$HOME/.ssh"; '
+                'touch "$HOME/.ssh/authorized_keys"; chmod 700 "$HOME/.ssh"; '
+                'chmod 600 "$HOME/.ssh/authorized_keys"; '
+                f'key={quoted_key}; '
+                'grep -qxF -- "$key" "$HOME/.ssh/authorized_keys" || '
+                'printf "%s\\n" "$key" >> "$HOME/.ssh/authorized_keys"'
+            )
+            _ssh_with_password(host, port, username, effective_password, kh, install_cmd, timeout=35)
+            _ssh_with_key(host, port, username, keyfile, kh)
+            fp = subprocess.run([SSH_KEYGEN, '-lf', str(keyfile) + '.pub'], capture_output=True, text=True, timeout=10)
+            fingerprint = (fp.stdout or '').strip()
+
+    return {
+        'ok': True,
+        'known_hosts': known_hosts,
+        'password_changed': password_changed,
+        'keypair_generated': generate_keypair,
+        'private_key': private_key,
+        'public_key': public_key,
+        'fingerprint': fingerprint,
+        'detail': (
+            'Remote password changed and SSH keypair generated, installed, and verified.' if password_changed and generate_keypair
+            else 'Remote SSH keypair generated, installed, and verified.' if generate_keypair
+            else 'Remote SSH password changed and verified.' if password_changed
+            else 'Remote SSH password verified.'
+        ),
+    }
+
+
+
+def test_sftp_auth(payload):
+    """Test the selected SSH credential without requiring a connected Kopia source repo.
+
+    The installer can run before Kopia has been built/connected. Once Kopia is
+    available, the Replication page uses the native `repository sync-to ...
+    --dry-run` path instead.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError('Invalid SFTP test request.')
+    host = clean_string(payload.get('host'), 255, 'Host', True)
+    port = parse_int(payload.get('port', 22), 1, 65535, 'Port')
+    username = clean_string(payload.get('username'), 255, 'Username', True)
+    auth_mode = str(payload.get('auth_mode') or 'key')
+    if auth_mode not in {'key', 'password'}:
+        raise ValueError('SFTP authentication must be key or password.')
+    known_hosts = str(payload.get('known_hosts') or '').strip()
+    if not known_hosts:
+        known_hosts = fetch_sftp_known_hosts(host, port)
+
+    with tempfile.TemporaryDirectory(prefix='everlomp-sftp-auth-test-', dir='/tmp') as td_raw:
+        td = Path(td_raw)
+        os.chmod(td, 0o700)
+        kh = _known_hosts_file(td, known_hosts)
+        if auth_mode == 'key':
+            private_key = str(payload.get('private_key') or '')
+            if not private_key:
+                raise ValueError('Paste or generate an SSH private key first.')
+            keyfile = td / 'id_test'
+            keyfile.write_text(private_key + ('\n' if not private_key.endswith('\n') else ''), encoding='utf-8')
+            os.chmod(keyfile, 0o600)
+            _ssh_with_key(host, port, username, keyfile, kh, command='printf EVERLOMP_KEY_TEST_OK')
+            detail = 'SSH key authentication succeeded. Kopia will use this key for SFTP replication.'
+        else:
+            password = str(payload.get('password') or '')
+            _ssh_with_password(host, port, username, password, kh, 'printf EVERLOMP_PASSWORD_TEST_OK')
+            detail = 'SSH password authentication succeeded. Kopia will use this account for SFTP replication.'
+
+    return {'ok': True, 'detail': detail, 'known_hosts': known_hosts}
+
+def normalize_payload(payload, existing=None, for_test=False):
+    if not isinstance(payload, dict):
+        raise ValueError('Invalid replica data.')
+    existing = existing or {}
+    provider = str(payload.get('provider') or existing.get('provider') or 'sftp')
+    if provider not in VALID_PROVIDERS:
+        raise ValueError('Unsupported destination type.')
+    if provider in {'from-config', 'rclone'}:
+        raise ValueError(
+            'This destination type is disabled by the isolated replication worker because it can describe local/root-accessible storage. '
+            'Use SFTP, WebDAV, S3/MinIO, or a mounted filesystem destination.'
+        )
+    schedule = str(payload.get('schedule') or existing.get('schedule') or 'manual')
+    if schedule not in VALID_SCHEDULES:
+        raise ValueError('Invalid replication schedule.')
+    tm = str(payload.get('time') or existing.get('time') or '03:30')
+    weekday = int(payload.get('weekday', existing.get('weekday', 0)) or 0)
+    if schedule in {'daily', 'weekly'} and not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', tm):
+        raise ValueError('Replication time must be HH:MM.')
+    if schedule == 'weekly' and not 0 <= weekday <= 6:
+        raise ValueError('Invalid weekday.')
+    parallel = parse_int(payload.get('parallel', existing.get('parallel', 1)), 1, 32, 'Parallel transfers')
+    name = clean_string(payload.get('name', existing.get('name', '')), 120, 'Name') or provider.upper()
+    enabled = bool(payload.get('enabled', existing.get('enabled', True)))
+    cfg_in = payload.get('config') or {}
+    if not isinstance(cfg_in, dict):
+        raise ValueError('Invalid provider configuration.')
+    cfg = {}
+    secret_in = payload.get('secret') or {}
+    if not isinstance(secret_in, dict):
+        raise ValueError('Invalid secret configuration.')
+    secrets = {}
+
+    if provider == 'filesystem':
+        path = clean_string(cfg_in.get('path'), 2048, 'Destination path', True)
+        if not path.startswith('/'):
+            raise ValueError('Filesystem destination must be an absolute path inside the container.')
+        cfg = {'path': path}
+
+    elif provider == 'sftp':
+        host = clean_string(cfg_in.get('host'), 255, 'Host', True)
+        port = parse_int(cfg_in.get('port', 22), 1, 65535, 'Port')
+        username = clean_string(cfg_in.get('username'), 255, 'Username', True)
+        path = clean_string(cfg_in.get('path'), 1024, 'Remote path', True)
+        auth_mode = str(cfg_in.get('auth_mode') or 'key')
+        if auth_mode not in {'key', 'password'}:
+            raise ValueError('SFTP authentication must be key or password.')
+        cfg = {'host': host, 'port': port, 'username': username, 'path': path, 'auth_mode': auth_mode}
+        for key in ('password', 'private_key', 'known_hosts'):
+            val = secret_in.get(key)
+            if isinstance(val, str) and val:
+                secrets[key] = val
+
+    elif provider == 'webdav':
+        url = clean_string(cfg_in.get('url'), 2048, 'WebDAV URL', True)
+        if not re.match(r'^https?://', url, re.I):
+            raise ValueError('WebDAV URL must start with http:// or https://.')
+        username = clean_string(cfg_in.get('username'), 512, 'Username', True)
+        cfg = {'url': url, 'username': username}
+        if isinstance(secret_in.get('password'), str) and secret_in.get('password'):
+            secrets['password'] = secret_in['password']
+
+    elif provider == 's3':
+        endpoint = clean_string(cfg_in.get('endpoint'), 255, 'Endpoint', True)
+        if '://' in endpoint or '/' in endpoint or re.search(r'\s', endpoint):
+            raise ValueError('S3/MinIO endpoint must be host[:port] without http:// or https://.')
+        bucket = clean_string(cfg_in.get('bucket'), 255, 'Bucket', True)
+        region = clean_string(cfg_in.get('region'), 128, 'Region')
+        prefix = clean_string(cfg_in.get('prefix'), 1024, 'Prefix')
+        disable_tls = bool(cfg_in.get('disable_tls', False))
+        cfg = {'endpoint': endpoint, 'bucket': bucket, 'region': region, 'prefix': prefix, 'disable_tls': disable_tls}
+        for key in ('access_key', 'secret_access_key', 'session_token'):
+            val = secret_in.get(key)
+            if isinstance(val, str) and val:
+                secrets[key] = val
+
+    elif provider == 'from-config':
+        cfg = {}
+        if isinstance(secret_in.get('token'), str) and secret_in.get('token'):
+            secrets['token'] = secret_in['token'].strip()
+
+    elif provider == 'rclone':
+        remote_path = clean_string(cfg_in.get('remote_path'), 2048, 'Rclone remote path', True)
+        cfg = {'remote_path': remote_path}
+        if isinstance(secret_in.get('rclone_config'), str) and secret_in.get('rclone_config'):
+            secrets['rclone_config'] = secret_in['rclone_config']
+
+    return {
+        'name': name,
+        'enabled': enabled,
+        'provider': provider,
+        'schedule': schedule,
+        'time': tm,
+        'weekday': weekday,
+        'parallel': parallel,
+        'config': cfg,
+    }, secrets
+
+
+def required_secret_keys(replica):
+    p = replica['provider']
+    cfg = replica.get('config', {})
+    if p == 'sftp':
+        return ['password'] if cfg.get('auth_mode') == 'password' else ['private_key']
+    if p == 'webdav':
+        return ['password']
+    if p == 's3':
+        return ['access_key', 'secret_access_key']
+    if p == 'from-config':
+        return ['token']
+    if p == 'rclone':
+        return ['rclone_config']
+    return []
+
+
+def validate_secrets(replica, secret):
+    missing = [k for k in required_secret_keys(replica) if not secret.get(k)]
+    if missing:
+        pretty = ', '.join(x.replace('_', ' ') for x in missing)
+        raise ValueError('Missing destination credential(s): ' + pretty + '.')
+
+
+def destination_fingerprint(replica, destination_secret_sha256=''):
+    """Stable identity for the actual replica destination, excluding schedule/UI settings."""
+    provider = replica.get('provider') or ''
+    cfg = replica.get('config') or {}
+    identity = {'provider': provider, 'config': cfg}
+    if provider in {'from-config', 'rclone'} and destination_secret_sha256:
+        identity['destination_secret_sha256'] = destination_secret_sha256
+    raw = json.dumps(identity, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+
+def public_replica(replica):
+    d = dict(replica)
+    meta = _privileged_json('replica-secret-meta', replica['id'], timeout=20)
+    d['secret_configured'] = meta.get('secret_configured') or {}
+    return d
+
+
+
+def list_replicas():
+    st = load_state()
+    return [public_replica(x) for x in st['replicas']]
+
+
+def save_replica(payload):
+    replica_id = str(payload.get('id') or '').strip()
+    with state_lock(True):
+        st = load_state_unlocked()
+        existing = next((x for x in st['replicas'] if x.get('id') == replica_id), None) if replica_id else None
+        normalized, new_secrets = normalize_payload(payload, existing)
+        if not replica_id:
+            replica_id = uuid.uuid4().hex[:16]
+        normalized['id'] = replica_id
+
+        if normalized.get('provider') == 'filesystem':
+            # Filesystem replicas have no destination credentials to retain.
+            with contextlib.suppress(Exception):
+                _privileged_json('replica-secret-delete', replica_id, timeout=20)
+            meta = {'secret_configured': {}, 'destination_secret_sha256': ''}
+        else:
+            meta = _privileged_json(
+                'replica-secret-update', replica_id,
+                payload={
+                    'provider': normalized.get('provider'),
+                    'config': normalized.get('config') or {},
+                    'secret': new_secrets,
+                },
+                timeout=30,
+            )
+
+        new_destination = destination_fingerprint(normalized, meta.get('destination_secret_sha256', ''))
+        old_destination = existing.get('destination_fingerprint') if existing else None
+        normalized['destination_fingerprint'] = new_destination
+        normalized['seeded'] = bool(existing and existing.get('seeded', False) and old_destination == new_destination)
+
+        for k in ('last_run', 'last_status', 'last_detail'):
+            if existing and k in existing:
+                normalized[k] = existing[k]
+        if existing:
+            st['replicas'] = [normalized if x.get('id') == replica_id else x for x in st['replicas']]
+        else:
+            st['replicas'].append(normalized)
+        atomic_json(CONFIG, st)
+    return public_replica(normalized)
+
+
+
+def delete_replica(replica_id):
+    with state_lock(True):
+        st = load_state_unlocked()
+        old = len(st['replicas'])
+        st['replicas'] = [x for x in st['replicas'] if x.get('id') != replica_id]
+        if len(st['replicas']) == old:
+            raise KeyError('Replica not found.')
+        atomic_json(CONFIG, st)
+    with contextlib.suppress(Exception):
+        _privileged_json('replica-secret-delete', replica_id, timeout=20)
+
+
+
+def update_result(replica_id, status, detail, seeded=None, destination_fp=None):
+    with state_lock(True):
+        st = load_state_unlocked()
+        for r in st['replicas']:
+            if r.get('id') == replica_id:
+                r['last_run'] = now_iso()
+                r['last_status'] = status
+                r['last_detail'] = detail[:500]
+                if seeded is not None:
+                    r['seeded'] = bool(seeded)
+                if destination_fp:
+                    r['destination_fingerprint'] = destination_fp
+                atomic_json(CONFIG, st)
+                return
+
+
+def build_sync_command(replica, secret, dry_run=False):
+    raise RuntimeError('Kopia sync commands are built only inside the privileged worker.')
+
+
+
+def run_command_for(replica, secret, dry_run=False, timeout=3600):
+    raise RuntimeError('Kopia sync commands run only inside the privileged worker.')
+
+
+
+def find_replica(replica_id):
+    st = load_state()
+    r = next((x for x in st['replicas'] if x.get('id') == replica_id), None)
+    if not r:
+        raise KeyError('Replica not found.')
+    return r
+
+
+def sync_replica(replica_id, timeout=3600):
+    r = find_replica(replica_id)
+    try:
+        result = _privileged_json('replica-sync', replica_id, timeout=max(120, timeout + 30))
+        detail = str(result.get('detail') or 'Repository synchronized successfully.')
+        update_result(replica_id, 'success', detail, seeded=True, destination_fp=r.get('destination_fingerprint'))
+        return detail
+    except Exception as exc:
+        update_result(replica_id, 'failed', str(exc))
+        raise
+
+
+
+def test_payload(payload):
+    replica_id = str(payload.get('id') or '').strip()
+    existing = find_replica(replica_id) if replica_id else None
+    normalized, new_secret = normalize_payload(payload, existing, for_test=True)
+    normalized['id'] = replica_id or 'test'
+    normalized['seeded'] = bool(existing.get('seeded', False)) if existing else False
+    result = _privileged_json(
+        'replica-test',
+        payload={
+            'replica': normalized,
+            'existing_id': replica_id if existing else '',
+            'secret': new_secret,
+        },
+        timeout=75,
+    )
+    return str(result.get('detail') or 'Connection test succeeded.')
+
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+def is_due(r, now=None):
+    if not r.get('enabled', True):
+        return False
+    schedule = r.get('schedule', 'manual')
+    if schedule == 'manual':
+        return False
+    now = now or dt.datetime.now().astimezone()
+    last = parse_iso(r.get('last_run'))
+    if last:
+        last = last.astimezone(now.tzinfo)
+    else:
+        last = dt.datetime.fromtimestamp(0, tz=now.tzinfo)
+    age = (now - last).total_seconds()
+    if schedule == 'hourly':
+        return age >= 3600
+    if schedule == 'every6h':
+        return age >= 21600
+    if schedule == 'every12h':
+        return age >= 43200
+    hh, mm = (int(x) for x in r.get('time', '03:30').split(':'))
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if schedule == 'daily':
+        return now >= target and last.date() != now.date()
+    if schedule == 'weekly':
+        sunday_based = (now.weekday() + 1) % 7
+        return sunday_based == int(r.get('weekday', 0)) and now >= target and age >= 6 * 86400
+    return False
+
+
+def run_due():
+    if not source_status()['connected']:
+        return 0
+    count = 0
+    for r in load_state()['replicas']:
+        if is_due(r):
+            try:
+                sync_replica(r['id'])
+            except Exception as e:
+                print(f"[replication] {r.get('name', r['id'])}: {e}", file=sys.stderr)
+            count += 1
+    return count
+
+
+def legacy_payload_to_replica(payload):
+    if not isinstance(payload, dict) or not payload.get('enabled'):
+        return None
+    p = {'name': 'Initial replica', 'enabled': True, 'provider': payload.get('type', 'sftp'), 'schedule': payload.get('schedule', 'every6h'), 'time': payload.get('time', '03:30'), 'weekday': payload.get('weekday', 0), 'parallel': 1, 'config': {}, 'secret': {}}
+    typ = p['provider']
+    if typ == 'sftp':
+        x = payload.get('sftp') or {}
+        p['config'] = {k: x.get(k) for k in ('host', 'port', 'username', 'path', 'auth_mode')}
+        p['secret'] = {k: x.get(k, '') for k in ('password', 'private_key', 'known_hosts')}
+    elif typ == 'webdav':
+        x = payload.get('webdav') or {}
+        p['config'] = {'url': x.get('url'), 'username': x.get('username')}
+        p['secret'] = {'password': x.get('password', '')}
+    elif typ == 'filesystem':
+        x = payload.get('filesystem') or {}
+        p['config'] = {'path': x.get('path')}
+    elif typ == 's3':
+        x = payload.get('s3') or {}
+        p['config'] = {k: x.get(k) for k in ('endpoint', 'bucket', 'region', 'prefix', 'disable_tls')}
+        p['secret'] = {k: x.get(k, '') for k in ('access_key', 'secret_access_key', 'session_token')}
+    elif typ == 'from-config':
+        x = payload.get('from_config') or {}
+        p['secret'] = {'token': x.get('token', '')}
+    elif typ == 'rclone':
+        x = payload.get('rclone') or {}
+        p['config'] = {'remote_path': x.get('remote_path')}
+        p['secret'] = {'rclone_config': x.get('config', '')}
+    else:
+        raise ValueError('Unsupported destination type.')
+    return p
+
+
+def validate_legacy_payload(payload):
+    p = legacy_payload_to_replica(payload)
+    if p is None:
+        return True
+    normalized, secrets = normalize_payload(p)
+    validate_secrets(normalized, secrets)
+    return True
+
+
+def import_legacy_payload(payload):
+    p = legacy_payload_to_replica(payload)
+    if p is None:
+        return ''
+    return save_replica(p)['id']
+
+
+def auth_ok(headers):
+    actual = headers.get('Authorization', '')
+    try:
+        cp = _privileged('auth-check', input_data=actual.encode('utf-8'), capture_output=True, timeout=15)
+        return cp.returncode == 0
+    except Exception:
+        return False
+
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = 'EverlompKopiaReplication/1'
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write('[replication-api] ' + (fmt % args) + '\n')
+
+    def send_json(self, code, obj):
+        body = json.dumps(obj).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def authorize(self, mutate=False):
+        if not auth_ok(self.headers):
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', 'Basic realm="Kopia"')
+            self.end_headers()
+            return False
+        if mutate:
+            if self.headers.get('Content-Type', '').split(';')[0].strip().lower() != 'application/json':
+                self.send_json(415, {'error': 'JSON request required.'})
+                return False
+            # A non-simple custom header prevents cross-site form CSRF. Kopia's
+            # HTMLUI already sets this header on axios requests.
+            if not self.headers.get('X-Kopia-Csrf-Token'):
+                self.send_json(403, {'error': 'Missing Kopia CSRF header.'})
+                return False
+        return True
+
+    def read_json(self):
+        n = int(self.headers.get('Content-Length', '0') or '0')
+        if n > 1024 * 1024:
+            raise ValueError('Request too large.')
+        raw = self.rfile.read(n) if n else b'{}'
+        data = json.loads(raw.decode('utf-8'))
+        if not isinstance(data, dict):
+            raise ValueError('JSON object required.')
+        return data
+
+    def do_GET(self):
+        if not self.authorize(False):
+            return
+        path = urlparse(self.path).path.rstrip('/') or '/'
+        try:
+            if path == '/status':
+                self.send_json(200, {'source': source_status(), 'replica_count': len(load_state()['replicas'])})
+            elif path == '/replicas':
+                self.send_json(200, {'replicas': list_replicas(), 'source': source_status()})
+            else:
+                self.send_json(404, {'error': 'Not found.'})
+        except Exception as e:
+            self.send_json(500, {'error': str(e)})
+
+    def do_POST(self):
+        if not self.authorize(True):
+            return
+        path = urlparse(self.path).path.rstrip('/') or '/'
+        try:
+            data = self.read_json()
+            if path == '/replicas':
+                self.send_json(200, {'replica': save_replica(data)})
+                return
+            if path == '/replicas/test':
+                self.send_json(200, {'ok': True, 'detail': test_payload(data)})
+                return
+            if path == '/sftp-host-key':
+                self.send_json(200, {'ok': True, 'known_hosts': fetch_sftp_known_hosts(data.get('host'), data.get('port', 22))})
+                return
+            if path == '/sftp-bootstrap':
+                self.send_json(200, bootstrap_sftp_access(data))
+                return
+            if path == '/source-password':
+                self.send_json(200, {'source': set_source_password(str(data.get('password') or ''))})
+                return
+            if path == '/source-password/change':
+                self.send_json(200, {'source': change_source_password(str(data.get('new_password') or ''))})
+                return
+            m = re.fullmatch(r'/replicas/([A-Za-z0-9._-]{1,80})/sync', path)
+            if m:
+                self.send_json(200, {'ok': True, 'detail': sync_replica(m.group(1))})
+                return
+            self.send_json(404, {'error': 'Not found.'})
+        except (ValueError, KeyError) as e:
+            self.send_json(400, {'error': str(e).strip("'")})
+        except subprocess.TimeoutExpired:
+            self.send_json(504, {'error': 'Kopia operation timed out.'})
+        except Exception as e:
+            self.send_json(500, {'error': str(e)})
+
+    def do_DELETE(self):
+        if not self.authorize(True):
+            return
+        path = urlparse(self.path).path.rstrip('/')
+        try:
+            m = re.fullmatch(r'/replicas/([A-Za-z0-9._-]{1,80})', path)
+            if not m:
+                self.send_json(404, {'error': 'Not found.'})
+                return
+            delete_replica(m.group(1))
+            self.send_json(200, {'ok': True})
+        except KeyError as e:
+            self.send_json(404, {'error': str(e).strip("'")})
+        except Exception as e:
+            self.send_json(500, {'error': str(e)})
+
+
+def serve():
+    ensure_dirs()
+    httpd = ThreadingHTTPServer((API_HOST, API_PORT), Handler)
+    httpd.daemon_threads = True
+    print(f'[replication-api] listening on {API_HOST}:{API_PORT}', file=sys.stderr)
+    httpd.serve_forever()
+
+
+def main():
+    ensure_dirs()
+    action = sys.argv[1] if len(sys.argv) > 1 else ''
+    if action == 'serve':
+        serve()
+    elif action == 'run-due':
+        print(run_due())
+    elif action == 'list':
+        print(json.dumps({'replicas': list_replicas(), 'source': source_status()}, indent=2))
+    elif action == 'sync' and len(sys.argv) == 3:
+        print(sync_replica(sys.argv[2]))
+    elif action == 'delete' and len(sys.argv) == 3:
+        delete_replica(sys.argv[2])
+    elif action == 'save':
+        print(json.dumps(save_replica(json.load(sys.stdin)), indent=2))
+    elif action == 'test':
+        print(test_payload(json.load(sys.stdin)))
+    elif action == 'fetch-host-key':
+        data = json.load(sys.stdin)
+        print(json.dumps({'known_hosts': fetch_sftp_known_hosts(data.get('host'), data.get('port', 22))}))
+    elif action == 'bootstrap-sftp':
+        print(json.dumps(bootstrap_sftp_access(json.load(sys.stdin))))
+    elif action == 'test-sftp-auth':
+        print(json.dumps(test_sftp_auth(json.load(sys.stdin))))
+    elif action == 'set-source-password':
+        print(json.dumps(set_source_password(sys.stdin.read().rstrip('\n')), indent=2))
+    elif action == 'change-source-password':
+        print(json.dumps(change_source_password(sys.stdin.read().rstrip('\n')), indent=2))
+    elif action == 'validate-offsite':
+        validate_legacy_payload(json.load(sys.stdin))
+        print('ok')
+    elif action == 'import-offsite':
+        rid = import_legacy_payload(json.load(sys.stdin))
+        print(rid)
+    else:
+        print('Usage: everlomp-kopia-replication {serve|run-due|list|sync ID|delete ID|save|test|fetch-host-key|bootstrap-sftp|test-sftp-auth|set-source-password|change-source-password|validate-offsite|import-offsite}', file=sys.stderr)
+        raise SystemExit(64)
+
+
+if __name__ == '__main__':
+    main()

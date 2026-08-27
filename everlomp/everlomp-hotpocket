@@ -1,0 +1,166 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${1:-}"
+
+SUPERVISOR_CONF="/etc/everlomp/supervisord.conf"
+SUPERVISORCTL="/usr/bin/supervisorctl"
+ENABLED_FILE="/var/www/.everlomp/hotpocket.enabled"
+
+if [ "$ACTION" != "enable" ]; then
+    echo "Usage: everlomp-hotpocket enable" >&2
+    exit 64
+fi
+
+install -d -o root -g nogroup -m 0750 /var/www/.everlomp
+
+if [ ! -f "$SUPERVISOR_CONF" ]; then
+    echo "Supervisor configuration is missing: $SUPERVISOR_CONF" >&2
+    exit 2
+fi
+
+if [ ! -x "$SUPERVISORCTL" ]; then
+    echo "supervisorctl is unavailable: $SUPERVISORCTL" >&2
+    exit 3
+fi
+
+BACKUP="$(mktemp /tmp/everlomp-supervisord.XXXXXX)"
+cp -p "$SUPERVISOR_CONF" "$BACKUP"
+
+cleanup() {
+    rm -f "$BACKUP"
+}
+trap cleanup EXIT
+
+rollback_config() {
+    echo "[Everlomp] Restoring previous Supervisor configuration..." >&2
+    cp -p "$BACKUP" "$SUPERVISOR_CONF" || true
+    "$SUPERVISORCTL" -c "$SUPERVISOR_CONF" reread >/dev/null 2>&1 || true
+    "$SUPERVISORCTL" -c "$SUPERVISOR_CONF" update >/dev/null 2>&1 || true
+}
+
+show_hotpocket_logs() {
+    echo >&2
+    echo "----- HotPocket Supervisor status -----" >&2
+    "$SUPERVISORCTL" -c "$SUPERVISOR_CONF" status hotpocket >&2 || true
+
+    echo >&2
+    echo "----- HotPocket stderr (last 80 lines) -----" >&2
+    if [ -f /var/log/supervisor/hotpocket.err.log ]; then
+        tail -n 80 /var/log/supervisor/hotpocket.err.log >&2 || true
+    else
+        echo "(stderr log does not exist yet)" >&2
+    fi
+
+    echo >&2
+    echo "----- HotPocket stdout (last 80 lines) -----" >&2
+    if [ -f /var/log/supervisor/hotpocket.out.log ]; then
+        tail -n 80 /var/log/supervisor/hotpocket.out.log >&2 || true
+    else
+        echo "(stdout log does not exist yet)" >&2
+    fi
+}
+
+echo "[Everlomp] Enabling HotPocket in $SUPERVISOR_CONF"
+
+python3 - "$SUPERVISOR_CONF" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+match = re.search(
+    r'(?ms)^\[program:hotpocket\]\s*$.*?(?=^\[|\Z)',
+    text,
+)
+
+if not match:
+    print("Supervisor [program:hotpocket] section was not found.", file=sys.stderr)
+    raise SystemExit(1)
+
+section = match.group(0)
+
+if re.search(r'(?m)^\s*autostart\s*=', section):
+    section = re.sub(
+        r'(?m)^\s*autostart\s*=.*$',
+        'autostart=true',
+        section,
+        count=1,
+    )
+else:
+    first_newline = section.find('\n')
+    section = (
+        section[:first_newline + 1]
+        + 'autostart=true\n'
+        + section[first_newline + 1:]
+    )
+
+path.write_text(text[:match.start()] + section + text[match.end():])
+PY
+
+if ! grep -A20 '^\[program:hotpocket\]$' "$SUPERVISOR_CONF" \
+    | grep -q '^autostart=true$'; then
+    rollback_config
+    echo "Could not persist HotPocket autostart=true." >&2
+    exit 4
+fi
+
+echo "[Everlomp] HotPocket autostart=true persisted."
+echo "[Everlomp] Supervisor config ownership: $(stat -c '%U:%G %a' "$SUPERVISOR_CONF")"
+
+echo "[Everlomp] Reloading Supervisor configuration..."
+REREAD_OUTPUT="$("$SUPERVISORCTL" -c "$SUPERVISOR_CONF" reread 2>&1)" || {
+    echo "$REREAD_OUTPUT" >&2
+    rollback_config
+    echo "Supervisor reread failed; previous configuration restored." >&2
+    exit 5
+}
+printf '%s\n' "$REREAD_OUTPUT"
+
+UPDATE_OUTPUT="$("$SUPERVISORCTL" -c "$SUPERVISOR_CONF" update 2>&1)" || {
+    echo "$UPDATE_OUTPUT" >&2
+    rollback_config
+    echo "Supervisor update failed; previous configuration restored." >&2
+    exit 6
+}
+printf '%s\n' "$UPDATE_OUTPUT"
+
+printf 'enabled\n' > "$ENABLED_FILE"
+chmod 0644 "$ENABLED_FILE"
+
+STATUS="$("$SUPERVISORCTL" -c "$SUPERVISOR_CONF" status hotpocket 2>&1 || true)"
+
+if printf '%s\n' "$STATUS" | grep -q 'STOPPED'; then
+    echo "[Everlomp] HotPocket is stopped; starting it..."
+    START_OUTPUT="$("$SUPERVISORCTL" -c "$SUPERVISOR_CONF" start hotpocket 2>&1)" || {
+        echo "$START_OUTPUT" >&2
+        echo "HotPocket is enabled for autostart, but the immediate start command failed." >&2
+        show_hotpocket_logs
+        exit 7
+    }
+    printf '%s\n' "$START_OUTPUT"
+fi
+
+for _ in $(seq 1 45); do
+    STATUS="$("$SUPERVISORCTL" -c "$SUPERVISOR_CONF" status hotpocket 2>&1 || true)"
+    printf '[Everlomp] %s\n' "$STATUS"
+
+    if printf '%s\n' "$STATUS" | grep -q 'RUNNING'; then
+        echo "[Everlomp] HotPocket is enabled, autostart=true, and RUNNING."
+        exit 0
+    fi
+
+    if printf '%s\n' "$STATUS" | grep -Eq 'BACKOFF|FATAL|EXITED'; then
+        echo "HotPocket is enabled for autostart, but the process failed before reaching RUNNING." >&2
+        show_hotpocket_logs
+        exit 8
+    fi
+
+    sleep 1
+done
+
+echo "HotPocket is enabled for autostart, but did not reach RUNNING within 45 seconds." >&2
+show_hotpocket_logs
+exit 9

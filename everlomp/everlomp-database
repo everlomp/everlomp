@@ -1,0 +1,73 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${1:-}"
+
+DATABASE_CONFIGURED_FILE="/var/www/.everlomp/database.configured"
+DATABASE_ADMIN_USER_FILE="/var/www/.everlomp/database-admin-user"
+
+SOCKET="/run/mysqld/mysqld.sock"
+
+if [ "$ACTION" != "configure" ]; then
+    echo "Usage: everlomp-database configure" >&2
+    exit 64
+fi
+
+if [ ! -S "$SOCKET" ]; then
+    echo "MariaDB socket is not available at $SOCKET." >&2
+    exit 2
+fi
+
+IFS= read -r DB_USER || true
+IFS= read -r DB_PASS || true
+
+if [[ ! "$DB_USER" =~ ^[A-Za-z][A-Za-z0-9_]{2,31}$ ]]; then
+    echo "Invalid database username." >&2
+    exit 3
+fi
+
+if [ "${#DB_PASS}" -lt 12 ]; then
+    echo "Database password must be at least 12 characters." >&2
+    exit 4
+fi
+
+EXISTS="$(
+    mariadb \
+        --protocol=socket \
+        --socket="$SOCKET" \
+        --batch \
+        --skip-column-names \
+        -e "SELECT COUNT(*) FROM mysql.user WHERE User='${DB_USER}' AND Host='localhost';"
+)"
+
+if [ "$EXISTS" != "0" ]; then
+    echo "MariaDB user '${DB_USER}' already exists. Choose another username." >&2
+    exit 5
+fi
+
+SQL_PASS="${DB_PASS//\\/\\\\}"
+SQL_PASS="${SQL_PASS//\'/\\\'}"
+
+mariadb \
+    --protocol=socket \
+    --socket="$SOCKET" <<SQL
+CREATE USER '${DB_USER}'@'localhost'
+    IDENTIFIED BY '${SQL_PASS}';
+
+GRANT ALL PRIVILEGES ON *.*
+    TO '${DB_USER}'@'localhost'
+    WITH GRANT OPTION;
+
+FLUSH PRIVILEGES;
+SQL
+
+install -d -o root -g nogroup -m 0750 /var/www/.everlomp
+
+printf '%s\n' "$DB_USER" > "$DATABASE_ADMIN_USER_FILE"
+touch "$DATABASE_CONFIGURED_FILE"
+
+chmod 0644 \
+    "$DATABASE_ADMIN_USER_FILE" \
+    "$DATABASE_CONFIGURED_FILE"
+
+echo "MariaDB administrator account created."

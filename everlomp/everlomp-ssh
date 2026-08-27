@@ -1,0 +1,320 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+SSH_USER="everlomp"
+ENV_FILE="/contract/env.vars"
+SUPERVISOR_CONF="/etc/everlomp/supervisord.conf"
+STATE_DIR="/var/www/.everlomp"
+STATE_FILE="$STATE_DIR/ssh.configured"
+HASH_FILE="$STATE_DIR/ssh-password.hash"
+PORT_FILE="$STATE_DIR/ssh.port"
+HOST_KEYS_SECRET="/home/everlomp/secrets/ssh-host-keys.tar"
+SECRET_HELPER="/usr/local/sbin/everlomp-secret"
+
+fail() {
+    local message="$1"
+    local code="${2:-1}"
+    echo "[Everlomp] ERROR: ${message}" >&2
+    exit "$code"
+}
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    fail "This SSH helper must run as root."
+fi
+
+install -d -o root -g nogroup -m 0750 "$STATE_DIR"
+install -d -o root -g root -m 0700 /var/www/.everlomp-secrets
+
+load_contract_env() {
+    [ -f "$ENV_FILE" ] || fail "Contract environment file was not found at $ENV_FILE."
+
+    source "$ENV_FILE"
+}
+
+read_gptcp2_port_optional() {
+    local port=""
+
+    if [ -f "$ENV_FILE" ]; then
+        source "$ENV_FILE"
+        port="${EXTERNAL_GPTCP2_PORT:-}"
+    fi
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        printf ''
+        return 0
+    fi
+
+    printf '%s' "$port"
+}
+
+read_gptcp2_port() {
+    local port
+    port="$(read_gptcp2_port_optional)"
+    [ -n "$port" ] || fail "EXTERNAL_GPTCP2_PORT is missing or invalid in /contract/env.vars."
+    printf '%s' "$port"
+}
+
+read_host_domain_address() {
+    load_contract_env
+    local value="${HOST_DOMAIN_ADDRESS:-}"
+    [ -n "$value" ] || fail "HOST_DOMAIN_ADDRESS is missing in /contract/env.vars."
+    [ "$value" != *$'\n'* ] && [ "$value" != *$'\r'* ] || fail "HOST_DOMAIN_ADDRESS contains an invalid newline."
+    printf '%s' "$value"
+}
+
+generate_ssh_password() {
+    python3 - <<'PYGEN'
+import secrets
+import string
+
+# Avoid shell/terminal-hostile punctuation while still producing a strong,
+# copyable password. 24 characters gives ample entropy for SSH password login.
+alphabet = string.ascii_letters + string.digits
+print(''.join(secrets.choice(alphabet) for _ in range(24)))
+PYGEN
+}
+
+normalize_supervisor_conf() {
+    [ -f "$SUPERVISOR_CONF" ] || fail "Supervisor configuration was not found at $SUPERVISOR_CONF."
+
+    sed -i 's/\r$//' "$SUPERVISOR_CONF"
+}
+
+set_sshd_autostart() {
+    local value="$1"
+
+    normalize_supervisor_conf
+
+    if ! grep -q '^\[program:sshd\][[:space:]]*$' "$SUPERVISOR_CONF"; then
+        fail "Supervisor does not contain a [program:sshd] section in $SUPERVISOR_CONF."
+    fi
+
+    sed -i '/^\[program:sshd\][[:space:]]*$/,/^\[program:/ s/^autostart[[:space:]]*=.*/autostart='"$value"'/' "$SUPERVISOR_CONF"
+
+    if ! sed -n '/^\[program:sshd\][[:space:]]*$/,/^\[program:/p' "$SUPERVISOR_CONF" | grep -Eq '^autostart[[:space:]]*=[[:space:]]*'"$value"'$'; then
+        fail "Could not set sshd autostart=$value in Supervisor."
+    fi
+}
+
+set_sshd_port() {
+    local port="$1"
+
+    normalize_supervisor_conf
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        fail "Invalid SSH port: $port."
+    fi
+
+    if ! grep -q '^\[program:sshd\][[:space:]]*$' "$SUPERVISOR_CONF"; then
+        fail "Supervisor does not contain a [program:sshd] section in $SUPERVISOR_CONF."
+    fi
+
+    sed -i '/^\[program:sshd\][[:space:]]*$/,/^\[program:/ s#^command[[:space:]]*=.*#command=/usr/sbin/sshd -D -p '"$port"'#' "$SUPERVISOR_CONF"
+
+    if ! sed -n '/^\[program:sshd\][[:space:]]*$/,/^\[program:/p' "$SUPERVISOR_CONF" | grep -Eq '^command=/usr/sbin/sshd -D -p '"$port"'$'; then
+        fail "Could not configure sshd to listen on EXTERNAL_GPTCP2_PORT $port."
+    fi
+}
+
+supervisorctl_run() {
+    normalize_supervisor_conf
+    supervisorctl -c "$SUPERVISOR_CONF" "$@"
+}
+
+reload_supervisor_sshd() {
+    supervisorctl_run reread >/dev/null || fail "Supervisor could not reread its configuration."
+    supervisorctl_run update sshd >/dev/null || fail "Supervisor could not apply the sshd configuration."
+}
+
+sshd_status() {
+    supervisorctl_run status sshd 2>/dev/null || true
+}
+
+sshd_state() {
+    local line
+    line="$(sshd_status)"
+    awk '{print $2}' <<<"$line"
+}
+
+sshd_is_running() {
+    [ "$(sshd_state)" = "RUNNING" ]
+}
+
+prepare_sshd_runtime() {
+    mkdir -p /run/sshd
+    chmod 0755 /run/sshd
+
+    ssh-keygen -A >/dev/null 2>&1 || fail "Could not generate SSH host keys."
+}
+
+wait_for_sshd_running() {
+    local i state
+
+    for i in $(seq 1 25); do
+        state="$(sshd_state)"
+        case "$state" in
+            RUNNING)
+                return 0
+                ;;
+            STARTING)
+                sleep 1
+                ;;
+            BACKOFF|EXITED|FATAL)
+                return 1
+                ;;
+            *)
+                sleep 1
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+ensure_sshd_running() {
+    local state output
+    state="$(sshd_state)"
+
+    case "$state" in
+        RUNNING)
+            return 0
+            ;;
+        STARTING)
+            wait_for_sshd_running
+            return $?
+            ;;
+    esac
+
+    output="$(supervisorctl_run start sshd 2>&1 || true)"
+    if [ -n "$output" ] && ! grep -qiE 'started|already started' <<<"$output"; then
+        echo "[Everlomp] Supervisor start output: $output" >&2
+    fi
+
+    wait_for_sshd_running
+}
+
+sshd_failure_details() {
+    local status log_file="/var/log/supervisor/sshd.err.log"
+    status="$(sshd_status)"
+    [ -n "$status" ] && echo "[Everlomp] Supervisor status: $status" >&2
+    if [ -s "$log_file" ]; then
+        echo "[Everlomp] Last sshd errors:" >&2
+        tail -n 20 "$log_file" >&2 || true
+    fi
+}
+
+sshd_is_listening() {
+    local port="$1"
+    python3 - "$port" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+port = int(sys.argv[1])
+with socket.create_connection(("127.0.0.1", port), timeout=2):
+    pass
+PY
+}
+
+persist_ssh_password_hash() {
+    local password_hash
+    password_hash="$(getent shadow "$SSH_USER" | awk -F: '{print $2}')"
+    [ -n "$password_hash" ] || fail "Could not read the generated SSH password hash."
+    case "$password_hash" in
+        '!'*|'*'*) fail "Generated SSH account is still locked; refusing to persist invalid state." ;;
+    esac
+    printf '%s\n' "$password_hash" > "$HASH_FILE"
+    chown root:root "$HASH_FILE"
+    chmod 0600 "$HASH_FILE"
+}
+
+persist_ssh_host_keys() {
+    [ -x "$SECRET_HELPER" ] || fail "Everlomp secret helper is unavailable."
+    local archive
+    archive="$(mktemp /run/everlomp-ssh-hostkeys.XXXXXX)"
+    (cd /etc/ssh && tar -cf "$archive" ssh_host_*_key ssh_host_*_key.pub) \
+        || fail "Could not package SSH host keys for persistence."
+    "$SECRET_HELPER" write "$HOST_KEYS_SECRET" < "$archive" \
+        || { rm -f "$archive"; fail "Could not persist SSH host keys."; }
+    rm -f "$archive"
+}
+
+write_state() {
+    local state="$1"
+    printf '%s\n' "$state" > "$STATE_FILE"
+    chown root:root "$STATE_FILE"
+    chmod 0644 "$STATE_FILE"
+}
+
+action="${1:-}"
+
+case "$action" in
+    enable)
+        port="$(read_gptcp2_port)"
+        host_domain="$(read_host_domain_address)"
+        password="$(generate_ssh_password)"
+        [ -n "$password" ] || fail "Could not generate an SSH password."
+
+        # Generate a fresh SSH password each time SSH is enabled/re-applied.
+        printf '%s:%s\n' "$SSH_USER" "$password" | chpasswd || fail "Could not set the generated SSH password."
+        passwd -u "$SSH_USER" >/dev/null 2>&1 || true
+
+        prepare_sshd_runtime
+        set_sshd_port "$port"
+
+        /usr/sbin/sshd -t -p "$port" || {
+            passwd -l "$SSH_USER" >/dev/null 2>&1 || true
+            fail "OpenSSH configuration validation failed."
+        }
+
+        set_sshd_autostart true
+        reload_supervisor_sshd
+
+        if ! ensure_sshd_running; then
+            sshd_failure_details
+            set_sshd_autostart false || true
+            supervisorctl_run reread >/dev/null 2>&1 || true
+            supervisorctl_run update sshd >/dev/null 2>&1 || true
+            passwd -l "$SSH_USER" >/dev/null 2>&1 || true
+            fail "sshd did not reach RUNNING state after activation."
+        fi
+
+        if ! sshd_is_listening "$port"; then
+            passwd -l "$SSH_USER" >/dev/null 2>&1 || true
+            fail "sshd is RUNNING but is not listening on EXTERNAL_GPTCP2_PORT ${port}."
+        fi
+
+        persist_ssh_password_hash
+        printf '%s\n' "$port" > "$PORT_FILE"
+        chown root:root "$PORT_FILE"
+        chmod 0644 "$PORT_FILE"
+        persist_ssh_host_keys
+        write_state enabled
+        jq -nc \
+            --arg username "$SSH_USER" \
+            --arg port "$port" \
+            --arg password "$password" \
+            --arg host_domain "$host_domain" \
+            '{enabled:true,username:$username,host_domain:$host_domain,port:($port|tonumber),password:$password}'
+        ;;
+
+    disable)
+        port="$(read_gptcp2_port_optional)"
+
+        supervisorctl_run stop sshd >/dev/null 2>&1 || true
+        set_sshd_autostart false
+        reload_supervisor_sshd
+        passwd -l "$SSH_USER" >/dev/null 2>&1 || true
+        rm -f "$HASH_FILE" "$PORT_FILE"
+        write_state disabled
+
+        jq -nc \
+            --arg username "$SSH_USER" \
+            --arg port "$port" \
+            '{enabled:false,username:$username,port:$port}'
+        ;;
+
+    *)
+        echo "Usage: everlomp-ssh {enable|disable}" >&2
+        exit 1
+        ;;
+esac

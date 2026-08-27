@@ -1,0 +1,863 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${1:-}"
+
+PHPBB_FALLBACK_VERSION="3.3.17"
+PHPBB_VERSIONCHECK_URL="https://raw.githubusercontent.com/phpbb/versioncheck/master/phpbb/versions.json"
+PHPBB_FALLBACK_ZIP="/home/everlomp/phpBB-${PHPBB_FALLBACK_VERSION}.zip"
+
+WEB_ROOT="/var/www/html"
+INSTALL_FILE="$WEB_ROOT/install.php"
+
+DATABASE_CONFIGURED_FILE="/var/www/.everlomp/database.configured"
+LSWS_PASSWORD_CONFIGURED_FILE="/var/www/.everlomp/lsws-password.configured"
+PRIMARY_APP_FILE="/home/everlomp/primary-app"
+PHPBB_INFO_FILE="/home/everlomp/phpbb.json"
+SECRET_HELPER="/usr/local/sbin/everlomp-secret"
+DB_SECRET_STORE="/home/everlomp/secrets/phpbb-db-password"
+DB_RUNTIME_FILE="/run/everlomp/web/phpbb-db-password"
+
+LOCAL_SOCKET="/run/mysqld/mysqld.sock"
+PHP_BIN="/usr/local/lsws/lsphp85/bin/php"
+
+if [ "$ACTION" != "install" ]; then
+    echo "Usage: everlomp-phpbb install" >&2
+    exit 64
+fi
+
+if [ ! -f "$DATABASE_CONFIGURED_FILE" ]; then
+    echo "Configure the MariaDB administrator account before installing phpBB." >&2
+    exit 2
+fi
+
+if [ ! -f "$LSWS_PASSWORD_CONFIGURED_FILE" ]; then
+    echo "Generate and save the OpenLiteSpeed WebAdmin password before installing phpBB." >&2
+    exit 3
+fi
+
+if [ -f "$PRIMARY_APP_FILE" ]; then
+    echo "A primary application is already installed." >&2
+    exit 4
+fi
+
+if [ ! -x "$PHP_BIN" ]; then
+    echo "LSPHP CLI is unavailable at $PHP_BIN." >&2
+    exit 3
+fi
+
+echo "[Everlomp] Checking phpBB PHP requirements..."
+
+MISSING_PHP_REQUIREMENTS="$(
+    "$PHP_BIN" -r '
+        $missing = [];
+
+        foreach (["json", "mbstring", "mysqli"] as $extension) {
+            if (!extension_loaded($extension)) {
+                $missing[] = $extension;
+            }
+        }
+
+        if (!class_exists("DOMDocument")) {
+            $missing[] = "dom";
+        }
+
+        if (!function_exists("simplexml_load_string")) {
+            $missing[] = "SimpleXML";
+        }
+
+        echo implode(" ", $missing);
+    '
+)"
+
+if [ -n "$MISSING_PHP_REQUIREMENTS" ]; then
+    echo "phpBB cannot be installed because LSPHP is missing required PHP functionality: $MISSING_PHP_REQUIREMENTS" >&2
+    echo "Loaded LSPHP modules:" >&2
+    "$PHP_BIN" -m >&2 || true
+    exit 4
+fi
+
+echo "[Everlomp] phpBB PHP requirements look good."
+
+PAYLOAD="$(cat)"
+
+SITE_URL="$(printf '%s' "$PAYLOAD" | jq -er '.site_url')"
+BOARD_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.board_name')"
+BOARD_DESCRIPTION="$(printf '%s' "$PAYLOAD" | jq -r '.board_description // ""')"
+
+if [ -z "$(printf '%s' "$BOARD_DESCRIPTION" | tr -d '[:space:]')" ]; then
+    BOARD_DESCRIPTION="A phpBB community powered by Everlomp"
+fi
+
+ADMIN_USER="$(printf '%s' "$PAYLOAD" | jq -er '.admin_user')"
+ADMIN_EMAIL="$(printf '%s' "$PAYLOAD" | jq -er '.admin_email')"
+ADMIN_PASS="$(printf '%s' "$PAYLOAD" | jq -er '.admin_password')"
+TABLE_PREFIX="$(printf '%s' "$PAYLOAD" | jq -er '.table_prefix')"
+DB_MODE="$(printf '%s' "$PAYLOAD" | jq -er '.db_mode')"
+LOCAL_FILE_ONLY="$(printf '%s' "$PAYLOAD" | jq -r 'if .local_file_only == true then "1" else "0" end')"
+SMTP_ENABLED="$(printf '%s' "$PAYLOAD" | jq -r 'if .smtp_enabled == true then "1" else "0" end')"
+SMTP_HOST="$(printf '%s' "$PAYLOAD" | jq -r '.smtp_host // ""')"
+SMTP_PORT="$(printf '%s' "$PAYLOAD" | jq -r '.smtp_port // ""')"
+SMTP_AUTH="$(printf '%s' "$PAYLOAD" | jq -r '.smtp_auth // ""')"
+SMTP_USER="$(printf '%s' "$PAYLOAD" | jq -r '.smtp_user // ""')"
+SMTP_PASS="$(printf '%s' "$PAYLOAD" | jq -r '.smtp_password // ""')"
+
+if [[ ! "$SITE_URL" =~ ^https://[^[:space:]]+$ ]]; then
+    echo "Invalid phpBB site URL." >&2
+    exit 4
+fi
+
+if [ -z "$BOARD_NAME" ] || [ "${#BOARD_NAME}" -gt 120 ]; then
+    echo "Invalid phpBB board name." >&2
+    exit 5
+fi
+
+if [ "${#BOARD_DESCRIPTION}" -gt 255 ]; then
+    echo "phpBB board description is too long." >&2
+    exit 6
+fi
+
+if [[ ! "$ADMIN_USER" =~ ^[A-Za-z0-9_.@-]{3,60}$ ]]; then
+    echo "Invalid phpBB admin username." >&2
+    exit 7
+fi
+
+if [ "${#ADMIN_PASS}" -lt 12 ] || [ "${#ADMIN_PASS}" -gt 30 ]; then
+    echo "phpBB admin password must be between 12 and 30 characters." >&2
+    exit 8
+fi
+
+if [[ ! "$ADMIN_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+    echo "Invalid phpBB admin email." >&2
+    exit 9
+fi
+
+if [[ ! "$TABLE_PREFIX" =~ ^[A-Za-z0-9_]{1,20}$ ]]; then
+    echo "Invalid phpBB table prefix." >&2
+    exit 10
+fi
+
+if [ "$SMTP_ENABLED" -eq 1 ]; then
+    if [ -z "$SMTP_HOST" ] || [ "${#SMTP_HOST}" -gt 255 ] || [[ "$SMTP_HOST" == *$'\n'* ]] || [[ "$SMTP_HOST" == *$'\r'* ]]; then
+        echo "Enter a valid phpBB SMTP host." >&2
+        exit 28
+    fi
+
+    if [ -z "$SMTP_PORT" ]; then
+        SMTP_PORT="587"
+    fi
+
+    if ! [[ "$SMTP_PORT" =~ ^[0-9]+$ ]] || [ "$SMTP_PORT" -lt 1 ] || [ "$SMTP_PORT" -gt 65535 ]; then
+        echo "phpBB SMTP port must be between 1 and 65535." >&2
+        exit 29
+    fi
+
+    case "$SMTP_AUTH" in
+        ""|PLAIN|LOGIN|CRAM-MD5|DIGEST-MD5|POP-BEFORE-SMTP) ;;
+        *)
+            echo "Invalid phpBB SMTP authentication method." >&2
+            exit 30
+            ;;
+    esac
+
+    if [[ "$SMTP_USER" == *$'\n'* ]] || [[ "$SMTP_USER" == *$'\r'* ]] || [[ "$SMTP_PASS" == *$'\n'* ]] || [[ "$SMTP_PASS" == *$'\r'* ]]; then
+        echo "phpBB SMTP credentials contain unsupported control characters." >&2
+        exit 31
+    fi
+
+    if { [ -n "$SMTP_USER" ] && [ -z "$SMTP_PASS" ]; } || { [ -z "$SMTP_USER" ] && [ -n "$SMTP_PASS" ]; }; then
+        echo "Provide both phpBB SMTP username and password, or leave both blank for an unauthenticated relay." >&2
+        exit 32
+    fi
+fi
+
+mapfile -t URL_PARTS < <(
+    python3 - "$SITE_URL" <<'PY'
+from urllib.parse import urlsplit
+import sys
+
+u = urlsplit(sys.argv[1])
+
+if u.scheme not in ("http", "https"):
+    raise SystemExit("invalid scheme")
+
+if not u.hostname:
+    raise SystemExit("missing hostname")
+
+if u.path not in ("", "/"):
+    raise SystemExit("phpBB primary-app URL must be the site root")
+
+port = u.port
+if port is None:
+    port = 443 if u.scheme == "https" else 80
+
+print(u.scheme)
+print(u.hostname)
+print(port)
+print("true" if u.scheme == "https" else "false")
+PY
+)
+
+if [ "${#URL_PARTS[@]}" -ne 4 ]; then
+    echo "Could not parse phpBB site URL. phpBB is installed at the site root, not a subdirectory." >&2
+    exit 11
+fi
+
+SERVER_SCHEME="${URL_PARTS[0]}"
+SERVER_NAME="${URL_PARTS[1]}"
+SERVER_PORT="${URL_PARTS[2]}"
+COOKIE_SECURE="${URL_PARTS[3]}"
+SERVER_PROTOCOL="${SERVER_SCHEME}://"
+
+
+TMP_DIR="$(mktemp -d /tmp/everlomp-phpbb.XXXXXX)"
+ZIP_FILE="$TMP_DIR/phpbb.zip"
+UNPACK_DIR="$TMP_DIR/unpacked"
+INSTALL_CONFIG="$TMP_DIR/phpbb-install-config.yml"
+
+DB_NAME=""
+DB_USER=""
+DB_PASS=""
+DB_HOST=""
+DB_PORT=""
+
+DB_CREATED=0
+USER_CREATED=0
+PUBLISHED=0
+FINISHED=0
+
+cleanup() {
+    status=$?
+
+    rm -rf "$TMP_DIR"
+
+    if [ "$FINISHED" -ne 1 ]; then
+        "$SECRET_HELPER" remove "$DB_SECRET_STORE" >/dev/null 2>&1 || true
+        rm -f "$DB_RUNTIME_FILE" || true
+    fi
+
+    if [ "$FINISHED" -ne 1 ] && [ "$PUBLISHED" -eq 1 ]; then
+        echo "[Everlomp] phpBB did not pass final verification; restoring the Everlomp bootstrap page..." >&2
+
+        find "$WEB_ROOT" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            ! -name install.php \
+            -exec rm -rf {} + || true
+
+        if [ -f "$INSTALL_FILE" ]; then
+            cat > "$WEB_ROOT/index.php" <<'PHP'
+<?php
+declare(strict_types=1);
+
+header('Location: /install.php', true, 302);
+exit;
+PHP
+            chown nobody:nogroup "$WEB_ROOT/index.php" || true
+            chmod 0644 "$WEB_ROOT/index.php" || true
+        fi
+    fi
+
+    if [ "$FINISHED" -ne 1 ] && [ "$DB_MODE" = "auto" ]; then
+        echo "[Everlomp] phpBB installation failed; rolling back auto-created database..." >&2
+
+        if [ "$DB_CREATED" -eq 1 ]; then
+            mariadb --protocol=socket --socket="$LOCAL_SOCKET" \
+                -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" || true
+        fi
+
+        if [ "$USER_CREATED" -eq 1 ]; then
+            mariadb --protocol=socket --socket="$LOCAL_SOCKET" \
+                -e "DROP USER IF EXISTS '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;" || true
+        fi
+    fi
+
+    exit "$status"
+}
+trap cleanup EXIT
+
+if [ "$DB_MODE" = "auto" ]; then
+    if [ ! -S "$LOCAL_SOCKET" ]; then
+        echo "Automatic database creation requires the local MariaDB server, but its socket is unavailable at $LOCAL_SOCKET." >&2
+        exit 12
+    fi
+
+    DB_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.database_name')"
+
+    if [[ ! "$DB_NAME" =~ ^[A-Za-z0-9_]{1,64}$ ]]; then
+        echo "Automatic database name may contain only letters, numbers, and underscores." >&2
+        exit 13
+    fi
+
+    INSTANCE_SUFFIX="site"
+
+    if [ -f /contract/env.vars ]; then
+        source /contract/env.vars
+
+        if [ -n "${INSTANCE_PUBKEY:-}" ]; then
+            INSTANCE_SUFFIX="${INSTANCE_PUBKEY:0:8}"
+        fi
+    fi
+
+    INSTANCE_SUFFIX="$(printf '%s' "$INSTANCE_SUFFIX" | tr -cd 'A-Za-z0-9_' | cut -c1-12)"
+    [ -n "$INSTANCE_SUFFIX" ] || INSTANCE_SUFFIX="site"
+
+    DB_USER="bb_${INSTANCE_SUFFIX}_$(openssl rand -hex 2)"
+    DB_USER="${DB_USER:0:32}"
+    DB_PASS="$(openssl rand -hex 32)"
+    DB_HOST="localhost"
+    DB_PORT=""
+
+    DB_EXISTS="$(
+        mariadb \
+            --protocol=socket \
+            --socket="$LOCAL_SOCKET" \
+            --batch \
+            --skip-column-names \
+            -e "SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';"
+    )"
+
+    if [ "$DB_EXISTS" != "0" ]; then
+        echo "Database '${DB_NAME}' already exists. Choose another name or use Existing Database mode." >&2
+        exit 14
+    fi
+
+    echo "[Everlomp] Creating phpBB database '${DB_NAME}'..."
+
+    mariadb --protocol=socket --socket="$LOCAL_SOCKET" <<SQL
+CREATE DATABASE \`${DB_NAME}\`
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+SQL
+    DB_CREATED=1
+
+    mariadb --protocol=socket --socket="$LOCAL_SOCKET" <<SQL
+CREATE USER '${DB_USER}'@'localhost'
+    IDENTIFIED BY '${DB_PASS}';
+
+GRANT ALL PRIVILEGES
+    ON \`${DB_NAME}\`.*
+    TO '${DB_USER}'@'localhost';
+
+FLUSH PRIVILEGES;
+SQL
+    USER_CREATED=1
+
+elif [ "$DB_MODE" = "existing" ]; then
+    DB_HOST="$(printf '%s' "$PAYLOAD" | jq -er '.database_host')"
+    DB_PORT="$(printf '%s' "$PAYLOAD" | jq -r '.database_port // ""')"
+    DB_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.database_name')"
+    DB_USER="$(printf '%s' "$PAYLOAD" | jq -er '.database_user')"
+    DB_PASS="$(printf '%s' "$PAYLOAD" | jq -r '.database_password // ""')"
+
+    if [ -z "$DB_HOST" ] || [ "${#DB_HOST}" -gt 255 ]; then
+        echo "Invalid database host." >&2
+        exit 15
+    fi
+
+    if [ -n "$DB_PORT" ] && { ! [[ "$DB_PORT" =~ ^[0-9]+$ ]] || [ "$DB_PORT" -lt 1 ] || [ "$DB_PORT" -gt 65535 ]; }; then
+        echo "Invalid database port." >&2
+        exit 16
+    fi
+
+    if [ -z "$DB_NAME" ] || [ "${#DB_NAME}" -gt 64 ]; then
+        echo "Invalid database name." >&2
+        exit 17
+    fi
+
+    if [ -z "$DB_USER" ] || [ "${#DB_USER}" -gt 128 ]; then
+        echo "Invalid database username." >&2
+        exit 18
+    fi
+else
+    echo "Invalid database mode." >&2
+    exit 19
+fi
+
+yaml_string() {
+    jq -Rn --arg value "$1" '$value'
+}
+
+if [ -n "$DB_PORT" ]; then
+    DB_PORT_YAML="$DB_PORT"
+else
+    DB_PORT_YAML="~"
+fi
+
+EMAIL_ENABLED_YAML="false"
+SMTP_DELIVERY_YAML="false"
+SMTP_HOST_YAML="~"
+SMTP_PORT_YAML="~"
+SMTP_AUTH_YAML="~"
+SMTP_USER_YAML="~"
+SMTP_PASS_YAML="~"
+
+if [ "$SMTP_ENABLED" -eq 1 ]; then
+    EMAIL_ENABLED_YAML="true"
+    SMTP_DELIVERY_YAML="true"
+    SMTP_HOST_YAML="$(yaml_string "$SMTP_HOST")"
+    SMTP_PORT_YAML="$SMTP_PORT"
+
+    if [ -n "$SMTP_AUTH" ]; then
+        SMTP_AUTH_YAML="$(yaml_string "$SMTP_AUTH")"
+    fi
+
+    if [ -n "$SMTP_USER" ]; then
+        SMTP_USER_YAML="$(yaml_string "$SMTP_USER")"
+        SMTP_PASS_YAML="$(yaml_string "$SMTP_PASS")"
+    fi
+fi
+
+cat > "$INSTALL_CONFIG" <<EOF
+installer:
+    admin:
+        name: $(yaml_string "$ADMIN_USER")
+        password: $(yaml_string "$ADMIN_PASS")
+        email: $(yaml_string "$ADMIN_EMAIL")
+
+    board:
+        lang: en
+        name: $(yaml_string "$BOARD_NAME")
+        description: $(yaml_string "$BOARD_DESCRIPTION")
+
+    database:
+        dbms: mysqli
+        dbhost: $(yaml_string "$DB_HOST")
+        dbport: ${DB_PORT_YAML}
+        dbuser: $(yaml_string "$DB_USER")
+        dbpasswd: $(yaml_string "$DB_PASS")
+        dbname: $(yaml_string "$DB_NAME")
+        table_prefix: $(yaml_string "$TABLE_PREFIX")
+
+    email:
+        enabled: ${EMAIL_ENABLED_YAML}
+        smtp_delivery: ${SMTP_DELIVERY_YAML}
+        smtp_host: ${SMTP_HOST_YAML}
+        smtp_port: ${SMTP_PORT_YAML}
+        smtp_auth: ${SMTP_AUTH_YAML}
+        smtp_user: ${SMTP_USER_YAML}
+        smtp_pass: ${SMTP_PASS_YAML}
+
+    server:
+        cookie_secure: ${COOKIE_SECURE}
+        server_protocol: $(yaml_string "$SERVER_PROTOCOL")
+        force_server_vars: true
+        server_name: $(yaml_string "$SERVER_NAME")
+        server_port: ${SERVER_PORT}
+        script_path: /
+
+    extensions: ['phpbb/viglink']
+EOF
+
+chmod 0600 "$INSTALL_CONFIG"
+
+echo "[Everlomp] Preparing phpBB..."
+
+mkdir -p "$UNPACK_DIR"
+
+validate_phpbb_zip() {
+    local archive="$1"
+
+    if [ ! -s "$archive" ]; then
+        return 1
+    fi
+
+    if ! unzip -tq "$archive" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if ! unzip -Z1 "$archive" \
+        | grep -qx 'phpBB3/install/phpbbcli.php'; then
+        return 1
+    fi
+
+    return 0
+}
+
+discover_latest_phpbb_version() {
+    local versions_json
+    local version
+
+    if ! versions_json="$(
+        curl \
+            -fsSL \
+            --retry 2 \
+            --connect-timeout 15 \
+            --max-time 45 \
+            "$PHPBB_VERSIONCHECK_URL"
+    )"; then
+        return 1
+    fi
+
+    version="$(
+        printf '%s' "$versions_json" \
+        | jq -r '.stable | to_entries[] | .value.current // empty' \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sort -V \
+        | tail -n 1
+    )"
+
+    if ! printf '%s' "$version" \
+        | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        return 1
+    fi
+
+    printf '%s\n' "$version"
+}
+
+USE_FALLBACK=0
+SELECTED_VERSION=""
+LATEST_VERSION=""
+
+if [ "$LOCAL_FILE_ONLY" -eq 1 ]; then
+    echo "[Everlomp] Local-file-only mode selected. Skipping phpBB version lookup and downloads."
+    USE_FALLBACK=1
+else
+    echo "[Everlomp] Checking phpBB official version data for the latest stable release..."
+
+    if LATEST_VERSION="$(discover_latest_phpbb_version)"; then
+        PHPBB_RELEASE_BRANCH="$(
+            printf '%s' "$LATEST_VERSION" \
+            | awk -F. '{print $1 "." $2}'
+        )"
+
+        PHPBB_DOWNLOAD_URL="https://download.phpbb.com/pub/release/${PHPBB_RELEASE_BRANCH}/${LATEST_VERSION}/phpBB-${LATEST_VERSION}.zip"
+
+        echo "[Everlomp] Latest stable phpBB: ${LATEST_VERSION}"
+        echo "[Everlomp] Trying official package: ${PHPBB_DOWNLOAD_URL}"
+
+        rm -f "$ZIP_FILE"
+
+        if curl \
+            -fL \
+            --retry 3 \
+            --connect-timeout 20 \
+            --max-time 180 \
+            "$PHPBB_DOWNLOAD_URL" \
+            -o "$ZIP_FILE"; then
+
+            if validate_phpbb_zip "$ZIP_FILE"; then
+                SELECTED_VERSION="$LATEST_VERSION"
+                echo "[Everlomp] Official phpBB ${SELECTED_VERSION} package validated."
+            else
+                echo "[Everlomp] Official phpBB ${LATEST_VERSION} download was incomplete or invalid. Using bundled fallback." >&2
+                USE_FALLBACK=1
+            fi
+        else
+            echo "[Everlomp] Could not download phpBB ${LATEST_VERSION}. Using bundled fallback." >&2
+            USE_FALLBACK=1
+        fi
+    else
+        echo "[Everlomp] Could not read phpBB stable version data. Using bundled fallback." >&2
+        USE_FALLBACK=1
+    fi
+fi
+
+if [ "$USE_FALLBACK" -eq 1 ]; then
+    rm -f "$ZIP_FILE"
+
+    if [ ! -f "$PHPBB_FALLBACK_ZIP" ]; then
+        echo "Bundled phpBB fallback archive is missing: $PHPBB_FALLBACK_ZIP" >&2
+        exit 18
+    fi
+
+    if ! validate_phpbb_zip "$PHPBB_FALLBACK_ZIP"; then
+        echo "Bundled phpBB fallback archive is invalid: $PHPBB_FALLBACK_ZIP" >&2
+        exit 19
+    fi
+
+    cp "$PHPBB_FALLBACK_ZIP" "$ZIP_FILE"
+    SELECTED_VERSION="$PHPBB_FALLBACK_VERSION"
+
+    echo "[Everlomp] Bundled phpBB ${SELECTED_VERSION} fallback validated and selected."
+fi
+
+echo "[Everlomp] Installing phpBB ${SELECTED_VERSION}..."
+
+rm -rf "$UNPACK_DIR"
+mkdir -p "$UNPACK_DIR"
+
+unzip -q "$ZIP_FILE" -d "$UNPACK_DIR"
+
+PHPBB_ROOT="$UNPACK_DIR/phpBB3"
+
+if [ ! -f "$PHPBB_ROOT/install/phpbbcli.php" ]; then
+    echo "The selected phpBB package did not contain phpBB3/install/phpbbcli.php." >&2
+    exit 20
+fi
+
+echo "[Everlomp] Validating phpBB installer configuration..."
+
+set +e
+CONFIG_VALIDATE_OUTPUT="$(
+    "$PHP_BIN" \
+        "$PHPBB_ROOT/install/phpbbcli.php" \
+        install:config:validate \
+        "$INSTALL_CONFIG" \
+        --no-ansi \
+        -vvv \
+        2>&1
+)"
+CONFIG_VALIDATE_RC=$?
+set -e
+
+if [ "$CONFIG_VALIDATE_RC" -ne 0 ]; then
+    echo "phpBB rejected the generated installer configuration:" >&2
+    printf '%s\n' "$CONFIG_VALIDATE_OUTPUT" >&2
+    exit 20
+fi
+
+if [ -n "$CONFIG_VALIDATE_OUTPUT" ]; then
+    printf '%s\n' "$CONFIG_VALIDATE_OUTPUT"
+fi
+
+echo "[Everlomp] phpBB installer configuration validated."
+echo "[Everlomp] Installing phpBB..."
+
+INSTALL_LOG="$TMP_DIR/phpbb-install.log"
+
+set +e
+"$PHP_BIN" \
+    "$PHPBB_ROOT/install/phpbbcli.php" \
+    install \
+    "$INSTALL_CONFIG" \
+    --no-ansi \
+    -vvv \
+    > >(tee "$INSTALL_LOG") \
+    2> >(tee -a "$INSTALL_LOG" >&2)
+
+INSTALL_RC=$?
+set -e
+
+if [ "$INSTALL_RC" -ne 0 ]; then
+    echo "phpBB CLI installer failed with exit status $INSTALL_RC." >&2
+    echo "Last installer output:" >&2
+    tail -n 100 "$INSTALL_LOG" >&2 || true
+    exit 21
+fi
+
+if [ ! -s "$PHPBB_ROOT/config.php" ]; then
+    echo "phpBB installer returned success but did not create a usable config.php." >&2
+    echo "Last installer output:" >&2
+    tail -n 100 "$INSTALL_LOG" >&2 || true
+    exit 22
+fi
+
+if ! grep -q "PHPBB_INSTALLED" "$PHPBB_ROOT/config.php"; then
+    echo "phpBB installer returned without marking config.php as installed." >&2
+    echo "Last installer output:" >&2
+    tail -n 100 "$INSTALL_LOG" >&2 || true
+    exit 23
+fi
+
+echo "[Everlomp] phpBB CLI install completed. Publishing files before final verification..."
+
+find "$WEB_ROOT" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    ! -name install.php \
+    -exec rm -rf {} +
+
+cp -a "$PHPBB_ROOT"/. "$WEB_ROOT"/
+PUBLISHED=1
+
+echo "[Everlomp] Applying OpenLiteSpeed ownership..."
+
+chown -R nobody:nogroup "$WEB_ROOT"
+
+find "$WEB_ROOT" \
+    -type d \
+    -exec chmod 0755 {} \;
+
+find "$WEB_ROOT" \
+    -type f \
+    -exec chmod 0644 {} \;
+
+chown nobody:nogroup "$WEB_ROOT/config.php"
+chmod 0600 "$WEB_ROOT/config.php"
+
+if [ -f "$INSTALL_FILE" ]; then
+    chown nobody:nogroup "$INSTALL_FILE"
+    chmod 0644 "$INSTALL_FILE"
+fi
+
+printf '%s' "$DB_PASS" | "$SECRET_HELPER" write "$DB_SECRET_STORE"
+"$SECRET_HELPER" materialize-web "$DB_SECRET_STORE" "$DB_RUNTIME_FILE"
+
+python3 - "$WEB_ROOT/config.php" <<'PYPHPBBCONFIG'
+from pathlib import Path
+import re
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+replacement = "$dbpasswd = trim((string) @file_get_contents('/run/everlomp/web/phpbb-db-password'));"
+text, count = re.subn(r"\$dbpasswd\s*=\s*.*?;", lambda _: replacement, text, count=1)
+if count != 1:
+    raise SystemExit('Could not replace phpBB dbpasswd with runtime secret file.')
+path.write_text(text)
+PYPHPBBCONFIG
+chown nobody:nogroup "$WEB_ROOT/config.php"
+chmod 0600 "$WEB_ROOT/config.php"
+
+echo "[Everlomp] Verifying published phpBB configuration and database..."
+
+if [ ! -s "$WEB_ROOT/config.php" ]; then
+    echo "Published phpBB config.php is missing or empty." >&2
+    exit 23
+fi
+
+if ! grep -q "PHPBB_INSTALLED" "$WEB_ROOT/config.php"; then
+    echo "Published phpBB config.php is not marked installed." >&2
+    exit 24
+fi
+
+PHPBB_VERIFY_SCRIPT="$TMP_DIR/verify-phpbb.php"
+
+cat > "$PHPBB_VERIFY_SCRIPT" <<'PHP'
+<?php
+declare(strict_types=1);
+
+$configFile = $argv[1] ?? '';
+
+if ($configFile === '' || !is_file($configFile)) {
+    fwrite(STDERR, "phpBB config file is missing.\n");
+    exit(1);
+}
+
+define('IN_PHPBB', true);
+require $configFile;
+
+$host = ($dbhost ?? '') !== '' ? (string) $dbhost : 'localhost';
+$port = ($dbport ?? '') !== '' ? (int) $dbport : 0;
+$user = (string) ($dbuser ?? '');
+$pass = (string) ($dbpasswd ?? '');
+$name = (string) ($dbname ?? '');
+$prefix = (string) ($table_prefix ?? '');
+
+if (!defined('PHPBB_INSTALLED')) {
+    fwrite(STDERR, "PHPBB_INSTALLED is not defined.\n");
+    exit(2);
+}
+
+$mysqli = mysqli_init();
+
+if ($mysqli === false) {
+    fwrite(STDERR, "Could not initialize mysqli.\n");
+    exit(3);
+}
+
+$connected = @$mysqli->real_connect(
+    $host,
+    $user,
+    $pass,
+    $name,
+    $port > 0 ? $port : null
+);
+
+if (!$connected) {
+    fwrite(
+        STDERR,
+        "Published phpBB config cannot connect to the database: "
+        . mysqli_connect_error()
+        . "\n"
+    );
+    exit(4);
+}
+
+$table = $prefix . 'config';
+
+if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+    fwrite(STDERR, "Unsafe phpBB config table name.\n");
+    exit(5);
+}
+
+$result = $mysqli->query(
+    "SELECT config_value FROM `" . $table . "` "
+    . "WHERE config_name='version' LIMIT 1"
+);
+
+if ($result === false || $result->num_rows !== 1) {
+    fwrite(STDERR, "phpBB config table/version row was not found.\n");
+    exit(6);
+}
+
+$row = $result->fetch_assoc();
+$version = (string) ($row['config_value'] ?? '');
+
+if ($version === '') {
+    fwrite(STDERR, "phpBB database version is empty.\n");
+    exit(7);
+}
+
+echo $version . PHP_EOL;
+PHP
+
+chmod 0600 "$PHPBB_VERIFY_SCRIPT"
+
+"$PHP_BIN" \
+    "$PHPBB_VERIFY_SCRIPT" \
+    "$WEB_ROOT/config.php"
+
+rm -f "$PHPBB_VERIFY_SCRIPT"
+
+echo "[Everlomp] phpBB database verification passed."
+
+echo "[Everlomp] Removing phpBB install directory after successful verification..."
+rm -rf -- "$WEB_ROOT/install"
+
+if [ -e "$WEB_ROOT/install" ]; then
+    echo "Failed to remove phpBB install directory." >&2
+    exit 25
+fi
+
+echo "[Everlomp] Running final phpBB bootstrap check..."
+PHPBB_VERSION_CHECK="$(
+    "$PHP_BIN" "$WEB_ROOT/bin/phpbbcli.php" config:get version 2>&1
+)" || {
+    echo "phpBB final bootstrap check failed:" >&2
+    echo "$PHPBB_VERSION_CHECK" >&2
+    exit 26
+}
+
+if [ -z "$(printf '%s' "$PHPBB_VERSION_CHECK" | tr -d '[:space:]')" ]; then
+    echo "phpBB final bootstrap check returned no version." >&2
+    exit 27
+fi
+
+echo "[Everlomp] phpBB final bootstrap check passed: $PHPBB_VERSION_CHECK"
+
+printf 'phpbb\n' > "$PRIMARY_APP_FILE"
+chmod 0644 "$PRIMARY_APP_FILE"
+
+DB_HOST_RECORDED="$DB_HOST"
+if [ -n "$DB_PORT" ]; then
+    DB_HOST_RECORDED="${DB_HOST}:${DB_PORT}"
+fi
+
+jq -n \
+    --arg version "$SELECTED_VERSION" \
+    --arg site_url "$SITE_URL" \
+    --arg database "$DB_NAME" \
+    --arg database_user "$DB_USER" \
+    --arg database_host "$DB_HOST_RECORDED" \
+    --arg database_mode "$DB_MODE" \
+    --arg table_prefix "$TABLE_PREFIX" \
+    --argjson smtp_configured "$([ "$SMTP_ENABLED" -eq 1 ] && printf true || printf false)" \
+    --arg installed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{
+        version: $version,
+        site_url: $site_url,
+        database: $database,
+        database_user: $database_user,
+        database_host: $database_host,
+        database_mode: $database_mode,
+        table_prefix: $table_prefix,
+        smtp_configured: $smtp_configured,
+        installed_at: $installed_at
+    }' > "$PHPBB_INFO_FILE"
+
+chmod 0644 "$PHPBB_INFO_FILE"
+
+FINISHED=1
+
+echo "[Everlomp] phpBB installed successfully."

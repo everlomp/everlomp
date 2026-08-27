@@ -1,0 +1,5 @@
+# Everlomp backup scheduler.
+# Runs every minute; the scheduler itself decides whether a configured job is due.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root /usr/local/sbin/everlomp-backup-scheduler >> /var/log/everlomp/backup-scheduler.log 2>&1

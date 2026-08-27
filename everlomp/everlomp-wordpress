@@ -1,0 +1,671 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${1:-}"
+
+WEB_ROOT="/var/www/html"
+INSTALL_FILE="$WEB_ROOT/install.php"
+
+DATABASE_CONFIGURED_FILE="/var/www/.everlomp/database.configured"
+LSWS_PASSWORD_CONFIGURED_FILE="/var/www/.everlomp/lsws-password.configured"
+PRIMARY_APP_FILE="/home/everlomp/primary-app"
+WORDPRESS_INFO_FILE="/home/everlomp/wordpress.json"
+SECRET_HELPER="/usr/local/sbin/everlomp-secret"
+DB_SECRET_STORE="/home/everlomp/secrets/wordpress-db-password"
+DB_RUNTIME_FILE="/run/everlomp/web/wordpress-db-password"
+
+LOCAL_SOCKET="/run/mysqld/mysqld.sock"
+WP="/usr/local/bin/wp"
+PHP_BIN="/usr/local/lsws/lsphp85/bin/php"
+
+WORDPRESS_LATEST_URL="https://wordpress.org/latest.zip"
+WORDPRESS_FALLBACK_VERSION="7.0.4"
+WORDPRESS_FALLBACK_ZIP="/home/everlomp/wordpress-${WORDPRESS_FALLBACK_VERSION}.zip"
+WPADDONS_DIR="/home/everlomp/wpaddons"
+WP_THEME_MANIFEST="$WPADDONS_DIR/themes.json"
+WP_PLUGIN_MANIFEST="$WPADDONS_DIR/plugins.json"
+
+if [ "$ACTION" != "install" ]; then
+    echo "Usage: everlomp-wordpress install" >&2
+    exit 64
+fi
+
+if [ ! -f "$DATABASE_CONFIGURED_FILE" ]; then
+    echo "Configure the MariaDB administrator account before installing WordPress." >&2
+    exit 2
+fi
+
+if [ ! -f "$LSWS_PASSWORD_CONFIGURED_FILE" ]; then
+    echo "Generate and save the OpenLiteSpeed WebAdmin password before installing WordPress." >&2
+    exit 3
+fi
+
+if [ -f "$PRIMARY_APP_FILE" ]; then
+    echo "A primary application is already installed." >&2
+    exit 4
+fi
+
+if [ ! -x "$WP" ]; then
+    echo "WP-CLI is not installed at $WP." >&2
+    exit 3
+fi
+
+PAYLOAD="$(cat)"
+
+SITE_URL="$(printf '%s' "$PAYLOAD" | jq -er '.site_url')"
+SITE_TITLE="$(printf '%s' "$PAYLOAD" | jq -er '.site_title')"
+ADMIN_USER="$(printf '%s' "$PAYLOAD" | jq -er '.admin_user')"
+ADMIN_EMAIL="$(printf '%s' "$PAYLOAD" | jq -er '.admin_email')"
+ADMIN_PASS="$(printf '%s' "$PAYLOAD" | jq -er '.admin_password')"
+DB_MODE="$(printf '%s' "$PAYLOAD" | jq -er '.db_mode')"
+LOCAL_FILE_ONLY="$(printf '%s' "$PAYLOAD" | jq -r 'if .local_file_only == true then "1" else "0" end')"
+
+mapfile -t SELECTED_THEMES < <(
+    printf '%s' "$PAYLOAD" | jq -r '.themes // [] | if type == "array" then .[] | select(type == "string") else empty end'
+)
+mapfile -t SELECTED_PLUGINS < <(
+    printf '%s' "$PAYLOAD" | jq -r '.plugins // [] | if type == "array" then .[] | select(type == "string") else empty end'
+)
+mapfile -t LOCAL_THEMES < <(
+    printf '%s' "$PAYLOAD" | jq -r '.theme_install_local // [] | if type == "array" then .[] | select(type == "string") else empty end'
+)
+mapfile -t LOCAL_PLUGINS < <(
+    printf '%s' "$PAYLOAD" | jq -r '.plugin_install_local // [] | if type == "array" then .[] | select(type == "string") else empty end'
+)
+mapfile -t ACTIVATE_THEMES < <(
+    printf '%s' "$PAYLOAD" | jq -r '.theme_activate // [] | if type == "array" then .[] | select(type == "string") else empty end'
+)
+mapfile -t ACTIVATE_PLUGINS < <(
+    printf '%s' "$PAYLOAD" | jq -r '.plugin_activate // [] | if type == "array" then .[] | select(type == "string") else empty end'
+)
+
+array_contains() {
+    local needle="$1"
+    shift || true
+    local item
+
+    for item in "$@"; do
+        if [ "$item" = "$needle" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+if [[ ! "$SITE_URL" =~ ^https://[^[:space:]]+$ ]]; then
+    echo "Invalid WordPress site URL." >&2
+    exit 4
+fi
+
+if [ -z "$SITE_TITLE" ] || [ "${#SITE_TITLE}" -gt 120 ]; then
+    echo "Invalid WordPress site title." >&2
+    exit 5
+fi
+
+if [[ ! "$ADMIN_USER" =~ ^[A-Za-z0-9_.@-]{3,60}$ ]]; then
+    echo "Invalid WordPress admin username." >&2
+    exit 6
+fi
+
+if [ "${#ADMIN_PASS}" -lt 12 ]; then
+    echo "WordPress admin password must be at least 12 characters." >&2
+    exit 7
+fi
+
+if [[ ! "$ADMIN_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+    echo "Invalid WordPress admin email." >&2
+    exit 8
+fi
+
+
+TMP_DIR="$(mktemp -d /tmp/everlomp-wordpress.XXXXXX)"
+
+DB_NAME=""
+DB_USER=""
+DB_PASS=""
+DB_HOST_FOR_WP=""
+
+DB_CREATED=0
+USER_CREATED=0
+FINISHED=0
+
+cleanup() {
+    status=$?
+
+    rm -rf "$TMP_DIR"
+
+    if [ "$FINISHED" -ne 1 ]; then
+        "$SECRET_HELPER" remove "$DB_SECRET_STORE" >/dev/null 2>&1 || true
+        rm -f "$DB_RUNTIME_FILE" || true
+    fi
+
+    if [ "$FINISHED" -ne 1 ] && [ "$DB_MODE" = "auto" ]; then
+        echo "[Everlomp] WordPress installation failed; rolling back auto-created database..." >&2
+
+        if [ "$DB_CREATED" -eq 1 ]; then
+            mariadb --protocol=socket --socket="$LOCAL_SOCKET" \
+                -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" || true
+        fi
+
+        if [ "$USER_CREATED" -eq 1 ]; then
+            mariadb --protocol=socket --socket="$LOCAL_SOCKET" \
+                -e "DROP USER IF EXISTS '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;" || true
+        fi
+    fi
+
+    exit "$status"
+}
+trap cleanup EXIT
+
+if [ "$DB_MODE" = "auto" ]; then
+    if [ ! -S "$LOCAL_SOCKET" ]; then
+        echo "Automatic database creation requires the local MariaDB server, but its socket is unavailable at $LOCAL_SOCKET." >&2
+        exit 9
+    fi
+
+    DB_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.database_name')"
+
+    if [[ ! "$DB_NAME" =~ ^[A-Za-z0-9_]{1,64}$ ]]; then
+        echo "Automatic database name may contain only letters, numbers, and underscores." >&2
+        exit 10
+    fi
+
+    INSTANCE_SUFFIX="site"
+
+    if [ -f /contract/env.vars ]; then
+        source /contract/env.vars
+
+        if [ -n "${INSTANCE_PUBKEY:-}" ]; then
+            INSTANCE_SUFFIX="${INSTANCE_PUBKEY:0:8}"
+        fi
+    fi
+
+    INSTANCE_SUFFIX="$(printf '%s' "$INSTANCE_SUFFIX" | tr -cd 'A-Za-z0-9_' | cut -c1-12)"
+    [ -n "$INSTANCE_SUFFIX" ] || INSTANCE_SUFFIX="site"
+
+    DB_USER="wp_${INSTANCE_SUFFIX}_$(openssl rand -hex 2)"
+    DB_USER="${DB_USER:0:32}"
+    DB_PASS="$(openssl rand -hex 32)"
+    DB_HOST_FOR_WP="localhost"
+
+    DB_EXISTS="$(
+        mariadb \
+            --protocol=socket \
+            --socket="$LOCAL_SOCKET" \
+            --batch \
+            --skip-column-names \
+            -e "SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';"
+    )"
+
+    if [ "$DB_EXISTS" != "0" ]; then
+        echo "Database '${DB_NAME}' already exists. Choose another name or use Existing Database mode." >&2
+        exit 11
+    fi
+
+    echo "[Everlomp] Creating WordPress database '${DB_NAME}'..."
+
+    mariadb --protocol=socket --socket="$LOCAL_SOCKET" <<SQL
+CREATE DATABASE \`${DB_NAME}\`
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+SQL
+    DB_CREATED=1
+
+    mariadb --protocol=socket --socket="$LOCAL_SOCKET" <<SQL
+CREATE USER '${DB_USER}'@'localhost'
+    IDENTIFIED BY '${DB_PASS}';
+
+GRANT ALL PRIVILEGES
+    ON \`${DB_NAME}\`.*
+    TO '${DB_USER}'@'localhost';
+
+FLUSH PRIVILEGES;
+SQL
+    USER_CREATED=1
+
+elif [ "$DB_MODE" = "existing" ]; then
+    DB_HOST="$(printf '%s' "$PAYLOAD" | jq -er '.database_host')"
+    DB_PORT="$(printf '%s' "$PAYLOAD" | jq -r '.database_port // ""')"
+    DB_NAME="$(printf '%s' "$PAYLOAD" | jq -er '.database_name')"
+    DB_USER="$(printf '%s' "$PAYLOAD" | jq -er '.database_user')"
+    DB_PASS="$(printf '%s' "$PAYLOAD" | jq -r '.database_password // ""')"
+
+    if [ -z "$DB_HOST" ] || [ "${#DB_HOST}" -gt 255 ]; then
+        echo "Invalid database host." >&2
+        exit 12
+    fi
+
+    if [ -n "$DB_PORT" ] && { ! [[ "$DB_PORT" =~ ^[0-9]+$ ]] || [ "$DB_PORT" -lt 1 ] || [ "$DB_PORT" -gt 65535 ]; }; then
+        echo "Invalid database port." >&2
+        exit 13
+    fi
+
+    if [ -z "$DB_NAME" ] || [ "${#DB_NAME}" -gt 64 ]; then
+        echo "Invalid database name." >&2
+        exit 14
+    fi
+
+    if [ -z "$DB_USER" ] || [ "${#DB_USER}" -gt 128 ]; then
+        echo "Invalid database username." >&2
+        exit 15
+    fi
+
+    DB_HOST_FOR_WP="$DB_HOST"
+
+    if [ -n "$DB_PORT" ]; then
+        DB_HOST_FOR_WP="${DB_HOST}:${DB_PORT}"
+    fi
+else
+    echo "Invalid database mode." >&2
+    exit 16
+fi
+
+echo "[Everlomp] Preparing WordPress..."
+
+WORDPRESS_ZIP="$TMP_DIR/wordpress.zip"
+WORDPRESS_UNPACK_DIR="$TMP_DIR/unpack"
+
+validate_wordpress_zip() {
+    local archive="$1"
+
+    if [ ! -s "$archive" ]; then
+        return 1
+    fi
+
+    if ! unzip -tq "$archive" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if ! unzip -Z1 "$archive" | grep -qx 'wordpress/wp-settings.php'; then
+        return 1
+    fi
+
+    if ! unzip -Z1 "$archive" | grep -qx 'wordpress/wp-admin/install.php'; then
+        return 1
+    fi
+
+    return 0
+}
+
+USE_WORDPRESS_FALLBACK=0
+
+if [ "$LOCAL_FILE_ONLY" -eq 1 ]; then
+    echo "[Everlomp] Local-file-only mode selected. Skipping WordPress.org."
+    USE_WORDPRESS_FALLBACK=1
+else
+    echo "[Everlomp] Trying latest stable WordPress from WordPress.org..."
+    rm -f "$WORDPRESS_ZIP"
+
+    if curl \
+        -fL \
+        --retry 3 \
+        --connect-timeout 20 \
+        --max-time 180 \
+        "$WORDPRESS_LATEST_URL" \
+        -o "$WORDPRESS_ZIP"; then
+
+        if validate_wordpress_zip "$WORDPRESS_ZIP"; then
+            echo "[Everlomp] Latest WordPress package validated."
+        else
+            echo "[Everlomp] Latest WordPress download was incomplete or invalid. Using bundled fallback." >&2
+            USE_WORDPRESS_FALLBACK=1
+        fi
+    else
+        echo "[Everlomp] Latest WordPress download failed. Using bundled fallback." >&2
+        USE_WORDPRESS_FALLBACK=1
+    fi
+fi
+
+if [ "$USE_WORDPRESS_FALLBACK" -eq 1 ]; then
+    rm -f "$WORDPRESS_ZIP"
+
+    if [ ! -f "$WORDPRESS_FALLBACK_ZIP" ]; then
+        echo "Bundled WordPress fallback archive is missing: $WORDPRESS_FALLBACK_ZIP" >&2
+        exit 17
+    fi
+
+    if ! validate_wordpress_zip "$WORDPRESS_FALLBACK_ZIP"; then
+        echo "Bundled WordPress fallback archive is invalid: $WORDPRESS_FALLBACK_ZIP" >&2
+        exit 18
+    fi
+
+    cp "$WORDPRESS_FALLBACK_ZIP" "$WORDPRESS_ZIP"
+    echo "[Everlomp] Bundled WordPress ${WORDPRESS_FALLBACK_VERSION} fallback validated and selected."
+fi
+
+rm -rf "$WORDPRESS_UNPACK_DIR"
+mkdir -p "$WORDPRESS_UNPACK_DIR"
+
+unzip -q "$WORDPRESS_ZIP" -d "$WORDPRESS_UNPACK_DIR"
+
+if [ ! -f "$WORDPRESS_UNPACK_DIR/wordpress/wp-settings.php" ]; then
+    echo "Selected WordPress archive did not unpack correctly." >&2
+    exit 19
+fi
+
+cp -a "$WORDPRESS_UNPACK_DIR/wordpress"/. "$TMP_DIR"/
+
+rm -rf "$WORDPRESS_UNPACK_DIR"
+rm -f "$WORDPRESS_ZIP"
+
+WORDPRESS_SELECTED_VERSION="$(
+    "$WP" --allow-root core version --path="$TMP_DIR" 2>/dev/null || true
+)"
+
+if [ -n "$WORDPRESS_SELECTED_VERSION" ]; then
+    echo "[Everlomp] Selected WordPress version: $WORDPRESS_SELECTED_VERSION"
+fi
+
+echo "[Everlomp] Creating wp-config.php..."
+
+"$WP" \
+    --allow-root \
+    config create \
+    --path="$TMP_DIR" \
+    --dbname="$DB_NAME" \
+    --dbuser="$DB_USER" \
+    --dbpass="$DB_PASS" \
+    --dbhost="$DB_HOST_FOR_WP" \
+    --dbcharset="utf8mb4"
+
+"$WP" \
+    --allow-root \
+    config set \
+    FS_METHOD \
+    direct \
+    --path="$TMP_DIR"
+
+"$WP" \
+    --allow-root \
+    config set \
+    WP_MEMORY_LIMIT \
+    256M \
+    --path="$TMP_DIR"
+
+"$WP" \
+    --allow-root \
+    config set \
+    WP_MAX_MEMORY_LIMIT \
+    512M \
+    --path="$TMP_DIR"
+
+echo "[Everlomp] Checking database connection..."
+
+if ! "$WP" --allow-root db check --path="$TMP_DIR"; then
+    echo "Could not connect to the WordPress database with the selected settings." >&2
+    exit 17
+fi
+
+echo "[Everlomp] Installing WordPress..."
+
+"$WP" \
+    --allow-root \
+    core install \
+    --path="$TMP_DIR" \
+    --url="$SITE_URL" \
+    --title="$SITE_TITLE" \
+    --admin_user="$ADMIN_USER" \
+    --admin_password="$ADMIN_PASS" \
+    --admin_email="$ADMIN_EMAIL" \
+    --skip-email
+
+echo "[Everlomp] Removing Hello Dolly if present..."
+
+"$WP" --allow-root plugin delete hello --path="$TMP_DIR" >/dev/null 2>&1 || true
+rm -f "$TMP_DIR/wp-content/plugins/hello.php"
+
+validate_wpaddon_manifest() {
+    local manifest="$1"
+    local key="$2"
+
+    if [ ! -s "$manifest" ]; then
+        echo "WordPress add-on manifest is missing: $manifest" >&2
+        return 1
+    fi
+
+    if ! jq -e --arg key "$key" '.[$key] | type == "array"' "$manifest" >/dev/null 2>&1; then
+        echo "WordPress add-on manifest is invalid: $manifest" >&2
+        return 1
+    fi
+}
+
+install_wpaddon() {
+    local type="$1"
+    local slug="$2"
+    local manifest="$3"
+    local key="$4"
+    local install_local="$5"
+    local activate="$6"
+    local addon_json local_file local_path
+
+    if [[ ! "$slug" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        echo "Invalid WordPress ${type} slug requested: $slug" >&2
+        return 1
+    fi
+
+    addon_json="$(jq -cer --arg key "$key" --arg slug "$slug" 'first(.[$key][] | select(.slug == $slug))' "$manifest")" || {
+        echo "Unknown WordPress ${type} requested: $slug" >&2
+        return 1
+    }
+
+    local_file="$(printf '%s' "$addon_json" | jq -r '.file // ""')"
+    local_path=""
+
+    if [ -n "$local_file" ]; then
+        if [[ ! "$local_file" =~ ^[A-Za-z0-9._-]+\.zip$ ]]; then
+            echo "Invalid local archive configured for WordPress ${type} ${slug}." >&2
+            return 1
+        fi
+        local_path="$WPADDONS_DIR/$local_file"
+    fi
+
+    install_local_wpaddon() {
+        if [ -z "$local_path" ]; then
+            echo "No local archive is configured for WordPress ${type} ${slug}." >&2
+            return 1
+        fi
+
+        if [ ! -s "$local_path" ]; then
+            echo "Bundled local archive is missing for WordPress ${type} ${slug}: $local_path" >&2
+            return 1
+        fi
+
+        if ! unzip -tq "$local_path" >/dev/null 2>&1; then
+            echo "Bundled local archive is invalid for WordPress ${type} ${slug}: $local_path" >&2
+            return 1
+        fi
+
+        "$WP" --allow-root "$type" install "$local_path" --force --path="$TMP_DIR"
+        echo "[Everlomp] Installed ${slug} from bundled local archive."
+    }
+
+    if [ "$install_local" -eq 1 ]; then
+        echo "[Everlomp] Installing WordPress ${type}: ${slug} from bundled local archive..."
+        install_local_wpaddon
+    else
+        echo "[Everlomp] Installing WordPress ${type}: ${slug} from WordPress.org with WP-CLI..."
+
+        if "$WP" --allow-root "$type" install "$slug" --path="$TMP_DIR"; then
+            echo "[Everlomp] Installed ${slug} from WordPress.org."
+        elif [ -n "$local_path" ] && [ -s "$local_path" ]; then
+            echo "[Everlomp] WordPress.org install failed for ${slug}; trying bundled archive ${local_file}." >&2
+            install_local_wpaddon
+        else
+            echo "[Everlomp] WordPress.org install failed for ${slug}, and no local fallback is available." >&2
+            return 1
+        fi
+    fi
+
+    if [ "$activate" -eq 1 ]; then
+        echo "[Everlomp] Activating WordPress ${type}: ${slug}..."
+        "$WP" --allow-root "$type" activate "$slug" --path="$TMP_DIR"
+    fi
+}
+
+if [ "${#SELECTED_THEMES[@]}" -gt 0 ]; then
+    validate_wpaddon_manifest "$WP_THEME_MANIFEST" themes
+
+    for addon_slug in "${SELECTED_THEMES[@]}"; do
+        install_local=0
+        activate=0
+        array_contains "$addon_slug" "${LOCAL_THEMES[@]}" && install_local=1
+        array_contains "$addon_slug" "${ACTIVATE_THEMES[@]}" && activate=1
+        install_wpaddon theme "$addon_slug" "$WP_THEME_MANIFEST" themes "$install_local" "$activate"
+    done
+fi
+
+if [ "${#SELECTED_PLUGINS[@]}" -gt 0 ]; then
+    validate_wpaddon_manifest "$WP_PLUGIN_MANIFEST" plugins
+
+    for addon_slug in "${SELECTED_PLUGINS[@]}"; do
+        install_local=0
+        activate=0
+        array_contains "$addon_slug" "${LOCAL_PLUGINS[@]}" && install_local=1
+        array_contains "$addon_slug" "${ACTIVATE_PLUGINS[@]}" && activate=1
+        install_wpaddon plugin "$addon_slug" "$WP_PLUGIN_MANIFEST" plugins "$install_local" "$activate"
+    done
+fi
+
+if [ "$LOCAL_FILE_ONLY" -eq 1 ]; then
+    echo "[Everlomp] Local-file-only mode: skipping LiteSpeed Cache because no bundled fallback archive is provided."
+else
+    echo "[Everlomp] Installing LiteSpeed Cache..."
+
+    "$WP" \
+        --allow-root \
+        plugin install \
+        litespeed-cache \
+        --activate \
+        --path="$TMP_DIR"
+fi
+
+WP_CLI_REWRITE_CONFIG="$TMP_DIR/wp-cli-rewrite.yml"
+cat > "$WP_CLI_REWRITE_CONFIG" <<'EOF'
+apache_modules:
+  - mod_rewrite
+EOF
+
+WP_CLI_CONFIG_PATH="$WP_CLI_REWRITE_CONFIG" "$WP" \
+    --allow-root \
+    rewrite structure \
+    '/%postname%/' \
+    --hard \
+    --path="$TMP_DIR"
+
+if [ ! -s "$TMP_DIR/.htaccess" ] || ! grep -q 'RewriteRule' "$TMP_DIR/.htaccess"; then
+    echo "WordPress permalink rewrite rules were not written to .htaccess." >&2
+    exit 18
+fi
+
+rm -f "$WP_CLI_REWRITE_CONFIG"
+
+printf '%s' "$DB_PASS" | "$SECRET_HELPER" write "$DB_SECRET_STORE"
+"$SECRET_HELPER" materialize-web "$DB_SECRET_STORE" "$DB_RUNTIME_FILE"
+
+python3 - "$TMP_DIR/wp-config.php" <<'PYWPCONFIG'
+from pathlib import Path
+import re
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+replacement = "define( 'DB_PASSWORD', trim((string) @file_get_contents('/run/everlomp/web/wordpress-db-password')) );"
+text, count = re.subn(r"define\(\s*['\"]DB_PASSWORD['\"]\s*,\s*.*?\s*\);", replacement, text, count=1)
+if count != 1:
+    raise SystemExit('Could not replace WordPress DB_PASSWORD with runtime secret file.')
+path.write_text(text)
+PYWPCONFIG
+
+echo "[Everlomp] Publishing WordPress..."
+
+find "$WEB_ROOT" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    ! -name install.php \
+    -exec rm -rf {} +
+
+cp -a "$TMP_DIR"/. "$WEB_ROOT"/
+
+echo "[Everlomp] Applying OpenLiteSpeed ownership..."
+
+chown -R nobody:nogroup "$WEB_ROOT"
+
+find "$WEB_ROOT" \
+    -type d \
+    -exec chmod 0755 {} \;
+
+find "$WEB_ROOT" \
+    -type f \
+    -exec chmod 0644 {} \;
+
+chown nobody:nogroup "$WEB_ROOT/wp-config.php"
+chmod 0600 "$WEB_ROOT/wp-config.php"
+
+if [ -f "$INSTALL_FILE" ]; then
+    chown nobody:nogroup "$INSTALL_FILE"
+    chmod 0644 "$INSTALL_FILE"
+fi
+
+"$SECRET_HELPER" materialize-web "$DB_SECRET_STORE" "$DB_RUNTIME_FILE"
+if ! sudo -u nobody -n test -r "$DB_RUNTIME_FILE"; then
+    echo "WordPress runtime DB password is not readable by the OpenLiteSpeed PHP worker." >&2
+    exit 19
+fi
+if ! cmp -s <(printf '%s' "$DB_PASS") "$DB_RUNTIME_FILE"; then
+    echo "WordPress runtime DB password does not match the stored credential." >&2
+    exit 20
+fi
+if ! "$WP" --allow-root core is-installed --path="$WEB_ROOT" >/dev/null 2>&1; then
+    echo "WordPress could not connect using its final wp-config.php immediately after installation." >&2
+    exit 22
+fi
+
+if [ ! -x "$PHP_BIN" ]; then
+    echo "OpenLiteSpeed PHP runtime is missing at $PHP_BIN." >&2
+    exit 23
+fi
+if ! runuser -u nobody -- "$PHP_BIN" -d display_errors=0 -r '
+    define("WP_USE_THEMES", false);
+    require "/var/www/html/wp-load.php";
+    $url = function_exists("get_option") ? get_option("siteurl") : false;
+    if (!is_string($url) || $url === "") { exit(7); }
+' >/dev/null 2>&1; then
+    echo "WordPress could not be loaded by the OpenLiteSpeed PHP runtime as nobody immediately after installation." >&2
+    exit 24
+fi
+
+printf 'wordpress\n' > "$PRIMARY_APP_FILE"
+chmod 0644 "$PRIMARY_APP_FILE"
+
+jq -n \
+    --arg site_url "$SITE_URL" \
+    --arg database "$DB_NAME" \
+    --arg database_user "$DB_USER" \
+    --arg database_host "$DB_HOST_FOR_WP" \
+    --arg database_mode "$DB_MODE" \
+    --arg installed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{
+        site_url: $site_url,
+        database: $database,
+        database_user: $database_user,
+        database_host: $database_host,
+        database_mode: $database_mode,
+        installed_at: $installed_at
+    }' > "$WORDPRESS_INFO_FILE"
+
+chmod 0644 "$WORDPRESS_INFO_FILE"
+
+if [ -x /usr/local/lsws/bin/lswsctrl ]; then
+    /usr/local/lsws/bin/lswsctrl restart || \
+        echo "[Everlomp] Warning: OpenLiteSpeed graceful restart failed; pretty permalinks may 404 until OLS is restarted." >&2
+fi
+
+"$SECRET_HELPER" materialize-web "$DB_SECRET_STORE" "$DB_RUNTIME_FILE"
+if ! runuser -u nobody -- test -r "$DB_RUNTIME_FILE"; then
+    echo "WordPress runtime DB password became unreadable after installation." >&2
+    exit 21
+fi
+
+FINISHED=1
+
+echo "[Everlomp] WordPress installed successfully."

@@ -1,0 +1,1252 @@
+#!/usr/bin/env python3
+import base64
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import html
+import hmac
+import json
+import os
+import re
+import secrets
+import shlex
+import struct
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote, urlparse
+
+import pexpect
+
+SECRET_HELPER = '/usr/local/sbin/everlomp-secret'
+SUPERVISORCTL = '/usr/bin/supervisorctl'
+SUPERVISOR_CONF = '/etc/everlomp/supervisord.conf'
+KOPIA_CANDIDATES = [Path('/usr/local/bin/kopia'), Path('/usr/bin/kopia')]
+RCLONE = shutil.which('rclone') or '/usr/bin/rclone'
+SSH_KEYSCAN = shutil.which('ssh-keyscan') or '/usr/bin/ssh-keyscan'
+
+BASE = Path('/home/everlomp/kopia')
+CONFIG = BASE / 'replication.json'
+KOPIA_SECRETS = Path('/home/everlomp/secrets/kopia')
+REPO_CONFIG = KOPIA_SECRETS / 'repository.config'
+SOURCE_PASSWORD = KOPIA_SECRETS / 'repository.password'
+PENDING_SOURCE_PASSWORD = KOPIA_SECRETS / 'repository.password.pending'
+WEB_PASSWORD = KOPIA_SECRETS / 'webui.password'
+TWO_FACTOR_SECRET = Path('/run/secrets/2fa')
+TWO_FACTOR_STATE = KOPIA_SECRETS / '2fa.enabled'
+TWO_FACTOR_COOKIE = 'everlomp_kopia_2fa'
+TWO_FACTOR_SESSION_SECONDS = 12 * 60 * 60
+REPLICA_SECRETS = KOPIA_SECRETS / 'replication'
+LOCK_ROOT = Path('/run/everlomp-kopia-priv')
+ADMIN_HOST = '127.0.0.1'
+ADMIN_PORT = 51517
+VALID_PROVIDERS = {'filesystem', 'sftp', 'webdav', 's3', 'from-config', 'rclone'}
+DENIED_FILESYSTEM_ROOTS = tuple(Path(x) for x in ('/proc', '/sys', '/dev', '/etc', '/run', '/usr', '/var', '/home', '/contract'))
+REPLICA_ID_RE = re.compile(r'^[A-Za-z0-9._-]{1,80}$')
+
+
+def fail(message, code=2):
+    print(message, file=sys.stderr)
+    return code
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(',', ':')) + '\n')
+
+
+def read_stdin(limit=2 * 1024 * 1024):
+    data = sys.stdin.buffer.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError('Request is too large.')
+    return data
+
+
+def read_json_stdin():
+    raw = read_stdin()
+    data = json.loads(raw.decode('utf-8') if raw else '{}')
+    if not isinstance(data, dict):
+        raise ValueError('JSON object required.')
+    return data
+
+
+def kopia_bin():
+    for p in KOPIA_CANDIDATES:
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    raise RuntimeError('Kopia is not installed.')
+
+
+def secret_exists(path):
+    return subprocess.run(
+        [SECRET_HELPER, 'exists', str(path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+
+
+def secret_read(path):
+    cp = subprocess.run(
+        [SECRET_HELPER, 'read', str(path)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+    )
+    if cp.returncode != 0:
+        raise RuntimeError((cp.stderr or b'').decode(errors='replace').strip() or f'Secret unavailable: {path}')
+    return cp.stdout
+
+
+def secret_write(path, data):
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    cp = subprocess.run(
+        [SECRET_HELPER, 'write', str(path)],
+        input=data,
+        capture_output=True,
+        check=False,
+    )
+    if cp.returncode != 0:
+        raise RuntimeError((cp.stderr or b'').decode(errors='replace').strip() or f'Could not store secret: {path}')
+
+
+def secret_remove(path):
+    subprocess.run(
+        [SECRET_HELPER, 'remove', str(path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def replica_secret_path(replica_id):
+    if not REPLICA_ID_RE.fullmatch(replica_id):
+        raise ValueError('Invalid replica ID.')
+    return REPLICA_SECRETS / f'{replica_id}.json'
+
+
+def load_replica_secret(replica_id):
+    path = replica_secret_path(replica_id)
+    if not secret_exists(path):
+        return {}
+    try:
+        data = json.loads(secret_read(path).decode('utf-8'))
+    except Exception as exc:
+        raise RuntimeError('Stored replica credentials are invalid.') from exc
+    return data if isinstance(data, dict) else {}
+
+
+def save_replica_secret(replica_id, data):
+    path = replica_secret_path(replica_id)
+    if data:
+        secret_write(path, json.dumps(data, separators=(',', ':'), sort_keys=True) + '\n')
+    else:
+        secret_remove(path)
+
+
+def required_secret_keys(replica):
+    provider = replica.get('provider')
+    cfg = replica.get('config') or {}
+    if provider == 'sftp':
+        return ['password'] if cfg.get('auth_mode') == 'password' else ['private_key']
+    if provider == 'webdav':
+        return ['password']
+    if provider == 's3':
+        return ['access_key', 'secret_access_key']
+    if provider == 'from-config':
+        return ['token']
+    if provider == 'rclone':
+        return ['rclone_config']
+    return []
+
+
+def validate_secret_set(replica, secret):
+    missing = [k for k in required_secret_keys(replica) if not isinstance(secret.get(k), str) or not secret.get(k)]
+    if missing:
+        raise ValueError('Missing destination credential(s): ' + ', '.join(x.replace('_', ' ') for x in missing) + '.')
+
+
+def secret_meta(replica_id, replica=None, secret=None):
+    secret = load_replica_secret(replica_id) if secret is None else secret
+    configured_keys = ['password', 'private_key', 'known_hosts', 'access_key', 'secret_access_key', 'session_token', 'token', 'rclone_config']
+    meta = {'secret_configured': {k: bool(secret.get(k)) for k in configured_keys}}
+    if replica:
+        provider = replica.get('provider')
+        if provider == 'from-config' and secret.get('token'):
+            meta['destination_secret_sha256'] = hashlib.sha256(secret['token'].encode()).hexdigest()
+        elif provider == 'rclone' and secret.get('rclone_config'):
+            meta['destination_secret_sha256'] = hashlib.sha256(secret['rclone_config'].encode()).hexdigest()
+        else:
+            meta['destination_secret_sha256'] = ''
+    return meta
+
+
+def source_env(password=None):
+    if not REPO_CONFIG.is_file() or REPO_CONFIG.stat().st_size <= 0:
+        raise RuntimeError('No connected repository configuration was found.')
+    env = os.environ.copy()
+    env['KOPIA_CONFIG_PATH'] = str(REPO_CONFIG)
+    if password is None:
+        if not secret_exists(SOURCE_PASSWORD):
+            raise RuntimeError('Saved repository password is missing.')
+        password = secret_read(SOURCE_PASSWORD).decode('utf-8')
+    env['KOPIA_PASSWORD'] = password
+    return env
+
+
+def source_status(password=None):
+    config_present = REPO_CONFIG.is_file() and REPO_CONFIG.stat().st_size > 0
+    password_configured = secret_exists(SOURCE_PASSWORD)
+    if not config_present:
+        return {
+            'connected': False,
+            'config_present': False,
+            'password_configured': password_configured,
+            'detail': 'No connected repository configuration was found.',
+        }
+    if password is None and not password_configured:
+        return {
+            'connected': False,
+            'config_present': True,
+            'password_configured': False,
+            'detail': 'Saved repository password is missing.',
+        }
+    try:
+        cp = subprocess.run(
+            [kopia_bin(), 'repository', 'status'],
+            env=source_env(password), capture_output=True, text=True, timeout=20, check=False,
+        )
+    except Exception as exc:
+        return {
+            'connected': False,
+            'config_present': True,
+            'password_configured': password_configured,
+            'detail': str(exc),
+        }
+    raw = (cp.stderr or cp.stdout or '').strip()
+    lines = [x.strip() for x in raw.splitlines() if x.strip()]
+    return {
+        'connected': cp.returncode == 0,
+        'config_present': True,
+        'password_configured': password_configured,
+        'detail': 'Repository is available to the privileged Kopia worker.' if cp.returncode == 0 else (lines[-1] if lines else 'Repository could not be opened.'),
+    }
+
+
+def supervisor(action):
+    if action not in {'start', 'stop'}:
+        raise ValueError('Only start and stop are permitted for the Kopia supervisor service.')
+    cp = subprocess.run(
+        [SUPERVISORCTL, '-c', SUPERVISOR_CONF, action, 'kopia'],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=45, check=False,
+    )
+    if cp.returncode != 0:
+        detail = (cp.stderr or cp.stdout or '').strip()
+        if action == 'stop' and 'not running' in detail.lower():
+            return
+        raise RuntimeError(detail or f'Could not {action} Kopia.')
+
+
+def wait_kopia_port(timeout=35):
+    import socket
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(('127.0.0.1', 51515), timeout=1):
+                return
+        except OSError:
+            time.sleep(0.5)
+    raise RuntimeError('Kopia did not become ready after restart.')
+
+
+def set_source_password(password):
+    if not password or len(password) > 4096 or any(c in password for c in ('\x00', '\r', '\n')):
+        raise ValueError('Enter a valid repository encryption password.')
+    had_old = secret_exists(SOURCE_PASSWORD)
+    old = secret_read(SOURCE_PASSWORD) if had_old else None
+    st = source_status(password)
+    if not st['connected']:
+        raise ValueError('Kopia could not open the connected repository with that password: ' + st['detail'])
+    secret_write(SOURCE_PASSWORD, password)
+    return source_status()
+
+
+def run_kopia_password_change(new_password):
+    child = pexpect.spawn(
+        kopia_bin(), ['repository', 'change-password'], env=source_env(),
+        encoding='utf-8', codec_errors='replace', timeout=60,
+    )
+    transcript = []
+    child.setecho(False)
+    try:
+        idx = child.expect([r'(?i)enter new password[^:]*:', r'(?i)new password[^:]*:', pexpect.EOF, pexpect.TIMEOUT])
+        transcript.append(child.before or '')
+        if idx >= 2:
+            raise RuntimeError('Kopia did not request a new repository password.')
+        child.sendline(new_password)
+        idx = child.expect([r'(?i)(re-enter|repeat|confirm|verify)[^:]*password[^:]*:', pexpect.EOF, pexpect.TIMEOUT])
+        transcript.append(child.before or '')
+        if idx != 0:
+            raise RuntimeError('Kopia did not request repository password confirmation.')
+        child.sendline(new_password)
+        child.expect(pexpect.EOF)
+        transcript.append(child.before or '')
+    finally:
+        child.close(force=child.isalive())
+    if child.exitstatus != 0:
+        detail = '\n'.join(x.strip() for x in transcript if x.strip()).replace(new_password, '[redacted]')
+        lines = [x.strip() for x in detail.splitlines() if x.strip()]
+        raise RuntimeError(lines[-1] if lines else f'Kopia exited with status {child.exitstatus}.')
+
+
+def change_source_password(new_password):
+    if len(new_password) < 12 or len(new_password) > 4096 or any(c in new_password for c in ('\x00', '\r', '\n')):
+        raise ValueError('Use a repository encryption password with at least 12 characters.')
+    if not secret_exists(SOURCE_PASSWORD):
+        raise ValueError('Everlomp does not have the current repository password.')
+    before = source_status()
+    if not before['connected']:
+        raise ValueError('The primary repository must be connected before its password can be changed: ' + before['detail'])
+    secret_write(PENDING_SOURCE_PASSWORD, new_password)
+    stopped = False
+    changed = False
+    try:
+        supervisor('stop')
+        stopped = True
+        run_kopia_password_change(new_password)
+        changed = True
+        secret_write(SOURCE_PASSWORD, new_password)
+        supervisor('start')
+        stopped = False
+        wait_kopia_port()
+        after = source_status()
+        if not after['connected']:
+            raise RuntimeError('Password changed and saved, but Kopia could not reopen the repository: ' + after['detail'])
+        secret_remove(PENDING_SOURCE_PASSWORD)
+        after['detail'] = 'Repository password changed, saved, and Kopia reopened successfully.'
+        return after
+    except Exception:
+        if not changed:
+            secret_remove(PENDING_SOURCE_PASSWORD)
+        if stopped:
+            with contextlib.suppress(Exception):
+                supervisor('start')
+        raise
+
+
+
+def change_webui_password(new_password):
+    """Change only the Kopia HTTP/WebUI login password.
+
+    The currently authenticated request was authorized using the old WebUI
+    password before this function is entered. The plaintext credential is
+    never returned to the unprivileged replication service.
+    """
+    if len(new_password) < 12 or len(new_password) > 4096 or any(ord(c) < 32 or ord(c) > 126 for c in new_password):
+        raise ValueError('Use a Kopia WebUI password with at least 12 printable ASCII characters.')
+    if not secret_exists(WEB_PASSWORD):
+        raise ValueError('Everlomp does not have the current Kopia WebUI password.')
+
+    old_password = secret_read(WEB_PASSWORD)
+    if hmac.compare_digest(old_password, new_password.encode('utf-8')):
+        raise ValueError('Choose a different Kopia WebUI password.')
+
+    secret_changed = False
+    try:
+        supervisor('stop')
+        secret_write(WEB_PASSWORD, new_password)
+        secret_changed = True
+        supervisor('start')
+        wait_kopia_port()
+        return {
+            'changed': True,
+            'username': 'admin',
+            'detail': 'Kopia WebUI password changed. Sign in again as admin with the new password.',
+        }
+    except Exception:
+        # If anything fails after replacing the credential, restore the old
+        # secret and restart Kopia so a failed password change does not lock
+        # the administrator out of the WebUI.
+        if secret_changed:
+            with contextlib.suppress(Exception):
+                supervisor('stop')
+            with contextlib.suppress(Exception):
+                secret_write(WEB_PASSWORD, old_password)
+        with contextlib.suppress(Exception):
+            supervisor('start')
+            wait_kopia_port()
+        raise
+
+
+def _mount_unescape(value):
+    return (value.replace('\\040', ' ').replace('\\011', '\t')
+                 .replace('\\012', '\n').replace('\\134', '\\'))
+
+
+def filesystem_destination_is_separate_mount(path):
+    """Allow root writes only inside a distinct non-system mount.
+
+    This preserves arbitrary Docker/NAS mount paths without allowing the
+    unprivileged API to turn a replica path into a root write primitive against
+    the container's own filesystem.
+    """
+    resolved = Path(path).resolve(strict=True)
+    for denied in DENIED_FILESYSTEM_ROOTS:
+        if resolved == denied or denied in resolved.parents:
+            return False
+    try:
+        lines = Path('/proc/self/mountinfo').read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return False
+    mounts = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) >= 5:
+            mp = Path(_mount_unescape(fields[4]))
+            if mp != Path('/'):
+                mounts.append(mp)
+    return any(resolved == mp or mp in resolved.parents for mp in mounts)
+
+def validate_saved_replica(replica):
+    if not isinstance(replica, dict):
+        raise ValueError('Invalid replica configuration.')
+    provider = replica.get('provider')
+    if provider not in VALID_PROVIDERS:
+        raise ValueError('Unsupported destination type.')
+    cfg = replica.get('config')
+    if not isinstance(cfg, dict):
+        raise ValueError('Invalid provider configuration.')
+    if provider == 'filesystem':
+        path = str(cfg.get('path') or '')
+        if not path.startswith('/') or len(path) > 2048 or '\x00' in path or '\n' in path or '\r' in path:
+            raise ValueError('Filesystem destination must be an absolute path.')
+        p = Path(path)
+        if not p.is_dir():
+            raise ValueError('Filesystem destination does not exist.')
+        resolved = p.resolve(strict=True)
+        if not filesystem_destination_is_separate_mount(resolved):
+            raise ValueError('Privileged filesystem replication requires a separate Docker/NAS mount outside system paths.')
+    elif provider == 'sftp':
+        host = str(cfg.get('host') or '')
+        username = str(cfg.get('username') or '')
+        path = str(cfg.get('path') or '')
+        port = cfg.get('port')
+        mode = cfg.get('auth_mode') or 'key'
+        if not host or len(host) > 255 or not username or len(username) > 255 or not path or len(path) > 1024:
+            raise ValueError('Invalid SFTP destination configuration.')
+        if not isinstance(port, int) or not 1 <= port <= 65535 or mode not in {'key', 'password'}:
+            raise ValueError('Invalid SFTP destination configuration.')
+    elif provider == 'webdav':
+        url = str(cfg.get('url') or '')
+        username = str(cfg.get('username') or '')
+        if not re.match(r'^https?://', url, re.I) or len(url) > 2048 or not username or len(username) > 512:
+            raise ValueError('Invalid WebDAV destination configuration.')
+    elif provider == 's3':
+        endpoint = str(cfg.get('endpoint') or '')
+        bucket = str(cfg.get('bucket') or '')
+        if not endpoint or len(endpoint) > 255 or '://' in endpoint or '/' in endpoint or re.search(r'\s', endpoint) or not bucket or len(bucket) > 255:
+            raise ValueError('Invalid S3 destination configuration.')
+    elif provider == 'rclone':
+        remote_path = str(cfg.get('remote_path') or '')
+        if not remote_path or len(remote_path) > 2048 or '\x00' in remote_path or '\n' in remote_path or '\r' in remote_path:
+            raise ValueError('Invalid rclone destination configuration.')
+    return replica
+
+
+def load_state():
+    try:
+        st = CONFIG.lstat()
+    except FileNotFoundError:
+        return {'version': 1, 'replicas': []}
+    if not CONFIG.is_file() or os.path.islink(CONFIG):
+        raise RuntimeError('Replication state file is not a regular file.')
+    data = json.loads(CONFIG.read_text(encoding='utf-8'))
+    if not isinstance(data, dict) or not isinstance(data.get('replicas'), list):
+        raise RuntimeError('Replication state file is invalid.')
+    return data
+
+
+def find_replica(replica_id):
+    if not REPLICA_ID_RE.fullmatch(replica_id):
+        raise ValueError('Invalid replica ID.')
+    replica = next((x for x in load_state()['replicas'] if isinstance(x, dict) and x.get('id') == replica_id), None)
+    if not replica:
+        raise KeyError('Replica not found.')
+    return validate_saved_replica(replica)
+
+
+def fetch_known_hosts(host, port):
+    cp = subprocess.run(
+        [SSH_KEYSCAN, '-T', '8', '-p', str(port), host],
+        capture_output=True, text=True, timeout=12, check=False,
+    )
+    lines = [x.strip() for x in (cp.stdout or '').splitlines() if x.strip() and not x.startswith('#')]
+    if cp.returncode != 0 or not lines:
+        raise ValueError('Could not fetch the SSH host key.')
+    return '\n'.join(lines)
+
+
+def ensure_known_hosts(replica, secret):
+    if replica.get('provider') != 'sftp' or secret.get('known_hosts'):
+        return False
+    cfg = replica.get('config') or {}
+    secret['known_hosts'] = fetch_known_hosts(cfg['host'], cfg['port'])
+    return True
+
+
+def temp_file(td, name, text, mode=0o600):
+    p = td / name
+    p.write_text(text + ('' if text.endswith('\n') else '\n'), encoding='utf-8')
+    os.chmod(p, mode)
+    return p
+
+
+def build_sync_command(replica, secret, dry_run=False):
+    validate_saved_replica(replica)
+    validate_secret_set(replica, secret)
+    cmd = [kopia_bin(), 'repository', 'sync-to']
+    env = source_env()
+    tmp = tempfile.TemporaryDirectory(prefix='everlomp-kopia-priv-', dir='/tmp')
+    td = Path(tmp.name)
+    os.chmod(td, 0o700)
+    cfg = replica.get('config') or {}
+    provider = replica['provider']
+
+    if provider == 'filesystem':
+        path = Path(cfg['path']).resolve(strict=True)
+        if not os.access(path, os.W_OK):
+            tmp.cleanup()
+            raise ValueError('Filesystem destination is not writable.')
+        cmd += ['filesystem', f'--path={path}']
+    elif provider == 'sftp':
+        cmd += ['sftp', f"--host={cfg['host']}", f"--port={cfg['port']}", f"--username={cfg['username']}", f"--path={cfg['path']}"]
+        if secret.get('known_hosts'):
+            cmd.append(f'--known-hosts={temp_file(td, "known_hosts", secret["known_hosts"])}')
+        if cfg.get('auth_mode') == 'password':
+            if not Path('/usr/bin/sshpass').is_file():
+                tmp.cleanup()
+                raise RuntimeError('sshpass is required for isolated SFTP password replication.')
+            kh = temp_file(td, 'known_hosts', secret['known_hosts'])
+            wrapper = td / 'ssh-with-password'
+            wrapper.write_text(
+                '#!/bin/sh\n'
+                'exec /usr/bin/sshpass -e /usr/bin/ssh '
+                '-o BatchMode=no -o PreferredAuthentications=password '
+                '-o PubkeyAuthentication=no -o StrictHostKeyChecking=yes '
+                f'-o UserKnownHostsFile={shlex.quote(str(kh))} "$@"\n',
+                encoding='utf-8',
+            )
+            os.chmod(wrapper, 0o700)
+            env['SSHPASS'] = secret['password']
+            cmd += ['--external', f'--ssh-command={wrapper}', f"--ssh-args=-p{cfg['port']}"]
+        else:
+            cmd.append(f'--keyfile={temp_file(td, "id_backup", secret["private_key"])}')
+    elif provider == 'webdav':
+        env['KOPIA_WEBDAV_USERNAME'] = cfg['username']
+        env['KOPIA_WEBDAV_PASSWORD'] = secret['password']
+        cmd += ['webdav', f"--url={cfg['url']}"]
+    elif provider == 's3':
+        env['AWS_ACCESS_KEY_ID'] = secret['access_key']
+        env['AWS_SECRET_ACCESS_KEY'] = secret['secret_access_key']
+        if secret.get('session_token'):
+            env['AWS_SESSION_TOKEN'] = secret['session_token']
+        else:
+            env.pop('AWS_SESSION_TOKEN', None)
+        cmd += ['s3', f"--bucket={cfg['bucket']}", f"--endpoint={cfg['endpoint']}"]
+        if cfg.get('region'):
+            cmd.append(f"--region={cfg['region']}")
+        if cfg.get('prefix'):
+            cmd.append(f"--prefix={cfg['prefix']}")
+        if cfg.get('disable_tls'):
+            cmd.append('--disable-tls')
+    elif provider == 'from-config':
+        # A Kopia token can describe arbitrary storage, including local paths.
+        # Do not allow an unprivileged caller to feed one to a root Kopia process.
+        tmp.cleanup()
+        raise ValueError('from-config replicas are disabled for the isolated privileged worker. Use SFTP, WebDAV, S3, or a mounted filesystem destination.')
+    elif provider == 'rclone':
+        # Rclone configs can reference local backends and commands. Running them
+        # from a root Kopia process would defeat the privilege boundary.
+        tmp.cleanup()
+        raise ValueError('rclone replicas are disabled for the isolated privileged worker. Use SFTP, WebDAV, S3, or a mounted filesystem destination.')
+
+    if replica.get('seeded'):
+        cmd.append('--must-exist')
+    if dry_run:
+        cmd.append('--dry-run')
+    parallel = replica.get('parallel', 1)
+    if not isinstance(parallel, int) or not 1 <= parallel <= 32:
+        parallel = 1
+    cmd += [f'--parallel={parallel}', '--no-progress']
+    return cmd, env, tmp
+
+
+def run_sync_command(replica, secret, dry_run=False, timeout=3600):
+    st = source_status()
+    if not st['connected']:
+        raise ValueError('Source repository is not available to replication: ' + st['detail'])
+    cmd, env, tmp = build_sync_command(replica, secret, dry_run=dry_run)
+    try:
+        cp = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
+    finally:
+        tmp.cleanup()
+    out = '\n'.join(x for x in [(cp.stdout or '').strip(), (cp.stderr or '').strip()] if x).strip()
+    for value in secret.values():
+        if isinstance(value, str) and value:
+            out = out.replace(value, '[redacted]')
+    if cp.returncode != 0:
+        lines = [x.strip() for x in out.splitlines() if x.strip()]
+        detail = lines[-1] if lines else f'Kopia exited with status {cp.returncode}.'
+        if replica.get('provider') == 'sftp' and 'connection closed' in out.lower():
+            detail = 'SFTP connection was closed by the remote server. Ensure this account/server permits the SFTP subsystem.'
+        raise RuntimeError(detail)
+    if dry_run and replica.get('provider') == 'sftp':
+        return 'SFTP connection succeeded.'
+    return out or ('Connection test succeeded.' if dry_run else 'Repository synchronized successfully.')
+
+
+def replica_secret_update(replica_id, payload):
+    replica = {
+        'provider': payload.get('provider'),
+        'config': payload.get('config') or {},
+    }
+    validate_saved_replica({**replica, 'id': replica_id, 'seeded': False, 'parallel': 1})
+    incoming = payload.get('secret') or {}
+    if not isinstance(incoming, dict):
+        raise ValueError('Invalid secret configuration.')
+    old = load_replica_secret(replica_id)
+    merged = dict(old)
+    allowed = {'password', 'private_key', 'known_hosts', 'access_key', 'secret_access_key', 'session_token', 'token', 'rclone_config'}
+    for k, v in incoming.items():
+        if k in allowed and isinstance(v, str) and v:
+            if len(v) > 1024 * 1024:
+                raise ValueError('A destination credential is too large.')
+            merged[k] = v
+    if replica['provider'] == 'sftp':
+        if replica['config'].get('auth_mode') == 'key':
+            merged.pop('password', None)
+        else:
+            merged.pop('private_key', None)
+        ensure_known_hosts(replica, merged)
+    validate_secret_set(replica, merged)
+    save_replica_secret(replica_id, merged)
+    return secret_meta(replica_id, replica, merged)
+
+
+def replica_test(payload):
+    replica = payload.get('replica')
+    if not isinstance(replica, dict):
+        raise ValueError('Invalid replica test request.')
+    replica = validate_saved_replica(replica)
+    existing_id = str(payload.get('existing_id') or '')
+    secret = load_replica_secret(existing_id) if existing_id else {}
+    incoming = payload.get('secret') or {}
+    if not isinstance(incoming, dict):
+        raise ValueError('Invalid secret configuration.')
+    secret.update({k: v for k, v in incoming.items() if isinstance(v, str) and v})
+    if replica['provider'] == 'sftp':
+        if replica['config'].get('auth_mode') == 'key':
+            secret.pop('password', None)
+        else:
+            secret.pop('private_key', None)
+        ensure_known_hosts(replica, secret)
+    validate_secret_set(replica, secret)
+    return run_sync_command(replica, secret, dry_run=True, timeout=45)
+
+
+def replica_sync(replica_id):
+    replica = find_replica(replica_id)
+    secret = load_replica_secret(replica_id)
+    if ensure_known_hosts(replica, secret):
+        save_replica_secret(replica_id, secret)
+    validate_secret_set(replica, secret)
+    LOCK_ROOT.mkdir(parents=True, exist_ok=True)
+    os.chmod(LOCK_ROOT, 0o700)
+    lock_path = LOCK_ROOT / f'replica-{replica_id}.lock'
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('This replica is already synchronizing.')
+        try:
+            return run_sync_command(replica, secret, dry_run=False, timeout=3600)
+        except RuntimeError as first_error:
+            msg = str(first_error).lower()
+            can_seed_remote = replica.get('provider') in {'sftp', 'webdav', 's3'}
+            if replica.get('seeded') and can_seed_remote and 'format blob' in msg:
+                fresh = dict(replica)
+                fresh['seeded'] = False
+                return run_sync_command(fresh, secret, dry_run=False, timeout=3600)
+            raise
+    finally:
+        os.close(fd)
+
+
+def auth_check_value(actual):
+    if not secret_exists(WEB_PASSWORD):
+        return False
+    expected = 'Basic ' + base64.b64encode(b'admin:' + secret_read(WEB_PASSWORD)).decode('ascii')
+    return hmac.compare_digest(actual, expected)
+
+
+def auth_check():
+    actual = read_stdin(16 * 1024).decode('utf-8', errors='replace').strip()
+    return 0 if auth_check_value(actual) else 1
+
+
+def _read_two_factor_secret_text():
+    try:
+        raw = TWO_FACTOR_SECRET.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return ''
+    except OSError as exc:
+        raise RuntimeError('Docker secret 2fa is not readable.') from exc
+    text = re.sub(r'[\s-]+', '', raw).upper().rstrip('=')
+    if not text:
+        return ''
+    if not re.fullmatch(r'[A-Z2-7]{16,128}', text):
+        raise ValueError('Docker secret 2fa must contain a valid Base32 TOTP secret.')
+    return text
+
+
+def _decode_two_factor_secret(text):
+    padding = '=' * ((8 - (len(text) % 8)) % 8)
+    try:
+        key = base64.b32decode(text + padding, casefold=True)
+    except Exception as exc:
+        raise ValueError('Docker secret 2fa contains invalid Base32 data.') from exc
+    if len(key) < 10:
+        raise ValueError('Docker secret 2fa is too short for TOTP.')
+    return key
+
+
+def _two_factor_secret_fingerprint(text):
+    return hashlib.sha256(text.encode('ascii')).hexdigest()
+
+
+def _two_factor_state():
+    stored = ''
+    if TWO_FACTOR_STATE.is_file():
+        try:
+            data = json.loads(TWO_FACTOR_STATE.read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                stored = str(data.get('secret_sha256') or '')
+        except Exception:
+            stored = ''
+
+    try:
+        secret = _read_two_factor_secret_text()
+    except (ValueError, RuntimeError) as exc:
+        # A malformed, empty, unreadable, missing, or placeholder Docker
+        # secret must never turn the reverse-proxy auth subrequest into a 5xx.
+        # It is treated as unactivated so the user can recover from the
+        # Security page by generating/replacing the setup key.
+        return {
+            'secret_present': TWO_FACTOR_SECRET.exists(),
+            'enabled': False,
+            'needs_activation': False,
+            'secret_changed': False,
+            'secret_missing': False,
+            'secret_invalid': True,
+            'secret_error': str(exc),
+        }
+
+    present = bool(secret)
+    fingerprint = _two_factor_secret_fingerprint(secret) if secret else ''
+    enabled = bool(present and stored and hmac.compare_digest(stored, fingerprint))
+
+    return {
+        'secret_present': present,
+        'enabled': enabled,
+        'needs_activation': bool(present and not enabled),
+        'secret_changed': bool(present and stored and not enabled),
+        'secret_missing': bool(stored and not present),
+        'secret_invalid': False,
+        'secret_error': '',
+    }
+
+
+def _write_two_factor_enabled(secret_text):
+    data = {
+        'version': 1,
+        'secret_sha256': _two_factor_secret_fingerprint(secret_text),
+        'enabled_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    TWO_FACTOR_STATE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.2fa-enabled.', dir=str(TWO_FACTOR_STATE.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, separators=(',', ':'), sort_keys=True)
+            f.write('\n')
+        os.replace(tmp, TWO_FACTOR_STATE)
+        os.chmod(TWO_FACTOR_STATE, 0o600)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def _remove_two_factor_enabled():
+    with contextlib.suppress(FileNotFoundError):
+        TWO_FACTOR_STATE.unlink()
+
+
+def _totp_value(key, counter):
+    digest = hmac.new(key, struct.pack('>Q', counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack('>I', digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return f'{value % 1000000:06d}'
+
+
+def _verify_totp(secret_text, code, now=None):
+    code = re.sub(r'\s+', '', str(code or ''))
+    if not re.fullmatch(r'\d{6}', code):
+        return False
+    key = _decode_two_factor_secret(secret_text)
+    now = time.time() if now is None else float(now)
+    counter = int(now // 30)
+    for delta in (-1, 0, 1):
+        if hmac.compare_digest(_totp_value(key, counter + delta), code):
+            return True
+    return False
+
+
+def _session_key(secret_text):
+    key = _decode_two_factor_secret(secret_text)
+    return hmac.new(key, b'everlomp-kopia-2fa-session-v1', hashlib.sha256).digest()
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).decode('ascii').rstrip('=')
+
+
+def _b64url_decode(text):
+    padding = '=' * ((4 - (len(text) % 4)) % 4)
+    return base64.urlsafe_b64decode(text + padding)
+
+
+def _make_two_factor_session(secret_text):
+    payload = {
+        'exp': int(time.time()) + TWO_FACTOR_SESSION_SECONDS,
+        'nonce': secrets.token_urlsafe(12),
+    }
+    body = _b64url(json.dumps(payload, separators=(',', ':'), sort_keys=True).encode('utf-8'))
+    sig = _b64url(hmac.new(_session_key(secret_text), body.encode('ascii'), hashlib.sha256).digest())
+    return body + '.' + sig
+
+
+def _cookie_value(cookie_header, name):
+    for part in (cookie_header or '').split(';'):
+        part = part.strip()
+        if '=' not in part:
+            continue
+        key, value = part.split('=', 1)
+        if key.strip() == name:
+            return value.strip()
+    return ''
+
+
+def _valid_two_factor_session(secret_text, cookie_header):
+    token = _cookie_value(cookie_header, TWO_FACTOR_COOKIE)
+    if not token or '.' not in token:
+        return False
+    body, supplied_sig = token.rsplit('.', 1)
+    expected_sig = _b64url(hmac.new(_session_key(secret_text), body.encode('ascii'), hashlib.sha256).digest())
+    if not hmac.compare_digest(supplied_sig, expected_sig):
+        return False
+    try:
+        payload = json.loads(_b64url_decode(body).decode('utf-8'))
+        exp = int(payload.get('exp') or 0)
+    except Exception:
+        return False
+    return exp >= int(time.time())
+
+
+def _two_factor_cookie_header(secret_text):
+    token = _make_two_factor_session(secret_text)
+    return (
+        f'{TWO_FACTOR_COOKIE}={token}; Path=/kopia/; Max-Age={TWO_FACTOR_SESSION_SECONDS}; '
+        'Secure; HttpOnly; SameSite=Strict'
+    )
+
+
+def _clear_two_factor_cookie_header():
+    return f'{TWO_FACTOR_COOKIE}=; Path=/kopia/; Max-Age=0; Secure; HttpOnly; SameSite=Strict'
+
+
+def _generate_two_factor_enrollment():
+    secret_text = base64.b32encode(secrets.token_bytes(20)).decode('ascii').rstrip('=')
+    label = quote('Everlomp', safe='') + ':' + quote('Kopia', safe='')
+    uri = (
+        'otpauth://totp/' + label +
+        '?secret=' + quote(secret_text, safe='') +
+        '&issuer=' + quote('Everlomp', safe='') +
+        '&algorithm=SHA1&digits=6&period=30'
+    )
+    try:
+        cp = subprocess.run(
+            ['qrencode', '-t', 'PNG', '-m', '2', '-s', '6', '-o', '-', uri],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError('qrencode is not installed in this image.') from exc
+    if cp.returncode != 0 or not cp.stdout:
+        raise RuntimeError((cp.stderr or b'').decode(errors='replace').strip() or 'Could not generate the TOTP QR code.')
+    return {
+        'secret': secret_text,
+        'otpauth_uri': uri,
+        'qr_png': base64.b64encode(cp.stdout).decode('ascii'),
+        'docker_secret_name': '2fa',
+        'issuer': 'Everlomp',
+        'account': 'Kopia',
+        'algorithm': 'SHA1',
+        'digits': 6,
+        'period': 30,
+    }
+
+
+class AdminHandler(BaseHTTPRequestHandler):
+    server_version = 'EverlompKopiaAdmin/2'
+    _totp_failures = {}
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write('[kopia-admin-api] ' + (fmt % args) + '\n')
+
+    def send_json(self, code, obj, headers=None):
+        body = json.dumps(obj, separators=(',', ':')).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Cache-Control', 'no-store')
+        if headers:
+            for key, value in headers.items():
+                self.send_header(key, value)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_empty(self, code, headers=None):
+        self.send_response(code)
+        self.send_header('Cache-Control', 'no-store')
+        if headers:
+            for key, value in headers.items():
+                self.send_header(key, value)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    def redirect(self, location, headers=None):
+        self.send_response(303)
+        self.send_header('Location', location)
+        self.send_header('Cache-Control', 'no-store')
+        if headers:
+            for key, value in headers.items():
+                self.send_header(key, value)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    def authorize_basic(self):
+        if not auth_check_value(self.headers.get('Authorization', '')):
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', 'Basic realm="Kopia"')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return False
+        return True
+
+    def authorize_json(self, require_two_factor_session=False):
+        if not self.authorize_basic():
+            return False
+        if self.headers.get('Content-Type', '').split(';')[0].strip().lower() != 'application/json':
+            self.send_json(415, {'error': 'JSON request required.'})
+            return False
+        if not self.headers.get('X-Kopia-Csrf-Token'):
+            self.send_json(403, {'error': 'Missing Kopia CSRF header.'})
+            return False
+        if require_two_factor_session:
+            state = _two_factor_state()
+            if state['enabled']:
+                try:
+                    secret = _read_two_factor_secret_text()
+                except (ValueError, RuntimeError) as exc:
+                    self.send_json(400, {'error': str(exc)})
+                    return False
+                if not _valid_two_factor_session(secret, self.headers.get('Cookie', '')):
+                    self.send_json(403, {'error': 'A valid 2FA session is required for this operation.'})
+                    return False
+        return True
+
+    def read_json(self):
+        n = int(self.headers.get('Content-Length', '0') or '0')
+        if n < 0 or n > 1024 * 1024:
+            raise ValueError('Request too large.')
+        raw = self.rfile.read(n) if n else b'{}'
+        data = json.loads(raw.decode('utf-8'))
+        if not isinstance(data, dict):
+            raise ValueError('JSON object required.')
+        return data
+
+    def client_key(self):
+        forwarded = (self.headers.get('X-Real-IP') or '').strip()
+        return forwarded or (self.client_address[0] if self.client_address else 'unknown')
+
+    def totp_rate_limited(self):
+        now = time.time()
+        key = self.client_key()
+        entries = [t for t in self._totp_failures.get(key, []) if now - t < 300]
+        self._totp_failures[key] = entries
+        return len(entries) >= 10
+
+    def record_totp_failure(self):
+        now = time.time()
+        key = self.client_key()
+        entries = [t for t in self._totp_failures.get(key, []) if now - t < 300]
+        entries.append(now)
+        self._totp_failures[key] = entries[-20:]
+
+    def clear_totp_failures(self):
+        self._totp_failures.pop(self.client_key(), None)
+
+    def challenge_html(self, error=''):
+        error_block = ''
+        if error:
+            error_block = '<div class="error">' + html.escape(error) + '</div>'
+        return f'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Kopia 2FA</title>
+<style>
+:root {{ color-scheme: light dark; }}
+body {{ margin:0; min-height:100vh; display:grid; place-items:center; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#111827; color:#e5e7eb; }}
+.card {{ width:min(420px,calc(100vw - 32px)); box-sizing:border-box; padding:28px; border-radius:14px; background:#1f2937; box-shadow:0 18px 50px rgba(0,0,0,.35); }}
+h1 {{ margin:0 0 8px; font-size:1.45rem; }}
+p {{ color:#cbd5e1; line-height:1.45; }}
+label {{ display:block; margin:18px 0 8px; font-weight:600; }}
+input {{ width:100%; box-sizing:border-box; font:inherit; font-size:1.4rem; letter-spacing:.25em; text-align:center; padding:12px; border-radius:9px; border:1px solid #64748b; background:#0f172a; color:#fff; }}
+button {{ width:100%; margin-top:14px; padding:12px; border:0; border-radius:9px; font:inherit; font-weight:700; cursor:pointer; background:#2563eb; color:white; }}
+.error {{ margin-top:14px; padding:10px 12px; border-radius:8px; background:#7f1d1d; color:#fee2e2; }}
+.small {{ font-size:.88rem; color:#94a3b8; }}
+</style>
+</head>
+<body>
+<main class="card">
+<h1>Kopia two-factor authentication</h1>
+<p>Your Kopia password was accepted. Enter the current 6-digit code from your authenticator app.</p>
+{error_block}
+<form method="post" action="/kopia/everlomp-2fa/challenge" autocomplete="off">
+<label for="code">Authenticator code</label>
+<input id="code" name="code" inputmode="numeric" pattern="[0-9]{{6}}" minlength="6" maxlength="6" autocomplete="one-time-code" autofocus required>
+<button type="submit">Verify</button>
+</form>
+<p class="small">Google Authenticator, WinAuth, Aegis and other standard TOTP apps are supported.</p>
+</main>
+</body>
+</html>'''.encode('utf-8')
+
+    def send_challenge(self, error=''):
+        body = self.challenge_html(error)
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path.rstrip('/') or '/'
+        try:
+            if path == '/two-factor/auth':
+                # This root-controlled helper is the single first-factor gate for
+                # every proxied /kopia/ request, whether 2FA is enabled or not.
+                # That gives nginx an unambiguous password-auth result that is
+                # completely separate from TOTP redirects, SPA responses and
+                # Kopia backend status codes.
+                if not auth_check_value(self.headers.get('Authorization', '')):
+                    self.send_empty(401, {'WWW-Authenticate': 'Basic realm="Kopia"'})
+                    return
+                state = _two_factor_state()
+                if not state['enabled']:
+                    self.send_empty(204)
+                    return
+                secret = _read_two_factor_secret_text()
+                if secret and _valid_two_factor_session(secret, self.headers.get('Cookie', '')):
+                    self.send_empty(204)
+                else:
+                    # Factor one already succeeded. Keep 401 exclusively for
+                    # bad/missing Kopia Basic credentials so the brute-force
+                    # guard does not count a normal TOTP challenge as a bad
+                    # password attempt.
+                    self.send_empty(403)
+                return
+
+            if path == '/two-factor/challenge':
+                if not self.authorize_basic():
+                    return
+                state = _two_factor_state()
+                if not state['enabled']:
+                    self.redirect('/kopia/')
+                    return
+                secret = _read_two_factor_secret_text()
+                if secret and _valid_two_factor_session(secret, self.headers.get('Cookie', '')):
+                    self.redirect('/kopia/')
+                    return
+                self.send_challenge()
+                return
+
+            if path == '/two-factor/status':
+                if not self.authorize_basic():
+                    return
+                self.send_json(200, {'two_factor': _two_factor_state()})
+                return
+
+            self.send_json(404, {'error': 'Not found.'})
+        except (ValueError, KeyError) as exc:
+            self.send_json(400, {'error': str(exc).strip("'")})
+        except Exception as exc:
+            self.send_json(500, {'error': str(exc)})
+
+    def do_POST(self):
+        path = urlparse(self.path).path.rstrip('/') or '/'
+
+        if path == '/two-factor/challenge':
+            if not self.authorize_basic():
+                return
+            try:
+                state = _two_factor_state()
+                if not state['enabled']:
+                    self.redirect('/kopia/')
+                    return
+                if self.totp_rate_limited():
+                    self.send_challenge('Too many incorrect codes. Try again in a few minutes.')
+                    return
+                n = int(self.headers.get('Content-Length', '0') or '0')
+                if n < 0 or n > 4096:
+                    raise ValueError('Request too large.')
+                raw = self.rfile.read(n).decode('utf-8', errors='replace') if n else ''
+                from urllib.parse import parse_qs
+                code = (parse_qs(raw).get('code') or [''])[0]
+                secret = _read_two_factor_secret_text()
+                if not secret or not _verify_totp(secret, code):
+                    self.record_totp_failure()
+                    self.send_challenge('That code was not accepted.')
+                    return
+                self.clear_totp_failures()
+                self.redirect('/kopia/', {'Set-Cookie': _two_factor_cookie_header(secret)})
+            except (ValueError, RuntimeError) as exc:
+                self.send_challenge(str(exc))
+            return
+
+        require_session = path in {'/two-factor/disable', '/two-factor/generate'}
+        if not self.authorize_json(require_two_factor_session=require_session):
+            return
+
+        try:
+            data = self.read_json()
+            if path == '/source-password':
+                self.send_json(200, {'source': set_source_password(str(data.get('password') or ''))})
+                return
+            if path == '/source-password/change':
+                self.send_json(200, {'source': change_source_password(str(data.get('new_password') or ''))})
+                return
+            if path == '/webui-password/change':
+                self.send_json(200, {'webui': change_webui_password(str(data.get('new_password') or ''))})
+                return
+            if path == '/two-factor/generate':
+                self.send_json(200, {'two_factor': _generate_two_factor_enrollment()})
+                return
+            if path == '/two-factor/activate':
+                if self.totp_rate_limited():
+                    self.send_json(429, {'error': 'Too many incorrect codes. Try again in a few minutes.'})
+                    return
+                secret = _read_two_factor_secret_text()
+                if not secret:
+                    raise ValueError('Docker secret 2fa is not present. Add it to the container and redeploy first.')
+                if not _verify_totp(secret, str(data.get('code') or '')):
+                    self.record_totp_failure()
+                    self.send_json(400, {'error': 'The authenticator code was not accepted.'})
+                    return
+                self.clear_totp_failures()
+                _write_two_factor_enabled(secret)
+                self.send_json(
+                    200,
+                    {'two_factor': _two_factor_state(), 'detail': 'Two-factor authentication is enabled for Kopia.'},
+                    {'Set-Cookie': _two_factor_cookie_header(secret)},
+                )
+                return
+            if path == '/two-factor/disable':
+                _remove_two_factor_enabled()
+                self.send_json(
+                    200,
+                    {'two_factor': _two_factor_state(), 'detail': 'Two-factor authentication is disabled. Docker secret 2fa was not deleted.'},
+                    {'Set-Cookie': _clear_two_factor_cookie_header()},
+                )
+                return
+            self.send_json(404, {'error': 'Not found.'})
+        except (ValueError, KeyError) as exc:
+            self.send_json(400, {'error': str(exc).strip("'")})
+        except subprocess.TimeoutExpired:
+            self.send_json(504, {'error': 'Kopia operation timed out.'})
+        except Exception as exc:
+            self.send_json(500, {'error': str(exc)})
+
+def serve_admin():
+    httpd = ThreadingHTTPServer((ADMIN_HOST, ADMIN_PORT), AdminHandler)
+    httpd.daemon_threads = True
+    print(f'[kopia-admin-api] listening on {ADMIN_HOST}:{ADMIN_PORT}', file=sys.stderr)
+    httpd.serve_forever()
+
+
+def main():
+    if os.geteuid() != 0:
+        return fail('everlomp-kopia-priv must run as root via sudo.')
+    if len(sys.argv) < 2:
+        return fail('Missing privileged Kopia operation.')
+    command = sys.argv[1]
+    if command == 'serve-admin' and len(sys.argv) == 2:
+        serve_admin()
+        return 0
+    try:
+        if command == 'auth-check' and len(sys.argv) == 2:
+            return auth_check()
+        if command == 'source-status' and len(sys.argv) == 2:
+            emit(source_status()); return 0
+        if command == 'replica-secret-meta' and len(sys.argv) == 3:
+            rid = sys.argv[2]
+            replica = None
+            with contextlib.suppress(Exception):
+                replica = find_replica(rid)
+            emit(secret_meta(rid, replica)); return 0
+        if command == 'replica-secret-update' and len(sys.argv) == 3:
+            emit(replica_secret_update(sys.argv[2], read_json_stdin())); return 0
+        if command == 'replica-secret-delete' and len(sys.argv) == 3:
+            secret_remove(replica_secret_path(sys.argv[2])); emit({'ok': True}); return 0
+        if command == 'replica-test' and len(sys.argv) == 2:
+            emit({'ok': True, 'detail': replica_test(read_json_stdin())}); return 0
+        if command == 'replica-sync' and len(sys.argv) == 3:
+            emit({'ok': True, 'detail': replica_sync(sys.argv[2])}); return 0
+        return fail('Unknown or invalid privileged Kopia operation.')
+    except KeyError as exc:
+        return fail(str(exc).strip("'"), 4)
+    except (ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return fail(str(exc), 3)
+    except Exception as exc:
+        return fail('Privileged Kopia operation failed: ' + str(exc), 3)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

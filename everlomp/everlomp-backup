@@ -1,0 +1,2183 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${1:-}"
+
+BASE="/home/everlomp/kopia"
+SECRETS_ROOT="/home/everlomp/secrets"
+KOPIA_SECRETS="$SECRETS_ROOT/kopia"
+INFO="/home/everlomp/kopia.json"
+BACKUP_CONFIG="/home/everlomp/backup.json"
+EVERBACKUPS_DIR="/home/everlomp/everbackups"
+SQL_BACKUP_DIR="$EVERBACKUPS_DIR/sql"
+DEFAULT_WWW_SOURCE="/var/www"
+OFFSITE_STORE="$KOPIA_SECRETS/offsite.json"
+REPO_PASSWORD_STORE="$KOPIA_SECRETS/repository.password"
+WEB_PASSWORD_STORE="$KOPIA_SECRETS/webui.password"
+REPO_CONFIG="$KOPIA_SECRETS/repository.config"
+OFFSITE_CONFIG="/run/everlomp-kopia-offsite.$$"
+LEGACY_OFFSITE_S3_CONFIG="$BASE/offsite-s3.json"
+OFFSITE_SYNC_LOCK="/run/everlomp-kopia-offsite-sync.lock"
+
+SUPERVISOR_CONF="/etc/everlomp/supervisord.conf"
+SUPERVISORCTL="/usr/bin/supervisorctl"
+KOPIA="/usr/local/bin/kopia"
+CUSTOM_KOPIA_HELPER="/usr/local/sbin/everlomp-kopia-custom"
+REPLICATION_HELPER="/usr/local/sbin/everlomp-kopia-replication"
+LOCAL_KOPIA_DIR="/usr/local/share/everlomp/kopia-local"
+SECRET_HELPER="/usr/local/sbin/everlomp-secret"
+
+OLS_VHCONF="/usr/local/lsws/conf/vhosts/GPTCP1/vhconf.conf"
+OLS_BIN="/usr/local/lsws/bin/openlitespeed"
+OLS_CTRL="/usr/local/lsws/bin/lswsctrl"
+
+mkdir -p /home/everlomp /var/log/supervisor /var/log/everlomp
+install -d -o root -g root -m 0700 "$SECRETS_ROOT" "$KOPIA_SECRETS"
+install -d -o root -g nogroup -m 0750 /run/everlomp
+trap 'rm -f "$OFFSITE_CONFIG"' EXIT
+
+if "$SECRET_HELPER" exists "$OFFSITE_STORE"; then
+    "$SECRET_HELPER" materialize "$OFFSITE_STORE" "$OFFSITE_CONFIG"
+fi
+
+ensure_kopia_build_environment() {
+    local packages=()
+    local cmd
+
+    command -v git >/dev/null 2>&1 || packages+=(git)
+    command -v go >/dev/null 2>&1 || packages+=(golang-go)
+
+    if ((${#packages[@]})); then
+        echo "Installing Kopia build dependencies: ${packages[*]}" >&2
+
+        local apt_ubuntu_opts=(
+            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
+            -o Dir::Etc::sourceparts=-
+        )
+
+        DEBIAN_FRONTEND=noninteractive \
+        apt-get "${apt_ubuntu_opts[@]}" update 1>&2
+
+        DEBIAN_FRONTEND=noninteractive \
+        apt-get "${apt_ubuntu_opts[@]}" install -y \
+            --no-install-recommends \
+            "${packages[@]}" 1>&2
+
+        rm -rf /var/lib/apt/lists/*
+    fi
+
+    for cmd in tar make node npm git go; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            echo "Required Kopia build command is unavailable: $cmd" >&2
+            return 1
+        }
+    done
+}
+
+local_kopia_sources_available() {
+    [ -s "$LOCAL_KOPIA_DIR/kopia_source.tar.gz" ] \
+        && [ -s "$LOCAL_KOPIA_DIR/htmlui_source.tar.gz" ]
+}
+
+install_local_kopia_source() {
+    local kopia_archive="$LOCAL_KOPIA_DIR/kopia_source.tar.gz"
+    local htmlui_archive="$LOCAL_KOPIA_DIR/htmlui_source.tar.gz"
+    local version
+    local build_dir
+
+    [ -x "$CUSTOM_KOPIA_HELPER" ] || {
+        echo "Everlomp custom Kopia builder is missing: $CUSTOM_KOPIA_HELPER" >&2
+        return 1
+    }
+
+    if ! local_kopia_sources_available; then
+        echo "Local Kopia install requires BOTH everlomp/local-kopia/kopia_source.tar.gz and everlomp/local-kopia/htmlui_source.tar.gz in the image." >&2
+        return 1
+    fi
+
+    ensure_kopia_build_environment
+
+    version="$("$CUSTOM_KOPIA_HELPER" local-version "$kopia_archive" 2>/dev/null || true)"
+    [ -n "$version" ] || {
+        echo "Bundled Kopia source archive is invalid or its version could not be detected: $kopia_archive" >&2
+        return 1
+    }
+
+    echo "Building bundled Kopia source v${version} with bundled HTMLUI and Everlomp's /kopia/ UI patch." >&2
+
+    build_dir="$(mktemp -d /tmp/everlomp-kopia-local.XXXXXX)"
+    if ! "$CUSTOM_KOPIA_HELPER" build-local \
+        "$kopia_archive" \
+        "$htmlui_archive" \
+        "$build_dir/kopia" \
+        1>&2; then
+        rm -rf "$build_dir"
+        return 1
+    fi
+
+    if ! "$CUSTOM_KOPIA_HELPER" install \
+        "$build_dir/kopia" \
+        "$version" \
+        1>&2; then
+        rm -rf "$build_dir"
+        return 1
+    fi
+
+    rm -rf "$build_dir"
+
+    "$CUSTOM_KOPIA_HELPER" verify \
+        "$KOPIA" \
+        "$version" \
+        >/dev/null
+}
+
+
+ensure_custom_kopia_binary() {
+    local mode="${1:-online}"
+    local target_version
+
+    if [ "$mode" = "local" ]; then
+        install_local_kopia_source
+        return
+    fi
+
+    [ "$mode" = "online" ] || {
+        echo "Unknown Kopia installation source: $mode" >&2
+        return 1
+    }
+
+    [ -x "$CUSTOM_KOPIA_HELPER" ] || {
+        echo "Everlomp custom Kopia builder is missing: $CUSTOM_KOPIA_HELPER" >&2
+        return 1
+    }
+
+    ensure_kopia_build_environment
+
+    target_version="$(
+        "$CUSTOM_KOPIA_HELPER" latest-version 2>/dev/null || true
+    )"
+
+    [ -n "$target_version" ] || {
+        echo "Could not resolve the latest stable Kopia release." >&2
+        return 1
+    }
+
+    if "$CUSTOM_KOPIA_HELPER" verify \
+        "$KOPIA" \
+        "$target_version" \
+        >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "Building Everlomp's /kopia/-aware Kopia ${target_version}." >&2
+
+    local build_dir
+    build_dir="$(mktemp -d /tmp/everlomp-kopia-setup.XXXXXX)"
+    if ! "$CUSTOM_KOPIA_HELPER" build \
+        "$target_version" \
+        "$build_dir/kopia" \
+        1>&2; then
+        rm -rf "$build_dir"
+        return 1
+    fi
+
+    if ! "$CUSTOM_KOPIA_HELPER" install \
+        "$build_dir/kopia" \
+        "$target_version" \
+        1>&2; then
+        rm -rf "$build_dir"
+        return 1
+    fi
+    rm -rf "$build_dir"
+
+    "$CUSTOM_KOPIA_HELPER" verify \
+        "$KOPIA" \
+        "$target_version" \
+        >/dev/null
+}
+
+
+set_web_state_permissions() {
+    local file="$1"
+
+    [ -e "$file" ] || return 0
+
+    chown root:root "$file"
+    chmod 0644 "$file"
+}
+
+repair_web_state_permissions() {
+    set_web_state_permissions "$INFO"
+    set_web_state_permissions "$BACKUP_CONFIG"
+}
+
+
+json_write_backup_settings() {
+    local kind="$1"
+    local payload="$2"
+
+    python3 - "$BACKUP_CONFIG" "$kind" "$payload" <<'PY'
+from pathlib import Path
+import json
+import os
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+kind = sys.argv[2]
+payload = json.loads(sys.argv[3])
+
+try:
+    data = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+if kind == "sql":
+    for key in (
+        "sql_enabled",
+        "sql_schedule",
+        "sql_time",
+        "sql_weekday",
+        "sql_keep",
+    ):
+        data[key] = payload[key]
+
+elif kind == "update":
+    for key in (
+        "kopia_auto_update",
+        "kopia_update_schedule",
+        "kopia_update_time",
+        "kopia_update_weekday",
+    ):
+        data[key] = payload[key]
+
+elif kind == "offsite":
+    old_type = data.get("offsite_type", "")
+    new_type = payload.get("offsite_type", "")
+    identity_keys = (
+        "offsite_host", "offsite_port", "offsite_username", "offsite_path",
+        "offsite_url", "offsite_endpoint", "offsite_bucket",
+        "offsite_region", "offsite_prefix", "offsite_rclone_remote_path",
+    )
+    target_changed = old_type != new_type or any(
+        key in payload and data.get(key) != payload.get(key)
+        for key in identity_keys
+    )
+
+    # Provider-specific values are public connection metadata only. Secrets
+    # live under /home/everlomp/secrets/kopia/ and are protected by everlomp-secret. Remove stale
+    # fields when changing providers so the UI cannot accidentally display
+    # details from the previous target.
+    for key in list(data):
+        if key.startswith("offsite_") and key not in (
+            "offsite_last_run",
+            "offsite_last_status",
+            "offsite_last_detail",
+        ):
+            data.pop(key, None)
+
+    for key, value in payload.items():
+        if key.startswith("offsite_"):
+            data[key] = value
+
+    if target_changed:
+        data.pop("offsite_last_run", None)
+        data.pop("offsite_last_status", None)
+        data.pop("offsite_last_detail", None)
+
+else:
+    raise SystemExit("unknown settings kind")
+
+fd, tmp = tempfile.mkstemp(prefix=".backup.", dir=str(path.parent))
+os.close(fd)
+
+Path(tmp).write_text(
+    json.dumps(data, indent=2, sort_keys=True) + "\n"
+)
+
+os.replace(tmp, path)
+PY
+
+    set_web_state_permissions "$BACKUP_CONFIG"
+}
+
+
+write_offsite_secret_config() {
+    local provider="$1"
+    local payload="$2"
+
+    install -d -o everlomp -g everlomp -m 0700 "$BASE"
+
+    if [ ! -s "$OFFSITE_CONFIG" ] && [ "$provider" = "s3" ] \
+        && [ -s "$LEGACY_OFFSITE_S3_CONFIG" ]; then
+        python3 - "$LEGACY_OFFSITE_S3_CONFIG" "$OFFSITE_CONFIG" <<'PYMIGRATE'
+from pathlib import Path
+import json, os, sys
+src, dst = map(Path, sys.argv[1:3])
+try:
+    old = json.loads(src.read_text())
+except Exception:
+    old = {}
+old["type"] = "s3"
+dst.write_text(json.dumps(old, indent=2, sort_keys=True) + "\n")
+os.chmod(dst, 0o600)
+PYMIGRATE
+    fi
+
+    python3 - "$OFFSITE_CONFIG" "$provider" "$payload" <<'PYOFFSITE'
+from pathlib import Path
+import json
+import os
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+provider = sys.argv[2]
+payload = json.loads(sys.argv[3])
+
+try:
+    existing = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(existing, dict) or existing.get("type") != provider:
+        existing = {}
+except Exception:
+    existing = {}
+
+secret = {"type": provider}
+for key, value in existing.items():
+    if key != "type":
+        secret[key] = value
+
+# Blank secret fields mean "keep the existing value". This makes it possible
+# to change schedules or public connection details without retyping secrets.
+for key, value in payload.items():
+    if key.startswith("_"):
+        continue
+    if value is None:
+        continue
+    if isinstance(value, str) and value == "":
+        continue
+    secret[key] = value
+
+# A newly supplied S3 key pair intentionally replaces an old session token
+# with the submitted value (including blank), so temporary credentials can be
+# converted back to long-lived credentials cleanly.
+if provider == "s3" and payload.get("_replace_s3_credentials"):
+    secret["session_token"] = payload.get("session_token", "")
+
+fd, tmp = tempfile.mkstemp(prefix=".offsite.", dir=str(path.parent))
+os.close(fd)
+Path(tmp).write_text(json.dumps(secret, indent=2, sort_keys=True) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PYOFFSITE
+
+    chown root:root "$OFFSITE_CONFIG"
+    chmod 0600 "$OFFSITE_CONFIG"
+    "$SECRET_HELPER" write "$OFFSITE_STORE" < "$OFFSITE_CONFIG"
+    rm -f "$LEGACY_OFFSITE_S3_CONFIG" 2>/dev/null || true
+}
+
+
+record_offsite_sync_result() {
+    local status="$1"
+    local detail="${2:-}"
+
+    python3 - "$BACKUP_CONFIG" "$status" "$detail" <<'PYRESULT'
+from pathlib import Path
+from datetime import datetime, timezone
+import json
+import os
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+status = sys.argv[2]
+detail = sys.argv[3]
+
+try:
+    data = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+data["offsite_last_run"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+data["offsite_last_status"] = status
+data["offsite_last_detail"] = detail[:240]
+
+fd, tmp = tempfile.mkstemp(prefix=".backup.", dir=str(path.parent))
+os.close(fd)
+Path(tmp).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+os.replace(tmp, path)
+PYRESULT
+
+    set_web_state_permissions "$BACKUP_CONFIG"
+}
+
+
+existing_offsite_secret() {
+    local provider="$1" key="$2"
+    [ -s "$OFFSITE_CONFIG" ] || return 0
+    [ "$(jq -r '.type // ""' "$OFFSITE_CONFIG" 2>/dev/null)" = "$provider" ] || return 0
+    jq -r --arg key "$key" '.[$key] // ""' "$OFFSITE_CONFIG" 2>/dev/null || true
+}
+
+
+validate_offsite_common() {
+    local enabled="$1" provider="$2" schedule="$3" time="$4" weekday="$5"
+
+    [[ "$enabled" == "true" || "$enabled" == "false" ]] || {
+        echo "Invalid off-site enabled value." >&2
+        return 1
+    }
+
+    case "$provider" in
+        sftp|webdav|filesystem|s3|from-config|rclone) ;;
+        *) echo "Unsupported off-site destination type." >&2; return 1 ;;
+    esac
+
+    [[ "$schedule" =~ ^(hourly|every6h|every12h|daily|weekly)$ ]] || {
+        echo "Invalid off-site sync schedule." >&2
+        return 1
+    }
+    if [[ "$schedule" == "daily" || "$schedule" == "weekly" ]]; then
+        [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || {
+            echo "Invalid off-site sync time." >&2
+            return 1
+        }
+    fi
+    if [ "$schedule" = "weekly" ]; then
+        [[ "$weekday" =~ ^[0-6]$ ]] || {
+            echo "Invalid off-site sync weekday." >&2
+            return 1
+        }
+    fi
+}
+
+
+save_offsite_configuration() {
+    local payload="$1"
+    local enabled provider schedule time weekday
+
+    enabled="$(jq -r '.enabled // false' <<<"$payload")"
+    provider="$(jq -r '.type // "sftp"' <<<"$payload")"
+    schedule="$(jq -r '.schedule // "every6h"' <<<"$payload")"
+    time="$(jq -r '.time // "03:30"' <<<"$payload")"
+    weekday="$(jq -r '.weekday // 0' <<<"$payload")"
+
+    validate_offsite_common "$enabled" "$provider" "$schedule" "$time" "$weekday"
+
+    local secret_payload='{}'
+    local public_payload
+
+    case "$provider" in
+        sftp)
+            local host port username remote_path auth_mode password private_key known_hosts
+            host="$(jq -r '.sftp.host // ""' <<<"$payload")"
+            port="$(jq -r '.sftp.port // 22' <<<"$payload")"
+            username="$(jq -r '.sftp.username // ""' <<<"$payload")"
+            remote_path="$(jq -r '.sftp.path // ""' <<<"$payload")"
+            auth_mode="$(jq -r '.sftp.auth_mode // "key"' <<<"$payload")"
+            password="$(jq -r '.sftp.password // ""' <<<"$payload")"
+            private_key="$(jq -r '.sftp.private_key // ""' <<<"$payload")"
+            known_hosts="$(jq -r '.sftp.known_hosts // ""' <<<"$payload")"
+
+            if [ "$enabled" = "true" ]; then
+                [ -n "$host" ] && [ "${#host}" -le 255 ] && [[ "$host" != *$'\n'* ]] || { echo "Enter a valid SFTP/SSH host." >&2; return 1; }
+                [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo "SFTP port must be between 1 and 65535." >&2; return 1; }
+                [ -n "$username" ] && [ "${#username}" -le 255 ] || { echo "Enter the SFTP/SSH username." >&2; return 1; }
+                [ -n "$remote_path" ] && [ "${#remote_path}" -le 1024 ] || { echo "Enter the remote SFTP repository path." >&2; return 1; }
+                [[ "$auth_mode" == "password" || "$auth_mode" == "key" ]] || { echo "SFTP authentication must use a password or private key." >&2; return 1; }
+            fi
+
+            local effective_password effective_private_key
+            effective_password="$password"
+            effective_private_key="$private_key"
+            [ -n "$effective_password" ] || effective_password="$(existing_offsite_secret sftp password)"
+            [ -n "$effective_private_key" ] || effective_private_key="$(existing_offsite_secret sftp private_key)"
+            if [ "$enabled" = "true" ]; then
+                if [ "$auth_mode" = "password" ]; then
+                    [ -n "$effective_password" ] || { echo "SFTP password is required for password authentication." >&2; return 1; }
+                else
+                    [ -n "$effective_private_key" ] || { echo "Paste an SSH private key for key authentication." >&2; return 1; }
+                fi
+            fi
+            secret_payload="$(jq -n --arg password "$password" --arg private_key "$private_key" --arg known_hosts "$known_hosts" '{password:$password,private_key:$private_key,known_hosts:$known_hosts}')"
+            write_offsite_secret_config sftp "$secret_payload"
+
+            public_payload="$(jq -n --argjson enabled "$enabled" --arg type "$provider" --arg host "$host" --argjson port "$port" --arg username "$username" --arg path "$remote_path" --arg auth "$auth_mode" --arg schedule "$schedule" --arg time "$time" --argjson weekday "$weekday" '{offsite_enabled:$enabled,offsite_type:$type,offsite_host:$host,offsite_port:$port,offsite_username:$username,offsite_path:$path,offsite_auth_mode:$auth,offsite_schedule:$schedule,offsite_time:$time,offsite_weekday:$weekday}')"
+            ;;
+
+        webdav)
+            local url username password
+            url="$(jq -r '.webdav.url // ""' <<<"$payload")"
+            username="$(jq -r '.webdav.username // ""' <<<"$payload")"
+            password="$(jq -r '.webdav.password // ""' <<<"$payload")"
+            if [ "$enabled" = "true" ]; then
+                [[ "$url" =~ ^https?:// ]] && [ "${#url}" -le 2048 ] || { echo "WebDAV URL must begin with http:// or https://." >&2; return 1; }
+                [ -n "$username" ] && [ "${#username}" -le 512 ] || { echo "Enter the WebDAV username." >&2; return 1; }
+            fi
+            local effective_password
+            effective_password="$password"
+            [ -n "$effective_password" ] || effective_password="$(existing_offsite_secret webdav password)"
+            if [ "$enabled" = "true" ]; then
+                [ -n "$effective_password" ] || { echo "WebDAV password is required." >&2; return 1; }
+            fi
+            secret_payload="$(jq -n --arg password "$password" '{password:$password}')"
+            write_offsite_secret_config webdav "$secret_payload"
+            public_payload="$(jq -n --argjson enabled "$enabled" --arg type "$provider" --arg url "$url" --arg username "$username" --arg schedule "$schedule" --arg time "$time" --argjson weekday "$weekday" '{offsite_enabled:$enabled,offsite_type:$type,offsite_url:$url,offsite_username:$username,offsite_schedule:$schedule,offsite_time:$time,offsite_weekday:$weekday}')"
+            ;;
+
+        filesystem)
+            local dest_path
+            dest_path="$(jq -r '.filesystem.path // ""' <<<"$payload")"
+            if [ "$enabled" = "true" ]; then
+                [[ "$dest_path" = /* ]] && [ "${#dest_path}" -le 2048 ] && [[ "$dest_path" != *$'\n'* ]] || { echo "Mounted filesystem destination must be an absolute path." >&2; return 1; }
+                local local_repo
+                local_repo="$(jq -r '.repository_path // ""' "$INFO" 2>/dev/null || true)"
+                [ "$dest_path" != "$local_repo" ] || { echo "Remote filesystem path cannot be the local Kopia repository itself." >&2; return 1; }
+                [ -d "$dest_path" ] || { echo "Mounted filesystem destination does not exist inside the container. Mount the NAS/storage first." >&2; return 1; }
+                [ -w "$dest_path" ] || { echo "Mounted filesystem destination is not writable." >&2; return 1; }
+            fi
+            rm -f "$OFFSITE_CONFIG"
+            "$SECRET_HELPER" remove "$OFFSITE_STORE"
+            public_payload="$(jq -n --argjson enabled "$enabled" --arg type "$provider" --arg path "$dest_path" --arg schedule "$schedule" --arg time "$time" --argjson weekday "$weekday" '{offsite_enabled:$enabled,offsite_type:$type,offsite_path:$path,offsite_schedule:$schedule,offsite_time:$time,offsite_weekday:$weekday}')"
+            ;;
+
+        s3)
+            local endpoint bucket region prefix access_key secret_key session_token replace_creds=false
+            endpoint="$(jq -r '.s3.endpoint // ""' <<<"$payload")"
+            bucket="$(jq -r '.s3.bucket // ""' <<<"$payload")"
+            region="$(jq -r '.s3.region // ""' <<<"$payload")"
+            prefix="$(jq -r '.s3.prefix // ""' <<<"$payload")"
+            access_key="$(jq -r '.s3.access_key // ""' <<<"$payload")"
+            secret_key="$(jq -r '.s3.secret_access_key // ""' <<<"$payload")"
+            session_token="$(jq -r '.s3.session_token // ""' <<<"$payload")"
+            if [ "$enabled" = "true" ]; then
+                [[ "$endpoint" =~ ^[^[:space:]/]+$ ]] || { echo "S3 endpoint must be a hostname, optionally with a port, without http:// or https://." >&2; return 1; }
+                [ -n "$bucket" ] && [ "${#bucket}" -le 255 ] || { echo "Enter the S3/MinIO bucket." >&2; return 1; }
+            fi
+            if [ -n "$access_key" ] || [ -n "$secret_key" ]; then
+                [ -n "$access_key" ] && [ -n "$secret_key" ] || { echo "Provide both S3 access key and secret key when changing credentials." >&2; return 1; }
+                replace_creds=true
+            fi
+            local effective_access_key effective_secret_key
+            effective_access_key="$access_key"
+            effective_secret_key="$secret_key"
+            [ -n "$effective_access_key" ] || effective_access_key="$(existing_offsite_secret s3 access_key)"
+            [ -n "$effective_secret_key" ] || effective_secret_key="$(existing_offsite_secret s3 secret_access_key)"
+            if [ "$enabled" = "true" ]; then
+                [ -n "$effective_access_key" ] && [ -n "$effective_secret_key" ] || { echo "S3/MinIO access key and secret key are required." >&2; return 1; }
+            fi
+            secret_payload="$(jq -n --arg access "$access_key" --arg secret "$secret_key" --arg token "$session_token" --argjson replace "$replace_creds" '{access_key:$access,secret_access_key:$secret,session_token:$token,_replace_s3_credentials:$replace}')"
+            write_offsite_secret_config s3 "$secret_payload"
+            public_payload="$(jq -n --argjson enabled "$enabled" --arg type "$provider" --arg endpoint "$endpoint" --arg bucket "$bucket" --arg region "$region" --arg prefix "$prefix" --arg schedule "$schedule" --arg time "$time" --argjson weekday "$weekday" '{offsite_enabled:$enabled,offsite_type:$type,offsite_endpoint:$endpoint,offsite_bucket:$bucket,offsite_region:$region,offsite_prefix:$prefix,offsite_schedule:$schedule,offsite_time:$time,offsite_weekday:$weekday}')"
+            ;;
+
+        from-config)
+            local token
+            token="$(jq -r '.from_config.token // ""' <<<"$payload")"
+            local effective_token
+            effective_token="$token"
+            [ -n "$effective_token" ] || effective_token="$(existing_offsite_secret from-config token)"
+            if [ "$enabled" = "true" ]; then
+                [ -n "$effective_token" ] || { echo "Paste a Kopia configuration token for this destination." >&2; return 1; }
+            fi
+            secret_payload="$(jq -n --arg token "$token" '{token:$token}')"
+            write_offsite_secret_config from-config "$secret_payload"
+            public_payload="$(jq -n --argjson enabled "$enabled" --arg type "$provider" --arg schedule "$schedule" --arg time "$time" --argjson weekday "$weekday" '{offsite_enabled:$enabled,offsite_type:$type,offsite_schedule:$schedule,offsite_time:$time,offsite_weekday:$weekday}')"
+            ;;
+
+        rclone)
+            local remote_path rclone_config
+            remote_path="$(jq -r '.rclone.remote_path // ""' <<<"$payload")"
+            rclone_config="$(jq -r '.rclone.config // ""' <<<"$payload")"
+            if [ "$enabled" = "true" ]; then
+                [ -n "$remote_path" ] && [ "${#remote_path}" -le 2048 ] || { echo "Enter an Rclone remote path such as remote:backups/everlomp." >&2; return 1; }
+                command -v rclone >/dev/null 2>&1 || { echo "Rclone is not installed in this image." >&2; return 1; }
+            fi
+            local effective_rclone_config
+            effective_rclone_config="$rclone_config"
+            [ -n "$effective_rclone_config" ] || effective_rclone_config="$(existing_offsite_secret rclone rclone_config)"
+            if [ "$enabled" = "true" ]; then
+                [ -n "$effective_rclone_config" ] || { echo "Paste the rclone.conf content for this remote." >&2; return 1; }
+            fi
+            secret_payload="$(jq -n --arg config "$rclone_config" '{rclone_config:$config}')"
+            write_offsite_secret_config rclone "$secret_payload"
+            public_payload="$(jq -n --argjson enabled "$enabled" --arg type "$provider" --arg path "$remote_path" --arg schedule "$schedule" --arg time "$time" --argjson weekday "$weekday" '{offsite_enabled:$enabled,offsite_type:$type,offsite_rclone_remote_path:$path,offsite_schedule:$schedule,offsite_time:$time,offsite_weekday:$weekday}')"
+            ;;
+    esac
+
+    json_write_backup_settings offsite "$public_payload"
+}
+
+
+test_offsite_connection() {
+    local payload="$1"
+    local provider
+    provider="$(jq -r '.type // "sftp"' <<<"$payload")"
+
+    case "$provider" in
+        filesystem)
+            local dest_path test_file
+            dest_path="$(jq -r '.filesystem.path // ""' <<<"$payload")"
+            [[ "$dest_path" = /* ]] && [ "${#dest_path}" -le 2048 ] || {
+                echo "Mounted filesystem destination must be an absolute path." >&2
+                return 1
+            }
+            [ -d "$dest_path" ] || {
+                echo "Destination does not exist inside the container. Mount the NAS/storage first." >&2
+                return 1
+            }
+            [ -w "$dest_path" ] || {
+                echo "Destination exists but is not writable." >&2
+                return 1
+            }
+            test_file="$(mktemp "$dest_path/.everlomp-connection-test.XXXXXX")" || {
+                echo "Destination is mounted but Everlomp could not write to it." >&2
+                return 1
+            }
+            rm -f "$test_file"
+            echo "Mounted filesystem connection succeeded and the destination is writable."
+            ;;
+
+        sftp)
+            command -v sftp >/dev/null 2>&1 || {
+                echo "The SFTP client is not installed in this image." >&2
+                return 1
+            }
+
+            local host port username auth_mode password private_key known_hosts
+            local effective_password effective_private_key tmp_dir
+            host="$(jq -r '.sftp.host // ""' <<<"$payload")"
+            port="$(jq -r '.sftp.port // 22' <<<"$payload")"
+            username="$(jq -r '.sftp.username // ""' <<<"$payload")"
+            auth_mode="$(jq -r '.sftp.auth_mode // "key"' <<<"$payload")"
+            password="$(jq -r '.sftp.password // ""' <<<"$payload")"
+            private_key="$(jq -r '.sftp.private_key // ""' <<<"$payload")"
+            known_hosts="$(jq -r '.sftp.known_hosts // ""' <<<"$payload")"
+
+            [ -n "$host" ] && [ "${#host}" -le 255 ] && [[ "$host" != *$'\n'* ]] || {
+                echo "Enter a valid SFTP/SSH host." >&2
+                return 1
+            }
+            [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || {
+                echo "SFTP port must be between 1 and 65535." >&2
+                return 1
+            }
+            [ -n "$username" ] && [ "${#username}" -le 255 ] || {
+                echo "Enter the SFTP/SSH username." >&2
+                return 1
+            }
+            [[ "$auth_mode" == "password" || "$auth_mode" == "key" ]] || {
+                echo "SFTP authentication must use a password or private key." >&2
+                return 1
+            }
+
+            effective_password="$password"
+            effective_private_key="$private_key"
+            [ -n "$effective_password" ] || effective_password="$(existing_offsite_secret sftp password)"
+            [ -n "$effective_private_key" ] || effective_private_key="$(existing_offsite_secret sftp private_key)"
+            [ -n "$known_hosts" ] || known_hosts="$(existing_offsite_secret sftp known_hosts)"
+
+            if [ "$auth_mode" = "password" ]; then
+                [ -n "$effective_password" ] || {
+                    echo "Enter the SFTP password." >&2
+                    return 1
+                }
+            else
+                [ -n "$effective_private_key" ] || {
+                    echo "Paste an SSH private key." >&2
+                    return 1
+                }
+            fi
+
+            tmp_dir="$(mktemp -d /run/everlomp-sftp-test.XXXXXX)"
+            chmod 0700 "$tmp_dir"
+            : > "$tmp_dir/known_hosts"
+            chmod 0600 "$tmp_dir/known_hosts"
+            if [ -n "$known_hosts" ]; then
+                printf '%s\n' "$known_hosts" > "$tmp_dir/known_hosts"
+            fi
+
+            local -a sftp_args=(
+                -q
+                -P "$port"
+                -o "ConnectTimeout=12"
+                -o "ConnectionAttempts=1"
+                -o "UserKnownHostsFile=$tmp_dir/known_hosts"
+            )
+
+            if [ -n "$known_hosts" ]; then
+                sftp_args+=(-o "StrictHostKeyChecking=yes")
+            else
+                sftp_args+=(-o "StrictHostKeyChecking=accept-new")
+            fi
+
+            local rc=0
+            if [ "$auth_mode" = "key" ]; then
+                printf '%s\n' "$effective_private_key" > "$tmp_dir/id_key"
+                chmod 0600 "$tmp_dir/id_key"
+                sftp_args+=(
+                    -i "$tmp_dir/id_key"
+                    -o "BatchMode=yes"
+                    -o "IdentitiesOnly=yes"
+                )
+                printf 'pwd\nquit\n' | timeout --foreground 20 sftp "${sftp_args[@]}" "$username@$host" >/dev/null 2>"$tmp_dir/error" || rc=$?
+            else
+                cat > "$tmp_dir/askpass" <<'EOFASKPASS'
+#!/bin/sh
+printf '%s\n' "${EVERLOMP_TEST_PASSWORD:-}"
+EOFASKPASS
+                chmod 0700 "$tmp_dir/askpass"
+                export EVERLOMP_TEST_PASSWORD="$effective_password"
+                export SSH_ASKPASS="$tmp_dir/askpass"
+                export SSH_ASKPASS_REQUIRE=force
+                export DISPLAY=:0
+                sftp_args+=(
+                    -o "BatchMode=no"
+                    -o "NumberOfPasswordPrompts=1"
+                    -o "PreferredAuthentications=password,keyboard-interactive"
+                )
+                printf 'pwd\nquit\n' | timeout --foreground 20 sftp "${sftp_args[@]}" "$username@$host" >/dev/null 2>"$tmp_dir/error" || rc=$?
+                unset EVERLOMP_TEST_PASSWORD SSH_ASKPASS SSH_ASKPASS_REQUIRE DISPLAY || true
+            fi
+
+            if [ "$rc" -ne 0 ]; then
+                local err
+                err="$(tail -n 2 "$tmp_dir/error" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+                rm -rf "$tmp_dir"
+                if [ "$rc" -eq 124 ]; then
+                    echo "SFTP connection timed out." >&2
+                elif printf '%s' "$err" | grep -qi 'connection closed'; then
+                    echo "SFTP connection was closed by the remote server. The selected SSH credential may be valid, but this account/server must also allow the SFTP subsystem." >&2
+                else
+                    echo "SFTP connection failed${err:+: $err}" >&2
+                fi
+                return 1
+            fi
+            rm -rf "$tmp_dir"
+            if [ "$auth_mode" = "key" ]; then
+                echo "SFTP key connection succeeded."
+            else
+                echo "SFTP password connection succeeded."
+            fi
+            ;;
+
+        webdav)
+            command -v curl >/dev/null 2>&1 || {
+                echo "curl is not installed in this image." >&2
+                return 1
+            }
+
+            local url username password effective_password tmp_dir rc=0
+            url="$(jq -r '.webdav.url // ""' <<<"$payload")"
+            username="$(jq -r '.webdav.username // ""' <<<"$payload")"
+            password="$(jq -r '.webdav.password // ""' <<<"$payload")"
+            [[ "$url" =~ ^https?:// ]] && [ "${#url}" -le 2048 ] || {
+                echo "WebDAV URL must begin with http:// or https://." >&2
+                return 1
+            }
+            [ -n "$username" ] || {
+                echo "Enter the WebDAV username." >&2
+                return 1
+            }
+            effective_password="$password"
+            [ -n "$effective_password" ] || effective_password="$(existing_offsite_secret webdav password)"
+            [ -n "$effective_password" ] || {
+                echo "Enter the WebDAV password." >&2
+                return 1
+            }
+
+            tmp_dir="$(mktemp -d /run/everlomp-webdav-test.XXXXXX)"
+            chmod 0700 "$tmp_dir"
+            TEST_WEBDAV_USER="$username" TEST_WEBDAV_PASSWORD="$effective_password" python3 - "$tmp_dir/curl.conf" <<'PYWEBDAV'
+from pathlib import Path
+import os, sys
+
+def esc(value: str) -> str:
+    return value.replace('\\', '\\\\').replace('"', '\\"').replace('\r', '').replace('\n', '')
+
+user = esc(os.environ.get('TEST_WEBDAV_USER', ''))
+password = esc(os.environ.get('TEST_WEBDAV_PASSWORD', ''))
+Path(sys.argv[1]).write_text(
+    f'user = "{user}:{password}"\n'
+    'silent\n'
+    'show-error\n'
+    'fail\n'
+    'max-time = 15\n'
+)
+PYWEBDAV
+            chmod 0600 "$tmp_dir/curl.conf"
+            timeout --foreground 20 curl --config "$tmp_dir/curl.conf" --request PROPFIND --header 'Depth: 0' --output /dev/null "$url" 2>"$tmp_dir/error" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                local err
+                err="$(tail -n 2 "$tmp_dir/error" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+                rm -rf "$tmp_dir"
+                [ "$rc" -eq 124 ] && echo "WebDAV connection timed out." >&2 || echo "WebDAV connection failed${err:+: $err}" >&2
+                return 1
+            fi
+            rm -rf "$tmp_dir"
+            echo "WebDAV authentication and endpoint access succeeded."
+            ;;
+
+        s3)
+            command -v rclone >/dev/null 2>&1 || {
+                echo "Rclone is required for the S3 connection test but is not installed." >&2
+                return 1
+            }
+
+            local endpoint bucket region prefix access_key secret_key session_token
+            local effective_access_key effective_secret_key effective_session_token endpoint_url target tmp_dir rc=0
+            endpoint="$(jq -r '.s3.endpoint // ""' <<<"$payload")"
+            bucket="$(jq -r '.s3.bucket // ""' <<<"$payload")"
+            region="$(jq -r '.s3.region // ""' <<<"$payload")"
+            prefix="$(jq -r '.s3.prefix // ""' <<<"$payload")"
+            access_key="$(jq -r '.s3.access_key // ""' <<<"$payload")"
+            secret_key="$(jq -r '.s3.secret_access_key // ""' <<<"$payload")"
+            session_token="$(jq -r '.s3.session_token // ""' <<<"$payload")"
+
+            [[ "$endpoint" =~ ^[^[:space:]/]+$ ]] || {
+                echo "S3 endpoint must be a hostname, optionally with a port, without http:// or https://." >&2
+                return 1
+            }
+            [ -n "$bucket" ] || {
+                echo "Enter the S3/MinIO bucket." >&2
+                return 1
+            }
+            effective_access_key="$access_key"
+            effective_secret_key="$secret_key"
+            effective_session_token="$session_token"
+            [ -n "$effective_access_key" ] || effective_access_key="$(existing_offsite_secret s3 access_key)"
+            [ -n "$effective_secret_key" ] || effective_secret_key="$(existing_offsite_secret s3 secret_access_key)"
+            if [ -z "$effective_session_token" ] && [ -z "$access_key" ] && [ -z "$secret_key" ]; then
+                effective_session_token="$(existing_offsite_secret s3 session_token)"
+            fi
+            [ -n "$effective_access_key" ] && [ -n "$effective_secret_key" ] || {
+                echo "Enter the S3/MinIO access key and secret key." >&2
+                return 1
+            }
+
+            [[ "$effective_access_key" != *$'\n'* && "$effective_secret_key" != *$'\n'* && "$effective_session_token" != *$'\n'* ]] || {
+                echo "S3 credentials may not contain line breaks." >&2
+                return 1
+            }
+
+            endpoint_url="https://$endpoint"
+            target="everlomptest:$bucket"
+            if [ -n "$prefix" ]; then
+                prefix="${prefix#/}"
+                prefix="${prefix%/}"
+                [ -n "$prefix" ] && target="$target/$prefix"
+            fi
+            tmp_dir="$(mktemp -d /run/everlomp-s3-test.XXXXXX)"
+            chmod 0700 "$tmp_dir"
+            {
+                printf '[everlomptest]\n'
+                printf 'type = s3\n'
+                printf 'provider = Other\n'
+                printf 'access_key_id = %s\n' "$effective_access_key"
+                printf 'secret_access_key = %s\n' "$effective_secret_key"
+                printf 'endpoint = %s\n' "$endpoint_url"
+                [ -n "$region" ] && printf 'region = %s\n' "$region"
+                [ -n "$effective_session_token" ] && printf 'session_token = %s\n' "$effective_session_token"
+            } > "$tmp_dir/rclone.conf"
+            chmod 0600 "$tmp_dir/rclone.conf"
+            timeout --foreground 20 rclone lsf "$target" --max-depth 1 --config "$tmp_dir/rclone.conf" >/dev/null 2>"$tmp_dir/error" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                local err
+                err="$(tail -n 2 "$tmp_dir/error" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+                rm -rf "$tmp_dir"
+                [ "$rc" -eq 124 ] && echo "S3/MinIO connection timed out." >&2 || echo "S3/MinIO connection failed${err:+: $err}" >&2
+                return 1
+            fi
+            rm -rf "$tmp_dir"
+            echo "S3/MinIO credentials and bucket access succeeded."
+            ;;
+
+        from-config)
+            local token effective_token tmp_dir rc=0
+            token="$(jq -r '.from_config.token // ""' <<<"$payload")"
+            effective_token="$token"
+            [ -n "$effective_token" ] || effective_token="$(existing_offsite_secret from-config token)"
+            [ -n "$effective_token" ] || {
+                echo "Paste the Kopia configuration token." >&2
+                return 1
+            }
+            tmp_dir="$(mktemp -d /run/everlomp-kopia-token-test.XXXXXX)"
+            chmod 0700 "$tmp_dir"
+            printf '%s' "$effective_token" > "$tmp_dir/token"
+            chmod 0600 "$tmp_dir/token"
+            KOPIA_CONFIG_PATH="$tmp_dir/repository.config" timeout --foreground 20 "$KOPIA" repository connect from-config --token-file="$tmp_dir/token" --readonly --no-check-for-updates --cache-directory="$tmp_dir/cache" >/dev/null 2>"$tmp_dir/error" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                local err
+                err="$(tail -n 2 "$tmp_dir/error" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+                rm -rf "$tmp_dir"
+                [ "$rc" -eq 124 ] && echo "Kopia token connection timed out." >&2 || echo "Kopia token connection failed${err:+: $err}" >&2
+                return 1
+            fi
+            rm -rf "$tmp_dir"
+            echo "Kopia configuration token connected successfully."
+            ;;
+
+        rclone)
+            command -v rclone >/dev/null 2>&1 || {
+                echo "Rclone is not installed in this image." >&2
+                return 1
+            }
+            local remote_path rclone_config effective_rclone_config tmp_dir rc=0
+            remote_path="$(jq -r '.rclone.remote_path // ""' <<<"$payload")"
+            rclone_config="$(jq -r '.rclone.config // ""' <<<"$payload")"
+            [ -n "$remote_path" ] && [ "${#remote_path}" -le 2048 ] || {
+                echo "Enter an Rclone remote path such as remote:backups/everlomp." >&2
+                return 1
+            }
+            effective_rclone_config="$rclone_config"
+            [ -n "$effective_rclone_config" ] || effective_rclone_config="$(existing_offsite_secret rclone rclone_config)"
+            [ -n "$effective_rclone_config" ] || {
+                echo "Paste the rclone.conf content." >&2
+                return 1
+            }
+            tmp_dir="$(mktemp -d /run/everlomp-rclone-test.XXXXXX)"
+            chmod 0700 "$tmp_dir"
+            printf '%s\n' "$effective_rclone_config" > "$tmp_dir/rclone.conf"
+            chmod 0600 "$tmp_dir/rclone.conf"
+            timeout --foreground 20 rclone lsf "$remote_path" --max-depth 1 --config "$tmp_dir/rclone.conf" >/dev/null 2>"$tmp_dir/error" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                local err
+                err="$(tail -n 2 "$tmp_dir/error" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+                rm -rf "$tmp_dir"
+                [ "$rc" -eq 124 ] && echo "Rclone connection timed out." >&2 || echo "Rclone connection failed${err:+: $err}" >&2
+                return 1
+            fi
+            rm -rf "$tmp_dir"
+            echo "Rclone remote access succeeded."
+            ;;
+
+        *)
+            echo "Unsupported off-site destination type." >&2
+            return 1
+            ;;
+    esac
+}
+
+sync_kopia_offsite() {
+    local max_seconds="${1:-0}"
+
+    [ -s "$REPO_CONFIG" ] || {
+        echo "Kopia repository is disconnected; off-site sync skipped." >&2
+        record_offsite_sync_result "failed" "Kopia repository is disconnected."
+        return 1
+    }
+    "$SECRET_HELPER" exists "$REPO_PASSWORD_STORE" || {
+        echo "Saved Kopia repository password is missing." >&2
+        record_offsite_sync_result "failed" "Saved repository password is missing."
+        return 1
+    }
+    [ -s "$BACKUP_CONFIG" ] || { echo "Backup settings are missing." >&2; return 1; }
+
+    local enabled provider
+    enabled="$(jq -r '.offsite_enabled // false' "$BACKUP_CONFIG")"
+    provider="$(jq -r '.offsite_type // "sftp"' "$BACKUP_CONFIG")"
+    [ "$enabled" = "true" ] || { echo "Off-site synchronization is disabled." >&2; return 2; }
+
+    if [ "$provider" = "s3" ] && [ ! -s "$OFFSITE_CONFIG" ] \
+        && [ -s "$LEGACY_OFFSITE_S3_CONFIG" ]; then
+        write_offsite_secret_config s3 '{}'
+    fi
+
+    export KOPIA_CONFIG_PATH="$REPO_CONFIG"
+    export KOPIA_PASSWORD="$("$SECRET_HELPER" read "$REPO_PASSWORD_STORE")"
+
+    local -a args=(repository sync-to)
+    local tmp_dir=""
+    local detail="Remote repository synchronized successfully."
+
+    case "$provider" in
+        filesystem)
+            local dest_path marker
+            dest_path="$(jq -r '.offsite_path // ""' "$BACKUP_CONFIG")"
+            [ -n "$dest_path" ] || { record_offsite_sync_result failed "Mounted filesystem path is missing."; return 1; }
+            [ -d "$dest_path" ] && [ -w "$dest_path" ] || { record_offsite_sync_result failed "Mounted filesystem destination is unavailable or not writable."; return 1; }
+            marker="$dest_path/.everlomp-kopia-mirror"
+            args+=(filesystem "--path=$dest_path")
+            if [ -e "$marker" ]; then
+                args+=(--must-exist)
+            elif [ "$(jq -r '.offsite_last_status // ""' "$BACKUP_CONFIG")" = "success" ]; then
+                echo "Mounted filesystem marker disappeared; refusing to write in case the NAS mount is missing." >&2
+                record_offsite_sync_result failed "Mounted filesystem marker disappeared; refusing to write in case the NAS mount is missing."
+                return 1
+            fi
+            ;;
+
+        sftp)
+            [ -s "$OFFSITE_CONFIG" ] || { record_offsite_sync_result failed "SFTP credentials are not configured."; return 1; }
+            local host port username remote_path auth_mode password private_key known_hosts
+            host="$(jq -r '.offsite_host // ""' "$BACKUP_CONFIG")"
+            port="$(jq -r '.offsite_port // 22' "$BACKUP_CONFIG")"
+            username="$(jq -r '.offsite_username // ""' "$BACKUP_CONFIG")"
+            remote_path="$(jq -r '.offsite_path // ""' "$BACKUP_CONFIG")"
+            auth_mode="$(jq -r '.offsite_auth_mode // "key"' "$BACKUP_CONFIG")"
+            password="$(jq -r '.password // ""' "$OFFSITE_CONFIG")"
+            private_key="$(jq -r '.private_key // ""' "$OFFSITE_CONFIG")"
+            known_hosts="$(jq -r '.known_hosts // ""' "$OFFSITE_CONFIG")"
+            args+=(sftp "--host=$host" "--port=$port" "--username=$username" "--path=$remote_path")
+            tmp_dir="$(mktemp -d /run/everlomp-kopia-sftp.XXXXXX)"
+            chmod 0700 "$tmp_dir"
+            if [ -n "$known_hosts" ]; then
+                printf '%s\n' "$known_hosts" > "$tmp_dir/known_hosts"
+                chmod 0600 "$tmp_dir/known_hosts"
+                args+=("--known-hosts=$tmp_dir/known_hosts")
+            fi
+            if [ "$auth_mode" = "key" ]; then
+                printf '%s\n' "$private_key" > "$tmp_dir/id_backup"
+                chmod 0600 "$tmp_dir/id_backup"
+                args+=("--keyfile=$tmp_dir/id_backup")
+            else
+                args+=("--sftp-password=$password")
+            fi
+            ;;
+
+        webdav)
+            [ -s "$OFFSITE_CONFIG" ] || { record_offsite_sync_result failed "WebDAV credentials are not configured."; return 1; }
+            local url username password
+            url="$(jq -r '.offsite_url // ""' "$BACKUP_CONFIG")"
+            username="$(jq -r '.offsite_username // ""' "$BACKUP_CONFIG")"
+            password="$(jq -r '.password // ""' "$OFFSITE_CONFIG")"
+            export KOPIA_WEBDAV_USERNAME="$username" KOPIA_WEBDAV_PASSWORD="$password"
+            args+=(webdav "--url=$url")
+            ;;
+
+        s3)
+            [ -s "$OFFSITE_CONFIG" ] || { record_offsite_sync_result failed "S3/MinIO credentials are not configured."; return 1; }
+            local endpoint bucket region prefix access_key secret_key session_token
+            endpoint="$(jq -r '.offsite_endpoint // ""' "$BACKUP_CONFIG")"
+            bucket="$(jq -r '.offsite_bucket // ""' "$BACKUP_CONFIG")"
+            region="$(jq -r '.offsite_region // ""' "$BACKUP_CONFIG")"
+            prefix="$(jq -r '.offsite_prefix // ""' "$BACKUP_CONFIG")"
+            access_key="$(jq -r '.access_key // ""' "$OFFSITE_CONFIG")"
+            secret_key="$(jq -r '.secret_access_key // ""' "$OFFSITE_CONFIG")"
+            session_token="$(jq -r '.session_token // ""' "$OFFSITE_CONFIG")"
+            export AWS_ACCESS_KEY_ID="$access_key" AWS_SECRET_ACCESS_KEY="$secret_key"
+            if [ -n "$session_token" ]; then export AWS_SESSION_TOKEN="$session_token"; else unset AWS_SESSION_TOKEN || true; fi
+            args+=(s3 "--bucket=$bucket" "--endpoint=$endpoint")
+            [ -n "$region" ] && args+=("--region=$region")
+            [ -n "$prefix" ] && args+=("--prefix=$prefix")
+            ;;
+
+        from-config)
+            [ -s "$OFFSITE_CONFIG" ] || { record_offsite_sync_result failed "Kopia destination token is not configured."; return 1; }
+            local token
+            token="$(jq -r '.token // ""' "$OFFSITE_CONFIG")"
+            tmp_dir="$(mktemp -d /run/everlomp-kopia-token.XXXXXX)"
+            chmod 0700 "$tmp_dir"
+            printf '%s' "$token" > "$tmp_dir/token"
+            chmod 0600 "$tmp_dir/token"
+            args+=(from-config "--token-file=$tmp_dir/token")
+            ;;
+
+        rclone)
+            [ -s "$OFFSITE_CONFIG" ] || { record_offsite_sync_result failed "Rclone configuration is not configured."; return 1; }
+            command -v rclone >/dev/null 2>&1 || { record_offsite_sync_result failed "Rclone is not installed."; return 1; }
+            local remote_path rclone_config
+            remote_path="$(jq -r '.offsite_rclone_remote_path // ""' "$BACKUP_CONFIG")"
+            rclone_config="$(jq -r '.rclone_config // ""' "$OFFSITE_CONFIG")"
+            tmp_dir="$(mktemp -d /run/everlomp-kopia-rclone.XXXXXX)"
+            chmod 0700 "$tmp_dir"
+            printf '%s\n' "$rclone_config" > "$tmp_dir/rclone.conf"
+            chmod 0600 "$tmp_dir/rclone.conf"
+            export RCLONE_CONFIG="$tmp_dir/rclone.conf"
+            args+=(rclone "--remote-path=$remote_path" "--rclone-exe=$(command -v rclone)")
+            detail="Remote repository synchronized through Rclone."
+            ;;
+
+        *)
+            record_offsite_sync_result failed "Unsupported off-site destination type."
+            return 1
+            ;;
+    esac
+
+    args+=(--no-progress)
+
+    local rc=0
+    if [ "$max_seconds" -gt 0 ]; then
+        timeout --foreground "$max_seconds" "$KOPIA" "${args[@]}" || rc=$?
+    else
+        "$KOPIA" "${args[@]}" || rc=$?
+    fi
+
+    [ -n "$tmp_dir" ] && rm -rf "$tmp_dir"
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN RCLONE_CONFIG KOPIA_WEBDAV_USERNAME KOPIA_WEBDAV_PASSWORD 2>/dev/null || true
+
+    if [ "$rc" -eq 0 ]; then
+        if [ "$provider" = "filesystem" ]; then
+            printf 'Everlomp Kopia mirror marker\n' > "$dest_path/.everlomp-kopia-mirror"
+            chmod 0600 "$dest_path/.everlomp-kopia-mirror" || true
+        fi
+        record_offsite_sync_result "success" "$detail"
+        return 0
+    fi
+
+    if [ "$max_seconds" -gt 0 ] && [ "$rc" -eq 124 ]; then
+        record_offsite_sync_result "failed" "Initial remote synchronization timed out."
+    else
+        record_offsite_sync_result "failed" "Kopia could not synchronize to the configured remote destination."
+    fi
+    return 1
+}
+
+
+ensure_kopia_supervisor_program() {
+    [ -f "$SUPERVISOR_CONF" ] || {
+        echo "Supervisor configuration is missing: $SUPERVISOR_CONF" >&2
+        return 1
+    }
+
+    if ! grep -q '^\[program:kopia\][[:space:]]*$' "$SUPERVISOR_CONF"; then
+        cat >> "$SUPERVISOR_CONF" <<'EOF'
+
+# ------------------------------------------------------------
+# Kopia
+# ------------------------------------------------------------
+
+[program:kopia]
+command=/usr/local/bin/run-kopia.sh
+autostart=false
+autorestart=true
+startretries=100
+startsecs=5
+stopsignal=TERM
+stopwaitsecs=30
+stderr_logfile=/var/log/supervisor/kopia.err.log
+stdout_logfile=/var/log/supervisor/kopia.out.log
+priority=45
+EOF
+    fi
+}
+
+
+ensure_cron_supervisor_program() {
+    [ -f "$SUPERVISOR_CONF" ] || {
+        echo "Supervisor configuration is missing: $SUPERVISOR_CONF" >&2
+        return 1
+    }
+
+    if ! grep -q '^\[program:cron\][[:space:]]*$' "$SUPERVISOR_CONF"; then
+        cat >> "$SUPERVISOR_CONF" <<'EOF'
+
+# ------------------------------------------------------------
+# Cron scheduler
+# ------------------------------------------------------------
+
+[program:cron]
+command=/usr/sbin/cron -f
+autostart=true
+autorestart=true
+startretries=100
+startsecs=3
+stopsignal=TERM
+stderr_logfile=/var/log/supervisor/cron.err.log
+stdout_logfile=/var/log/supervisor/cron.out.log
+priority=35
+EOF
+    fi
+
+    "$SUPERVISORCTL" -c "$SUPERVISOR_CONF" reread >/dev/null
+    "$SUPERVISORCTL" -c "$SUPERVISOR_CONF" update >/dev/null
+
+    "$SUPERVISORCTL" -c "$SUPERVISOR_CONF" start cron \
+        >/dev/null 2>&1 || true
+}
+
+
+set_kopia_autostart() {
+    local desired="$1"
+
+    ensure_kopia_supervisor_program
+
+    python3 - "$SUPERVISOR_CONF" "$desired" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+desired = sys.argv[2]
+text = path.read_text()
+
+match = re.search(
+    r'(?ms)^\[program:kopia\]\s*$.*?(?=^\[|\Z)',
+    text,
+)
+
+if not match:
+    print(
+        "Supervisor [program:kopia] section was not found.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+section = match.group(0)
+
+if re.search(r'(?m)^\s*autostart\s*=', section):
+    section = re.sub(
+        r'(?m)^\s*autostart\s*=.*$',
+        f'autostart={desired}',
+        section,
+        count=1,
+    )
+else:
+    pos = section.find("\n")
+    section = (
+        section[:pos + 1]
+        + f"autostart={desired}\n"
+        + section[pos + 1:]
+    )
+
+path.write_text(
+    text[:match.start()]
+    + section
+    + text[match.end():]
+)
+PY
+
+    "$SUPERVISORCTL" -c "$SUPERVISOR_CONF" reread >/dev/null
+    "$SUPERVISORCTL" -c "$SUPERVISOR_CONF" update >/dev/null
+}
+
+
+start_kopia_and_verify() {
+    local web_password="$1"
+    local status=""
+    local curl_config
+    curl_config="$(mktemp /run/everlomp-kopia-curl.XXXXXX)"
+    chmod 0600 "$curl_config"
+    printf 'user = "admin:%s"\n' "$web_password" > "$curl_config"
+
+    "$SUPERVISORCTL" -c "$SUPERVISOR_CONF" start kopia \
+        >/dev/null 2>&1 || true
+
+    for _ in $(seq 1 30); do
+        if curl -fsS \
+            --max-time 2 \
+            --config "$curl_config" \
+            http://127.0.0.1:51515/ \
+            >/dev/null 2>&1; then
+            rm -f "$curl_config"
+            return 0
+        fi
+
+        status="$(
+            "$SUPERVISORCTL" \
+                -c "$SUPERVISOR_CONF" \
+                status kopia 2>&1 || true
+        )"
+
+        case "$status" in
+            *FATAL*|*BACKOFF*|*EXITED*)
+                break
+                ;;
+        esac
+
+        sleep 0.25
+    done
+
+    echo \
+        "Kopia Web UI did not become healthy on 127.0.0.1:51515." \
+        >&2
+
+    echo "Supervisor status: ${status:-unknown}" >&2
+
+    if [ -f /var/log/supervisor/kopia.err.log ]; then
+        echo "--- Kopia stderr (last 60 lines) ---" >&2
+        tail -n 60 /var/log/supervisor/kopia.err.log >&2 || true
+    fi
+
+    if [ -f /var/log/supervisor/kopia.out.log ]; then
+        echo "--- Kopia stdout (last 60 lines) ---" >&2
+        tail -n 60 /var/log/supervisor/kopia.out.log >&2 || true
+    fi
+
+    rm -f "$curl_config"
+    return 1
+}
+
+
+test_and_restart_ols() {
+    local backup="$1"
+
+    set +e
+    local test_output
+    local test_rc
+    test_output="$("$OLS_BIN" -t 2>&1)"
+    test_rc=$?
+    set -e
+
+    printf '%s\n' "$test_output" >&2
+    echo \
+        "[Everlomp] OpenLiteSpeed config-test exit status: ${test_rc}" \
+        >&2
+
+    if printf '%s\n' "$test_output" \
+        | grep -Eiq \
+            '\[(ERROR|FATAL)\]|syntax[[:space:]]+error|configuration[[:space:]]+error|failed[[:space:]]+to[[:space:]]+(load|parse|read)[[:space:]]+config'; then
+
+        echo \
+            "OpenLiteSpeed reported a configuration error. Restoring backup." \
+            >&2
+
+        cp -f "$backup" "$OLS_VHCONF"
+        return 1
+    fi
+
+    set +e
+    local restart_output
+    local restart_rc
+    restart_output="$("$OLS_CTRL" restart 2>&1)"
+    restart_rc=$?
+    set -e
+
+    printf '%s\n' "$restart_output" >&2
+
+    if [ "$restart_rc" -ne 0 ]; then
+        echo \
+            "OpenLiteSpeed restart failed. Restoring backup." \
+            >&2
+
+        cp -f "$backup" "$OLS_VHCONF"
+        "$OLS_CTRL" restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    sleep 2
+
+    local status_output
+    status_output="$("$OLS_CTRL" status 2>&1 || true)"
+    printf '%s\n' "$status_output" >&2
+
+    if ! printf '%s\n' "$status_output" \
+        | grep -q 'litespeed is running with PID'; then
+
+        echo \
+            "OpenLiteSpeed did not come back healthy. Restoring backup." \
+            >&2
+
+        cp -f "$backup" "$OLS_VHCONF"
+        "$OLS_CTRL" restart >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+
+ensure_kopia_subpath_routing() {
+    [ -f "$OLS_VHCONF" ] || {
+        echo \
+            "Missing OpenLiteSpeed vhost config: $OLS_VHCONF" \
+            >&2
+        return 1
+    }
+
+    local backup="${OLS_VHCONF}.everlomp-kopia-backup"
+    cp -f "$OLS_VHCONF" "$backup"
+
+    python3 - "$OLS_VHCONF" <<'PYROUTE'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+# Remove obsolete restore/hostname compatibility blocks from persistent configs.
+text = re.sub(
+    r'(?ms)^[ \t]*# BEGIN everlomp kopia escaped routes\s*$.*?'
+    r'^[ \t]*# END everlomp kopia escaped routes\s*$\n?',
+    '',
+    text,
+)
+text = re.sub(
+    r'(?ms)^[ \t]*# BEGIN everlomp kopia host\s*$.*?'
+    r'^[ \t]*# END everlomp kopia host\s*$\n?',
+    '',
+    text,
+)
+text = re.sub(
+    r'(?ms)^# Kopia hostname backend\s*\n'
+    r'extprocessor kopia-backend\s*\{.*?^\}\s*',
+    '',
+    text,
+)
+
+# Remove all previous Kopia contexts, then install the clean pair below.
+text = re.sub(
+    r'(?m)^# Kopia[^\n]*\n(?=context /kopia(?:/api)?/)',
+    '',
+    text,
+)
+text = re.sub(
+    r'(?ms)^context /kopia/api/\s*\{.*?^\}\s*',
+    '',
+    text,
+)
+text = re.sub(
+    r'(?ms)^context /kopia/\s*\{.*?^\}\s*',
+    '',
+    text,
+)
+
+if not re.search(r'(?m)^extprocessor ols-admin-adapter\s*\{', text):
+    raise SystemExit("OpenLiteSpeed nginx adapter was not found.")
+
+contexts = r"""# Kopia Web UI + API.
+# nginx strips /kopia/ before forwarding. Kopia itself serves its custom
+# embedded HTMLUI, including native authentication/session/CSRF handling.
+context /kopia/ {
+    type                    proxy
+    handler                 ols-admin-adapter
+    addDefaultCharset       off
+}
+"""
+
+anchor = re.search(
+    r'(?ms)^context /openlitespeed/\s*\{.*?^\}\s*',
+    text,
+)
+if anchor:
+    pos = anchor.end()
+    text = text[:pos].rstrip() + "\n\n" + contexts + "\n" + text[pos:].lstrip("\n")
+else:
+    text = text.rstrip() + "\n\n" + contexts
+
+path.write_text(text)
+PYROUTE
+
+    if ! test_and_restart_ols "$backup"; then
+        return 1
+    fi
+
+    rm -f "$backup"
+}
+
+is_kopia_configured() {
+    if [ -s "$INFO" ] && jq -e '.configured == true' "$INFO" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ -s "$INFO" ] && jq -e '(.repository_type == "filesystem") and ((.repository_path // "") | length > 0)' "$INFO" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ -f "$BASE/enabled" ] && [ -s "$REPO_CONFIG" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+
+write_kopia_info() {
+    local enabled="$1"
+    local repo_path="$2"
+    local version="$3"
+    local encryption="${4:-}"
+    local install_source="${5:-}"
+
+    python3 \
+        - "$INFO" \
+        "$enabled" \
+        "$repo_path" \
+        "$version" \
+        "$encryption" \
+        "$install_source" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+path = Path(sys.argv[1])
+
+repo_path = sys.argv[3]
+install_source = sys.argv[6]
+if not install_source and path.is_file():
+    try:
+        previous = json.loads(path.read_text())
+        install_source = str(previous.get("install_source", ""))
+    except (OSError, ValueError, TypeError):
+        install_source = ""
+
+data = {
+    "configured": True,
+    "enabled": sys.argv[2] == "true",
+    "repository_type": "filesystem" if repo_path else "kopia-ui",
+    "repository_path": repo_path,
+    "version": sys.argv[4],
+    "encryption": sys.argv[5],
+    "install_source": install_source,
+    "web_path": "/kopia/",
+}
+
+path.write_text(
+    json.dumps(data, indent=2, sort_keys=True) + "\n"
+)
+PY
+
+    set_web_state_permissions "$INFO"
+}
+
+
+case "$ACTION" in
+
+    repair-state-permissions)
+        repair_web_state_permissions
+        ;;
+
+    configure-kopia)
+        if is_kopia_configured; then
+            echo "Kopia is already configured. Use Enable or Reconnect instead of running first-time configuration again." >&2
+            exit 3
+        fi
+
+        payload="$(cat)"
+
+        repo_mode="$(
+            jq -r '.repository_mode // "create"' <<<"$payload"
+        )"
+
+        repo_path="$(
+            jq -r '.repository_path // "/home/everlomp/kopiasnapshots"' <<<"$payload"
+        )"
+
+        repo_password="$(
+            jq -r '.repository_password // ""' <<<"$payload"
+        )"
+
+        encryption="$(
+            jq -r '.encryption // "AES256-GCM-HMAC-SHA256"' <<<"$payload"
+        )"
+
+        install_local_version="$(
+            jq -r '.install_local_version // false' <<<"$payload"
+        )"
+
+        default_snapshots_enabled="$(
+            jq -r '.default_snapshots.enabled // false' <<<"$payload"
+        )"
+
+        default_snapshot_time="$(
+            jq -r '.default_snapshots.time // "03:00"' <<<"$payload"
+        )"
+
+        case "$default_snapshots_enabled" in
+            true|false) ;;
+            *) echo "default_snapshots.enabled must be true or false." >&2; exit 28 ;;
+        esac
+
+        if [ "$default_snapshots_enabled" = "true" ] \
+            && ! [[ "$default_snapshot_time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+            echo "Default Kopia snapshot time must be HH:MM." >&2
+            exit 29
+        fi
+
+        case "$install_local_version" in
+            true) kopia_install_source="local" ;;
+            false) kopia_install_source="online" ;;
+            *) echo "install_local_version must be true or false." >&2; exit 27 ;;
+        esac
+
+        offsite_payload="$(jq -c '.offsite // {enabled:false,type:"sftp",schedule:"every6h",time:"03:30",weekday:0}' <<<"$payload")"
+
+        if [ "$repo_mode" != "create" ] && [ "$repo_mode" != "connect" ] && [ "$repo_mode" != "ui" ]; then
+            echo "Repository mode must be create, connect, or ui." >&2
+            exit 4
+        fi
+
+        if [ "$repo_mode" != "ui" ]; then
+            if [[ ! "$repo_path" =~ ^/home/everlomp/kopiasnapshots(/.*)?$ ]] \
+                || [[ "$repo_path" == *"/../"* ]] \
+                || [[ "$repo_path" == *"/.." ]]; then
+                echo "Kopia repository path must be /home/everlomp/kopiasnapshots or a directory below it." >&2
+                exit 5
+            fi
+        else
+            repo_path=""
+        fi
+
+        if [ "$default_snapshots_enabled" = "true" ] && [ "$repo_mode" = "ui" ]; then
+            echo "Default snapshot sources can only be enabled when creating the local primary repository during installation. If you choose the primary repository later, configure snapshot sources in Kopia after connecting it." >&2
+            exit 30
+        fi
+
+        if [ "$repo_mode" != "ui" ] && [ "${#repo_password}" -lt 12 ]; then
+            echo "Kopia repository password must be at least 12 characters." >&2
+            exit 6
+        fi
+
+        case "$encryption" in
+            AES256-GCM-HMAC-SHA256|CHACHA20-POLY1305-HMAC-SHA256) ;;
+            *) echo "Unsupported Kopia encryption algorithm." >&2; exit 18 ;;
+        esac
+
+        offsite_enabled="$(jq -r '.enabled // false' <<<"$offsite_payload")"
+        if [ "$offsite_enabled" = "true" ]; then
+            [ -x "$REPLICATION_HELPER" ] || {
+                echo "Kopia replication helper is missing: $REPLICATION_HELPER" >&2
+                exit 26
+            }
+            if ! printf '%s' "$offsite_payload" | /usr/sbin/runuser -u everlomp -- "$REPLICATION_HELPER" validate-offsite >/dev/null; then
+                echo "Remote backup destination configuration is invalid." >&2
+                exit 26
+            fi
+        fi
+
+        ensure_custom_kopia_binary "$kopia_install_source"
+
+        install -d -o everlomp -g everlomp -m 0700 "$BASE"
+        mkdir -p "$EVERBACKUPS_DIR" "$SQL_BACKUP_DIR"
+
+        if [ "$repo_mode" = "create" ]; then
+            mkdir -p "$repo_path"
+            chmod 0700 "$repo_path" || true
+        elif [ "$repo_mode" = "connect" ] && [ ! -d "$repo_path" ]; then
+            echo \
+                "Existing Kopia repository directory does not exist: $repo_path" \
+                >&2
+            exit 7
+        fi
+
+        if [ "$repo_mode" != "ui" ]; then
+            printf '%s' "$repo_password" | "$SECRET_HELPER" write "$REPO_PASSWORD_STORE"
+        else
+            "$SECRET_HELPER" remove "$REPO_PASSWORD_STORE"
+        fi
+
+        web_password="$(openssl rand -hex 16)"
+        printf '%s' "$web_password" | "$SECRET_HELPER" write "$WEB_PASSWORD_STORE"
+
+        export KOPIA_CONFIG_PATH="$REPO_CONFIG"
+        export KOPIA_PASSWORD="$repo_password"
+
+        if [ "$repo_mode" = "create" ]; then
+            "$KOPIA" repository create filesystem \
+                --path="$repo_path" \
+                --encryption="$encryption" \
+                --no-check-for-updates \
+                1>&2
+        elif [ "$repo_mode" = "connect" ]; then
+            "$KOPIA" repository connect filesystem \
+                --path="$repo_path" \
+                --no-check-for-updates \
+                1>&2
+            encryption="existing-repository"
+        else
+            rm -f "$REPO_CONFIG"
+            encryption="kopia-ui-managed"
+        fi
+
+        if [ "$default_snapshots_enabled" = "true" ]; then
+            mkdir -p "$SQL_BACKUP_DIR"
+            chmod 0700 "$EVERBACKUPS_DIR" "$SQL_BACKUP_DIR" 2>/dev/null || true
+
+            for snapshot_source in "$DEFAULT_WWW_SOURCE" "$SQL_BACKUP_DIR"; do
+                [ -d "$snapshot_source" ] || {
+                    echo "Default snapshot source does not exist: $snapshot_source" >&2
+                    exit 31
+                }
+
+                "$KOPIA" policy set "$snapshot_source" \
+                    --snapshot-time="$default_snapshot_time" \
+                    --run-missed=true \
+                    --no-manual \
+                    1>&2
+
+                "$KOPIA" snapshot create "$snapshot_source" \
+                    --description="Everlomp initial snapshot" \
+                    1>&2
+            done
+        fi
+
+        if [ -s "$REPO_CONFIG" ]; then
+            chmod 0600 "$REPO_CONFIG"
+        fi
+
+        version="$(
+            "$KOPIA" --version 2>/dev/null \
+                | head -n1 \
+                | tr -d '\r'
+        )"
+
+        initial_offsite_status="disabled"
+        initial_replica_id=""
+
+        if [ "$offsite_enabled" = "true" ]; then
+            if initial_replica_id="$(printf '%s' "$offsite_payload" | /usr/sbin/runuser -u everlomp -- "$REPLICATION_HELPER" import-offsite 2>/dev/null)" \
+                && [ -n "$initial_replica_id" ]; then
+                if [ "$repo_mode" = "ui" ]; then
+                    initial_offsite_status="pending-primary"
+                elif /usr/sbin/runuser -u everlomp -- "$REPLICATION_HELPER" sync "$initial_replica_id" 1>&2; then
+                    initial_offsite_status="success"
+                else
+                    initial_offsite_status="failed"
+                fi
+            else
+                echo "Could not save the initial Kopia replica." >&2
+                exit 26
+            fi
+        fi
+
+        set_kopia_autostart true
+        start_kopia_and_verify "$web_password"
+        ensure_kopia_subpath_routing
+
+        write_kopia_info \
+            true \
+            "$repo_path" \
+            "$version" \
+            "$encryption" \
+            "$kopia_install_source"
+        touch "$BASE/enabled"
+        chmod 0600 "$BASE/enabled"
+
+        jq -n \
+            --arg username admin \
+            --arg password "$web_password" \
+            --arg path "$repo_path" \
+            --arg version "$version" \
+            --arg repository_mode "$repo_mode" \
+            --arg offsite_status "$initial_offsite_status" \
+            '{
+                configured:true,
+                enabled:true,
+                username:$username,
+                password:$password,
+                repository_path:$path,
+                repository_mode:$repository_mode,
+                version:$version,
+                offsite_status:$offsite_status,
+                web_path:"/kopia/"
+            }'
+        ;;
+
+
+    prepare-kopia-build)
+        ensure_custom_kopia_binary
+
+        echo "Kopia build/update tools are installed and the custom /kopia/ binary is ready."
+        ;;
+
+
+    reconnect-kopia)
+
+        [ -s "$INFO" ] || {
+            echo \
+                "Kopia metadata is missing: $INFO" \
+                >&2
+            exit 19
+        }
+
+        "$SECRET_HELPER" exists "$REPO_PASSWORD_STORE" || {
+            echo \
+                "Saved Kopia repository password is missing." \
+                >&2
+            exit 20
+        }
+
+        repo_type="$(
+            jq -r '.repository_type // ""' \
+                "$INFO" 2>/dev/null || true
+        )"
+
+        repo_path="$(
+            jq -r '.repository_path // ""' \
+                "$INFO" 2>/dev/null || true
+        )"
+
+        if [ "$repo_type" != "filesystem" ]; then
+            echo \
+                "Automatic Everlomp reconnect currently supports only filesystem repositories." \
+                >&2
+            exit 21
+        fi
+
+        if { [[ ! "$repo_path" =~ ^/home/everlomp/kopiasnapshots(/.*)?$ ]] \
+                && [[ ! "$repo_path" =~ ^/backup(/.*)?$ ]]; } \
+            || [[ "$repo_path" == *"/../"* ]] \
+            || [[ "$repo_path" == *"/.." ]]; then
+
+            echo \
+                "Refusing unsafe Kopia repository path: $repo_path" \
+                >&2
+            exit 22
+        fi
+
+        [ -d "$repo_path" ] || {
+            echo \
+                "Kopia repository directory does not exist: $repo_path" \
+                >&2
+            exit 23
+        }
+
+        # If a repository config already exists, do not overwrite it.
+        if [ -s "$REPO_CONFIG" ]; then
+            echo \
+                "Kopia repository.config already exists; refusing to overwrite an active connection." \
+                >&2
+            exit 24
+        fi
+
+        export KOPIA_CONFIG_PATH="$REPO_CONFIG"
+        export KOPIA_PASSWORD="$(
+            "$SECRET_HELPER" read "$REPO_PASSWORD_STORE"
+        )"
+
+        "$SUPERVISORCTL" \
+            -c "$SUPERVISOR_CONF" \
+            stop kopia \
+            >/dev/null 2>&1 || true
+
+        if ! "$KOPIA" repository connect filesystem \
+            --path="$repo_path" \
+            --no-check-for-updates; then
+
+            echo \
+                "Kopia repository reconnect failed. The Web UI will be started in disconnected mode." \
+                >&2
+
+            "$SUPERVISORCTL" \
+                -c "$SUPERVISOR_CONF" \
+                start kopia \
+                >/dev/null 2>&1 || true
+
+            exit 25
+        fi
+
+        chmod 0600 "$REPO_CONFIG"
+
+        if [ -f "$BASE/enabled" ]; then
+            set_kopia_autostart true
+
+            start_kopia_and_verify "$(
+                "$SECRET_HELPER" read "$WEB_PASSWORD_STORE"
+            )"
+        fi
+
+        echo \
+            "Kopia reconnected to the Everlomp filesystem repository: $repo_path"
+        ;;
+
+
+    repair-kopia-route)
+        ensure_kopia_subpath_routing
+        echo "Kopia native /kopia/ UI/API proxy route repaired."
+        ;;
+
+
+    enable-kopia)
+
+        "$SECRET_HELPER" exists "$WEB_PASSWORD_STORE" || {
+            echo \
+                "Kopia Web UI credentials are missing; configure Kopia first." \
+                >&2
+            exit 8
+        }
+
+        repo_path="$(
+            jq -r '.repository_path // ""' \
+                "$INFO" 2>/dev/null || true
+        )"
+
+        encryption="$(
+            jq -r '.encryption // ""' \
+                "$INFO" 2>/dev/null || true
+        )"
+
+        version="$(
+            "$KOPIA" --version 2>/dev/null \
+                | head -n1 \
+                | tr -d '\r'
+        )"
+
+        write_kopia_info \
+            true \
+            "$repo_path" \
+            "$version" \
+            "$encryption"
+
+        touch "$BASE/enabled"
+        chmod 0600 "$BASE/enabled"
+
+        set_kopia_autostart true
+
+        start_kopia_and_verify "$(
+            "$SECRET_HELPER" read "$WEB_PASSWORD_STORE"
+        )"
+
+        ensure_kopia_subpath_routing
+
+        echo "Kopia enabled."
+        ;;
+
+
+    disable-kopia)
+        "$SUPERVISORCTL" \
+            -c "$SUPERVISOR_CONF" \
+            stop kopia \
+            >/dev/null 2>&1 || true
+
+        set_kopia_autostart false
+
+        rm -f "$BASE/enabled"
+
+        if [ -f "$INFO" ]; then
+            python3 - "$INFO" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+path = Path(sys.argv[1])
+
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    data = {}
+
+data["enabled"] = False
+# Disabling is not the same as undoing first-time configuration. Backfill the
+# v21 persistent marker for metadata created by v19/v20.
+data["configured"] = bool(data.get("repository_path"))
+data["web_path"] = "/kopia/"
+data.pop("hostname", None)
+
+path.write_text(
+    json.dumps(data, indent=2, sort_keys=True) + "\n"
+)
+PY
+            set_web_state_permissions "$INFO"
+        fi
+
+        echo \
+            "Kopia disabled. Repository configuration was preserved."
+        ;;
+
+
+    test-offsite-connection)
+        payload="$(cat)"
+        test_offsite_connection "$payload"
+        ;;
+
+
+    save-offsite-settings)
+        payload="$(cat)"
+        save_offsite_configuration "$payload"
+        echo "Remote backup destination settings saved."
+        ;;
+
+
+    sync-kopia-now)
+        exec 8>"$OFFSITE_SYNC_LOCK"
+        flock -n 8 || {
+            echo "An off-site Kopia synchronization is already running." >&2
+            exit 44
+        }
+
+        sync_kopia_offsite
+        echo "Off-site Kopia synchronization completed."
+        ;;
+
+
+    save-sql-settings)
+        payload="$(cat)"
+
+        enabled="$(
+            jq -r '.sql_enabled // false' <<<"$payload"
+        )"
+
+        schedule="$(
+            jq -r '.sql_schedule // "daily"' <<<"$payload"
+        )"
+
+        time="$(
+            jq -r '.sql_time // "02:30"' <<<"$payload"
+        )"
+
+        weekday="$(
+            jq -r '.sql_weekday // 0' <<<"$payload"
+        )"
+
+        keep="$(
+            jq -r '.sql_keep // 7' <<<"$payload"
+        )"
+
+        [[ "$enabled" == "true" \
+            || "$enabled" == "false" ]] || {
+
+            echo \
+                "Invalid SQL enabled value." \
+                >&2
+            exit 9
+        }
+
+        [[ "$schedule" =~ ^(hourly|every6h|every12h|daily|weekly)$ ]] || {
+            echo \
+                "Invalid SQL schedule." \
+                >&2
+            exit 10
+        }
+
+        if [[ "$schedule" == "daily" || "$schedule" == "weekly" ]]; then
+            [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || {
+                echo \
+                    "Invalid SQL backup time." \
+                    >&2
+                exit 11
+            }
+        fi
+
+        if [ "$schedule" = "weekly" ]; then
+            [[ "$weekday" =~ ^[0-6]$ ]] || {
+                echo "Invalid weekday." >&2
+                exit 12
+            }
+        fi
+
+        [[ "$keep" =~ ^[0-9]+$ ]] \
+            && [ "$keep" -ge 1 ] \
+            && [ "$keep" -le 365 ] || {
+
+            echo \
+                "Keep count must be 1-365." \
+                >&2
+            exit 13
+        }
+
+        clean="$(
+            jq -n \
+                --argjson e "$enabled" \
+                --arg s "$schedule" \
+                --arg t "$time" \
+                --argjson w "$weekday" \
+                --argjson k "$keep" \
+                '{
+                    sql_enabled:$e,
+                    sql_schedule:$s,
+                    sql_time:$t,
+                    sql_weekday:$w,
+                    sql_keep:$k
+                }'
+        )"
+
+        was_enabled="false"
+        if [ -f "$BACKUP_CONFIG" ]; then
+            was_enabled="$(jq -r '.sql_enabled // false' "$BACKUP_CONFIG" 2>/dev/null || echo false)"
+        fi
+
+        json_write_backup_settings sql "$clean"
+
+        if [ "$enabled" = "true" ] && [ "$was_enabled" != "true" ]; then
+            python3 - "$BACKUP_CONFIG" <<'PYBASE'
+from pathlib import Path
+import datetime, json, os, sys, tempfile
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+data['sql_last_run'] = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z')
+data['sql_last_status'] = 'scheduled'
+data['sql_last_detail'] = 'Schedule enabled; first automatic backup will run at the next scheduled interval.'
+fd, tmp = tempfile.mkstemp(prefix='.backup.', dir=str(path.parent))
+os.close(fd)
+Path(tmp).write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
+os.replace(tmp, path)
+os.chown(path, 0, 0)
+os.chmod(path, 0o644)
+PYBASE
+        fi
+
+        echo "SQL backup settings saved."
+        ;;
+
+
+    save-update-settings)
+        payload="$(cat)"
+
+        enabled="$(
+            jq -r '.kopia_auto_update // false' <<<"$payload"
+        )"
+
+        schedule="$(
+            jq -r '.kopia_update_schedule // "weekly"' <<<"$payload"
+        )"
+
+        time="$(
+            jq -r '.kopia_update_time // "04:30"' <<<"$payload"
+        )"
+
+        weekday="$(
+            jq -r '.kopia_update_weekday // 0' <<<"$payload"
+        )"
+
+        [[ "$enabled" == "true" \
+            || "$enabled" == "false" ]] || {
+
+            echo \
+                "Invalid update enabled value." \
+                >&2
+            exit 14
+        }
+
+        [[ "$schedule" =~ ^(daily|weekly)$ ]] || {
+            echo \
+                "Invalid Kopia update schedule." \
+                >&2
+            exit 15
+        }
+
+        [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || {
+            echo \
+                "Invalid Kopia update time." \
+                >&2
+            exit 16
+        }
+
+        if [ "$schedule" = "weekly" ]; then
+            [[ "$weekday" =~ ^[0-6]$ ]] || {
+                echo "Invalid weekday." >&2
+                exit 17
+            }
+        fi
+
+        clean="$(
+            jq -n \
+                --argjson e "$enabled" \
+                --arg s "$schedule" \
+                --arg t "$time" \
+                --argjson w "$weekday" \
+                '{
+                    kopia_auto_update:$e,
+                    kopia_update_schedule:$s,
+                    kopia_update_time:$t,
+                    kopia_update_weekday:$w
+                }'
+        )"
+
+        json_write_backup_settings update "$clean"
+
+        echo "Kopia update settings saved."
+        ;;
+
+
+    sql-backup-now)
+        exec /usr/local/sbin/everlomp-sql-backup
+        ;;
+
+
+    *)
+        echo \
+            "Usage: everlomp-backup {repair-state-permissions|configure-kopia|prepare-kopia-build|reconnect-kopia|repair-kopia-route|enable-kopia|disable-kopia|test-offsite-connection|save-offsite-settings|sync-kopia-now|save-sql-settings|save-update-settings|sql-backup-now}" \
+            >&2
+        exit 64
+        ;;
+esac

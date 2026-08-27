@@ -1,0 +1,94 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG="/home/everlomp/backup.json"
+STATE_LOCK="/run/everlomp-backup-scheduler.lock"
+
+exec 9>"$STATE_LOCK"
+flock -n 9 || exit 0
+
+NOW_EPOCH="$(date +%s)"
+NOW_HM="$(date +%H:%M)"
+NOW_DATE="$(date +%F)"
+NOW_WDAY="$(date +%w)"
+
+iso_epoch() {
+    local value="$1"
+    [ -n "$value" ] && [ "$value" != "null" ] || { echo 0; return; }
+    date -d "$value" +%s 2>/dev/null || echo 0
+}
+
+sql_enabled=false
+if [ -f "$CONFIG" ]; then
+    sql_enabled="$(jq -r '.sql_enabled // false' "$CONFIG" 2>/dev/null || echo false)"
+fi
+if [ "$sql_enabled" = "true" ]; then
+    schedule="$(jq -r '.sql_schedule // "daily"' "$CONFIG")"
+    target_hm="$(jq -r '.sql_time // "02:30"' "$CONFIG")"
+    target_wday="$(jq -r '.sql_weekday // 0' "$CONFIG")"
+    last_iso="$(jq -r '.sql_last_run // empty' "$CONFIG")"
+    last_epoch="$(iso_epoch "$last_iso")"
+    due=false
+
+    case "$schedule" in
+        hourly)
+            [ $((NOW_EPOCH - last_epoch)) -ge 3600 ] && due=true
+            ;;
+        every6h)
+            [ $((NOW_EPOCH - last_epoch)) -ge 21600 ] && due=true
+            ;;
+        every12h)
+            [ $((NOW_EPOCH - last_epoch)) -ge 43200 ] && due=true
+            ;;
+        daily)
+            last_date="$(date -d "@$last_epoch" +%F 2>/dev/null || echo never)"
+            if [ "$last_date" != "$NOW_DATE" ] && [[ "$NOW_HM" > "$target_hm" || "$NOW_HM" = "$target_hm" ]]; then
+                due=true
+            fi
+            ;;
+        weekly)
+            if [ "$NOW_WDAY" = "$target_wday" ] && [[ "$NOW_HM" > "$target_hm" || "$NOW_HM" = "$target_hm" ]] && [ $((NOW_EPOCH - last_epoch)) -ge 518400 ]; then
+                due=true
+            fi
+            ;;
+    esac
+
+    if [ "$due" = "true" ]; then
+        /usr/local/sbin/everlomp-sql-backup || true
+    fi
+fi
+
+if [ -x /usr/local/sbin/everlomp-kopia-replication ]; then
+    /usr/sbin/runuser -u everlomp -- /usr/local/sbin/everlomp-kopia-replication run-due || true
+fi
+
+update_enabled=false
+if [ -f "$CONFIG" ]; then
+    update_enabled="$(jq -r '.kopia_auto_update // false' "$CONFIG" 2>/dev/null || echo false)"
+fi
+if [ "$update_enabled" = "true" ]; then
+    schedule="$(jq -r '.kopia_update_schedule // "weekly"' "$CONFIG")"
+    target_hm="$(jq -r '.kopia_update_time // "04:30"' "$CONFIG")"
+    target_wday="$(jq -r '.kopia_update_weekday // 0' "$CONFIG")"
+    last_iso="$(jq -r '.kopia_update_last_run // empty' "$CONFIG")"
+    last_epoch="$(iso_epoch "$last_iso")"
+    due=false
+
+    case "$schedule" in
+        daily)
+            last_date="$(date -d "@$last_epoch" +%F 2>/dev/null || echo never)"
+            if [ "$last_date" != "$NOW_DATE" ] && [[ "$NOW_HM" > "$target_hm" || "$NOW_HM" = "$target_hm" ]]; then
+                due=true
+            fi
+            ;;
+        weekly)
+            if [ "$NOW_WDAY" = "$target_wday" ] && [[ "$NOW_HM" > "$target_hm" || "$NOW_HM" = "$target_hm" ]] && [ $((NOW_EPOCH - last_epoch)) -ge 518400 ]; then
+                due=true
+            fi
+            ;;
+    esac
+
+    if [ "$due" = "true" ]; then
+        /usr/local/sbin/everlomp-kopia-update || true
+    fi
+fi

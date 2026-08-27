@@ -1,0 +1,742 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${1:-}"
+BASE_URL="/kopia/"
+PATCHER="/usr/local/sbin/kopia-htmlui-patch.py"
+STATE_DIR="/var/www/.everlomp/kopia-runtime"
+STATE_FILE="$STATE_DIR/kopia-custom.json"
+KOPIA_BINARY="/usr/local/bin/kopia"
+PERSISTENT_BINARY="$STATE_DIR/kopia"
+
+log() {
+    printf '[Everlomp Kopia Build] %s\n' "$*" >&2
+}
+
+normalize_version() {
+    printf '%s\n' "$1" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+        | head -n1
+}
+
+installed_version() {
+    local raw=""
+
+    if [ -x "$KOPIA_BINARY" ]; then
+        raw="$("$KOPIA_BINARY" --version 2>/dev/null | head -n1 || true)"
+    fi
+
+    normalize_version "$raw"
+}
+
+latest_version() {
+    local requested="${EVERLOMP_KOPIA_VERSION:-}"
+    local metadata
+    local version
+
+    if [ -n "$requested" ]; then
+        version="$(normalize_version "$requested")"
+        [ -n "$version" ] || {
+            log "EVERLOMP_KOPIA_VERSION is invalid: $requested"
+            return 1
+        }
+        printf '%s\n' "$version"
+        return 0
+    fi
+
+    log "Resolving latest stable Kopia release from GitHub."
+    metadata="$(
+        curl -fsSL \
+            --retry 3 \
+            --retry-delay 1 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: Everlomp-Kopia-Custom-Builder' \
+            https://api.github.com/repos/kopia/kopia/releases/latest
+    )"
+
+    version="$(
+        printf '%s' "$metadata" \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin).get("tag_name", ""))' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+            | head -n1
+    )"
+
+    [ -n "$version" ] || {
+        log "Could not resolve the latest stable Kopia release."
+        return 1
+    }
+
+    printf '%s\n' "$version"
+}
+
+resolve_htmlui_source_sha() {
+    local version="$1"
+    local go_mod
+    local build_version
+    local build_commit
+    local metadata
+    local source_sha
+
+    log "Resolving official HTMLUI source for Kopia v${version}."
+
+    go_mod="$(
+        curl -fsSL \
+            --retry 3 \
+            --retry-delay 1 \
+            "https://raw.githubusercontent.com/kopia/kopia/v${version}/go.mod"
+    )"
+
+    build_version="$(
+        printf '%s\n' "$go_mod" \
+            | awk '$1 == "github.com/kopia/htmluibuild" {print $2; exit}'
+    )"
+
+    build_commit="$(
+        printf '%s\n' "$build_version" \
+            | sed -nE 's/.*-([0-9a-f]{12,40})$/\1/p'
+    )"
+
+    if [ -z "$build_commit" ]; then
+        log "Could not resolve github.com/kopia/htmluibuild from Kopia v${version}."
+        return 1
+    fi
+
+    metadata="$(
+        curl -fsSL \
+            --retry 3 \
+            --retry-delay 1 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: Everlomp-Kopia-Custom-Builder' \
+            "https://api.github.com/repos/kopia/htmluibuild/commits/${build_commit}"
+    )"
+
+    source_sha="$(
+        printf '%s' "$metadata" \
+            | python3 -c '
+import json, re, sys
+obj = json.load(sys.stdin)
+message = obj.get("commit", {}).get("message", "")
+patterns = [
+    r"github\.com/kopia/htmlui/commit/([0-9a-f]{40})",
+    r"\bhtmlui\b[^0-9a-f]+([0-9a-f]{40})\b",
+]
+for p in patterns:
+    m = re.search(p, message, re.I)
+    if m:
+        print(m.group(1))
+        break
+'
+    )"
+
+    if [ -z "$source_sha" ]; then
+        log "htmluibuild ${build_commit} did not reveal its htmlui source SHA."
+        return 1
+    fi
+
+    log "Kopia v${version}: htmluibuild=${build_commit}, htmlui=${source_sha}."
+    printf '%s\n' "$source_sha"
+}
+
+download_htmlui() {
+    local sha="$1"
+    local target="$2"
+
+    mkdir -p "$target"
+
+    log "Downloading official kopia/htmlui source ${sha}."
+    curl -fsSL \
+        --retry 3 \
+        --retry-delay 1 \
+        "https://codeload.github.com/kopia/htmlui/tar.gz/${sha}" \
+        | tar -xz --strip-components=1 -C "$target"
+}
+
+download_kopia() {
+    local version="$1"
+    local target="$2"
+
+    log "Downloading official Kopia source v${version}."
+    git clone \
+        --quiet \
+        --depth 1 \
+        --branch "v${version}" \
+        https://github.com/kopia/kopia.git \
+        "$target"
+}
+
+
+local_archive_root() {
+    local archive="$1"
+
+    [ -f "$archive" ] || {
+        log "Local source archive does not exist: $archive"
+        return 1
+    }
+
+    tar -tzf "$archive" 2>/dev/null \
+        | awk -F/ 'NF && $1 != "" && $1 != "." {print $1; exit}'
+}
+
+local_source_version() {
+    local kopia_archive="$1"
+    local root
+    local version
+
+    root="$(local_archive_root "$kopia_archive")" || return 1
+    version="$(normalize_version "$root")"
+
+    [ -n "$version" ] || {
+        log "Could not determine Kopia version from local archive root: $root"
+        return 1
+    }
+
+    printf '%s\n' "$version"
+}
+
+local_htmlui_sha() {
+    local htmlui_archive="$1"
+    local root
+    local sha
+
+    root="$(local_archive_root "$htmlui_archive")" || return 1
+    sha="$(
+        printf '%s\n' "$root" \
+            | sed -nE 's/^htmlui-([0-9a-fA-F]{7,40})$/\1/p' \
+            | tr 'A-F' 'a-f'
+    )"
+
+    if [ -z "$sha" ]; then
+        sha="local"
+    fi
+
+    printf '%s\n' "$sha"
+}
+
+extract_local_sources() {
+    local kopia_archive="$1"
+    local htmlui_archive="$2"
+    local kopia_target="$3"
+    local htmlui_target="$4"
+    local version
+    local htmlui_sha
+
+    [ -f "$kopia_archive" ] || {
+        log "Local Kopia source archive does not exist: $kopia_archive"
+        return 1
+    }
+    [ -f "$htmlui_archive" ] || {
+        log "Local HTMLUI source archive does not exist: $htmlui_archive"
+        return 1
+    }
+
+    version="$(local_source_version "$kopia_archive")" || return 1
+    htmlui_sha="$(local_htmlui_sha "$htmlui_archive")" || return 1
+
+    mkdir -p "$kopia_target" "$htmlui_target"
+
+    log "Extracting bundled Kopia source v${version}."
+    tar -xzf "$kopia_archive" --strip-components=1 -C "$kopia_target"
+
+    log "Extracting bundled Kopia HTMLUI source ${htmlui_sha}."
+    tar -xzf "$htmlui_archive" --strip-components=1 -C "$htmlui_target"
+
+    [ -f "$kopia_target/go.mod" ] || {
+        log "Local Kopia source is missing go.mod."
+        return 1
+    }
+    [ -f "$htmlui_target/package.json" ] || {
+        log "Local HTMLUI source is missing package.json."
+        return 1
+    }
+
+    printf '%s\t%s\n' "$version" "$htmlui_sha"
+}
+
+build_htmlui() {
+    local version="$1"
+    local source_sha="$2"
+    local source="$3"
+    local output="$4"
+    local source_mode="${5:-download}"
+
+    if [ "$source_mode" = "download" ]; then
+        download_htmlui "$source_sha" "$source"
+    elif [ "$source_mode" != "local" ]; then
+        log "Unknown HTMLUI source mode: $source_mode"
+        return 9
+    fi
+
+    python3 "$PATCHER" app "$source"
+
+    log "Installing HTMLUI npm dependencies."
+    (
+        cd "$source"
+        npm ci --no-audit --no-fund
+    )
+
+    log "Building HTMLUI for ${BASE_URL}."
+    (
+        cd "$source"
+        VITE_FULL_VERSION_INFO="v${version}" \
+            npm run build -- --base="$BASE_URL"
+    )
+
+    local built=""
+    if [ -f "$source/build/index.html" ]; then
+        built="$source/build"
+    elif [ -f "$source/dist/index.html" ]; then
+        built="$source/dist"
+    else
+        log "Vite completed but no build/index.html or dist/index.html exists."
+        return 10
+    fi
+
+    rm -rf "$output"
+    mkdir -p "$output"
+    cp -a "$built"/. "$output"/
+
+    python3 "$PATCHER" \
+        bundle-router \
+        "$output" \
+        "$BASE_URL"
+
+    python3 - "$output/index.html" "$version" "$source_sha" <<'PY'
+from pathlib import Path
+import html
+import sys
+
+path = Path(sys.argv[1])
+version = sys.argv[2]
+sha = sys.argv[3]
+
+text = path.read_text()
+marker = (
+    '<meta name="everlomp-kopia-base" content="/kopia/" '
+    f'data-kopia-version="{html.escape(version)}" '
+    f'data-htmlui-sha="{html.escape(sha)}">'
+)
+
+if 'name="everlomp-kopia-base"' not in text:
+    if "</head>" not in text:
+        raise SystemExit("built index.html has no </head>")
+    text = text.replace("</head>", "  " + marker + "\n</head>", 1)
+
+path.write_text(text)
+PY
+
+    grep -q 'name="everlomp-kopia-base"' "$output/index.html" || {
+        log "Custom HTMLUI marker was not added."
+        return 11
+    }
+
+    grep -q '/kopia/' "$output/index.html" || {
+        log "Built index.html does not contain /kopia/."
+        return 12
+    }
+
+    if ! grep -Rqs --include='*.js' '/kopia/' "$output"; then
+        log "Built JavaScript does not contain /kopia/."
+        return 13
+    fi
+}
+
+make_htmluibuild_module() {
+    local kopia_source="$1"
+    local ui_dist="$2"
+    local module="$3"
+
+    local go_version
+    go_version="$(
+        awk '$1 == "go" {print $2; exit}' "$kopia_source/go.mod"
+    )"
+    [ -n "$go_version" ] || go_version="1.25.0"
+
+    rm -rf "$module"
+    mkdir -p "$module/dist"
+    cp -a "$ui_dist"/. "$module/dist"/
+
+    cat > "$module/go.mod" <<EOF
+module github.com/kopia/htmluibuild
+
+go ${go_version}
+EOF
+
+    cat > "$module/htmlui.go" <<'EOF'
+package htmluibuild
+
+import (
+    "embed"
+    "io/fs"
+    "net/http"
+)
+
+//go:embed all:dist
+var embedded embed.FS
+
+func AssetFile() http.FileSystem {
+    sub, err := fs.Sub(embedded, "dist")
+    if err != nil {
+        panic(err)
+    }
+
+    return http.FS(sub)
+}
+EOF
+}
+
+verify_binary() {
+    local binary="$1"
+    local expected_version="${2:-}"
+
+    [ -x "$binary" ] || {
+        log "Custom Kopia binary is not executable: $binary"
+        return 20
+    }
+
+    if ! grep -aq 'everlomp-kopia-base' "$binary"; then
+        log "Binary does not contain the Everlomp HTMLUI marker."
+        return 21
+    fi
+
+    if ! grep -aq '/kopia/' "$binary"; then
+        log "Binary does not contain the /kopia/ public base."
+        return 22
+    fi
+
+    local shown
+    shown="$("$binary" --version 2>/dev/null | head -n1 || true)"
+    log "Custom binary reports: ${shown:-unknown version}"
+
+    if [ -n "$expected_version" ]; then
+        local normalized
+        normalized="$(normalize_version "$shown")"
+        if [ -n "$normalized" ] && [ "$normalized" != "$expected_version" ]; then
+            log "WARNING: binary reports ${normalized}; package/source target is ${expected_version}."
+        fi
+    fi
+}
+
+find_built_binary() {
+    local work="$1"
+    local gobin="$2"
+
+    if [ -x "$gobin/kopia" ]; then
+        printf '%s\n' "$gobin/kopia"
+        return 0
+    fi
+
+    local found
+    found="$(
+        find "$work" \
+            -type f \
+            -name kopia \
+            -perm /111 \
+            -print \
+            2>/dev/null \
+            | head -n1
+    )"
+
+    [ -n "$found" ] || return 1
+    printf '%s\n' "$found"
+}
+
+build_custom() {
+    local requested="$1"
+    local output="$2"
+    local local_kopia_archive="${3:-}"
+    local local_htmlui_archive="${4:-}"
+
+    local version
+    version="$(normalize_version "$requested")"
+    [ -n "$version" ] || {
+        log "Invalid Kopia version: $requested"
+        return 30
+    }
+
+    [ -x "$PATCHER" ] || {
+        log "Missing patcher: $PATCHER"
+        return 31
+    }
+
+    command -v node >/dev/null
+    command -v npm >/dev/null
+    command -v git >/dev/null
+    command -v go >/dev/null
+    command -v make >/dev/null
+
+    local work
+    work="$(mktemp -d /tmp/everlomp-kopia-custom.XXXXXX)"
+    trap 'rm -rf "$work"' RETURN
+
+    local htmlui_sha
+    local htmlui_source_mode="download"
+
+    mkdir -p \
+        "$work/htmlui" \
+        "$work/ui-dist" \
+        "$work/bin" \
+        "$work/gopath" \
+        "$work/gocache" \
+        "$work/npm-cache" \
+        "$work/home"
+
+    if [ -n "$local_kopia_archive" ] || [ -n "$local_htmlui_archive" ]; then
+        [ -n "$local_kopia_archive" ] && [ -n "$local_htmlui_archive" ] || {
+            log "Both local Kopia and HTMLUI source archives are required."
+            return 32
+        }
+
+        local source_meta source_version source_htmlui_sha
+        source_meta="$(
+            extract_local_sources \
+                "$local_kopia_archive" \
+                "$local_htmlui_archive" \
+                "$work/kopia" \
+                "$work/htmlui"
+        )" || return 32
+        IFS=$'\t' read -r source_version source_htmlui_sha <<<"$source_meta"
+
+        if [ "$source_version" != "$version" ]; then
+            log "Local Kopia source version ${source_version} does not match requested ${version}."
+            return 32
+        fi
+
+        htmlui_sha="$source_htmlui_sha"
+        htmlui_source_mode="local"
+        log "Using bundled Kopia v${version} and bundled HTMLUI source ${htmlui_sha}."
+    else
+        htmlui_sha="${KOPIA_HTMLUI_SOURCE_SHA:-}"
+        if [ -z "$htmlui_sha" ]; then
+            htmlui_sha="$(resolve_htmlui_source_sha "$version")"
+        fi
+
+        case "$htmlui_sha" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+            *)
+                log "Invalid HTMLUI source SHA: $htmlui_sha"
+                return 32
+                ;;
+        esac
+    fi
+
+    export HOME="$work/home"
+    export GOPATH="$work/gopath"
+    export GOCACHE="$work/gocache"
+    export NPM_CONFIG_CACHE="$work/npm-cache"
+
+    build_htmlui \
+        "$version" \
+        "$htmlui_sha" \
+        "$work/htmlui" \
+        "$work/ui-dist" \
+        "$htmlui_source_mode"
+
+    if [ -z "$local_kopia_archive" ]; then
+        download_kopia "$version" "$work/kopia"
+    fi
+
+    if ! grep -q 'github.com/kopia/htmluibuild' "$work/kopia/go.mod"; then
+        log "Kopia v${version} no longer declares github.com/kopia/htmluibuild."
+        return 33
+    fi
+
+    make_htmluibuild_module \
+        "$work/kopia" \
+        "$work/ui-dist" \
+        "$work/htmluibuild"
+
+    log "Replacing Kopia's htmluibuild dependency with Everlomp's matching build."
+    (
+        cd "$work/kopia"
+        GOTOOLCHAIN=auto \
+            go mod edit \
+            -replace="github.com/kopia/htmluibuild=$work/htmluibuild"
+    )
+
+    if ! grep -q "^replace github.com/kopia/htmluibuild => $work/htmluibuild" \
+        "$work/kopia/go.mod"; then
+        log "go.mod replacement for htmluibuild did not verify."
+        return 34
+    fi
+
+    log "Building full Kopia v${version} with its native UI server."
+
+    (
+        cd "$work/kopia"
+        HOME="$work/home" \
+        GOPATH="$work/gopath" \
+        GOBIN="$work/bin" \
+        GOTOOLCHAIN=auto \
+        CGO_ENABLED=0 \
+        make install KOPIA_VERSION_NO_PREFIX="$version" GITHUB_REPOSITORY="kopia/kopia"
+    )
+
+    local built
+    built="$(find_built_binary "$work" "$work/bin" || true)"
+    if [ -z "$built" ]; then
+        log "Kopia make install completed but no isolated kopia executable was found."
+        return 35
+    fi
+
+    verify_binary "$built" "$version"
+
+    mkdir -p "$(dirname "$output")"
+    install -m 0755 "$built" "$output"
+
+    cat > "${output}.everlomp.json" <<EOF
+{
+  "kopia_version": "${version}",
+  "htmlui_source_sha": "${htmlui_sha}",
+  "public_base": "/kopia/",
+  "ui_delivery": "embedded-native-kopia"
+}
+EOF
+
+    log "Built custom Kopia v${version}: $output"
+}
+
+write_state() {
+    local version="$1"
+    local metadata_source="${2:-}"
+
+    install -d -o root -g nogroup -m 0750 "$STATE_DIR"
+
+    if [ -n "$metadata_source" ] && [ -f "$metadata_source" ]; then
+        install -m 0644 "$metadata_source" "$STATE_FILE"
+        return
+    fi
+
+    cat > "$STATE_FILE" <<EOF
+{
+  "kopia_version": "${version}",
+  "public_base": "/kopia/",
+  "ui_delivery": "embedded-native-kopia"
+}
+EOF
+    chmod 0644 "$STATE_FILE"
+}
+
+install_binary() {
+    local source="$1"
+    local version="$2"
+
+    verify_binary "$source" "$version"
+
+    local tmp="${KOPIA_BINARY}.everlomp-new.$$"
+    install -m 0755 "$source" "$tmp"
+    mv -f "$tmp" "$KOPIA_BINARY"
+
+    install -d -o root -g nogroup -m 0750 "$STATE_DIR"
+    install -m 0755 "$KOPIA_BINARY" "$PERSISTENT_BINARY"
+
+    ln -sfn "$KOPIA_BINARY" /usr/bin/kopia
+
+    write_state "$version" "${source}.everlomp.json"
+
+    verify_binary "$KOPIA_BINARY" "$version"
+    verify_binary "$PERSISTENT_BINARY" "$version"
+    verify_binary /usr/bin/kopia "$version"
+    log "Installed custom embedded-HTMLUI Kopia v${version}."
+}
+
+install_current() {
+    local version
+    version="$(latest_version)"
+
+    [ -n "$version" ] || {
+        log "Could not resolve a Kopia release to build."
+        return 40
+    }
+
+    local work
+    work="$(mktemp -d /tmp/everlomp-kopia-install.XXXXXX)"
+    trap 'rm -rf "$work"' RETURN
+
+    build_custom "$version" "$work/kopia"
+    install_binary "$work/kopia" "$version"
+}
+
+case "$ACTION" in
+    build)
+        version="${2:-}"
+        output="${3:-}"
+        [ -n "$version" ] && [ -n "$output" ] || {
+            echo "Usage: $0 build VERSION OUTPUT" >&2
+            exit 64
+        }
+        build_custom "$version" "$output"
+        ;;
+
+    build-local)
+        kopia_archive="${2:-}"
+        htmlui_archive="${3:-}"
+        output="${4:-}"
+        [ -n "$kopia_archive" ] && [ -n "$htmlui_archive" ] && [ -n "$output" ] || {
+            echo "Usage: $0 build-local KOPIA_SOURCE_TAR HTMLUI_SOURCE_TAR OUTPUT" >&2
+            exit 64
+        }
+        version="$(local_source_version "$kopia_archive")"
+        build_custom "$version" "$output" "$kopia_archive" "$htmlui_archive"
+        ;;
+
+    local-version)
+        kopia_archive="${2:-}"
+        [ -n "$kopia_archive" ] || {
+            echo "Usage: $0 local-version KOPIA_SOURCE_TAR" >&2
+            exit 64
+        }
+        local_source_version "$kopia_archive"
+        ;;
+
+    install)
+        source="${2:-}"
+        version="${3:-}"
+        [ -n "$source" ] || {
+            echo "Usage: $0 install BINARY [VERSION]" >&2
+            exit 64
+        }
+        if [ -z "$version" ]; then
+            version="$(normalize_version "$("$source" --version 2>/dev/null | head -n1 || true)")"
+        else
+            version="$(normalize_version "$version")"
+        fi
+        [ -n "$version" ] || {
+            log "Could not determine version for $source."
+            exit 65
+        }
+        install_binary "$source" "$version"
+        ;;
+
+    install-current)
+        install_current
+        ;;
+
+    verify)
+        binary="${2:-$KOPIA_BINARY}"
+        version="${3:-}"
+        verify_binary "$binary" "$(normalize_version "$version")"
+        ;;
+
+    installed-version)
+        installed_version
+        ;;
+
+    latest-version)
+        latest_version
+        ;;
+
+    *)
+        cat >&2 <<EOF
+Usage:
+  $0 install-current
+  $0 build VERSION OUTPUT
+  $0 build-local KOPIA_SOURCE_TAR HTMLUI_SOURCE_TAR OUTPUT
+  $0 local-version KOPIA_SOURCE_TAR
+  $0 install BINARY [VERSION]
+  $0 verify [BINARY] [VERSION]
+  $0 installed-version
+  $0 latest-version
+EOF
+        exit 64
+        ;;
+esac

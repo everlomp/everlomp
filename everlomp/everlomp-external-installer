@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path, PurePosixPath
+
+HOME = Path('/home/everlomp')
+PACKAGES = HOME / 'external-installs'
+PRIMARY = HOME / 'primary-app'
+MAX_ZIP = 10 * 1024 * 1024
+MAX_EXPANDED = 50 * 1024 * 1024
+MAX_FILES = 200
+ID_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,63}$')
+FIELD_RE = re.compile(r'^[a-z][a-z0-9_]{0,39}$')
+ALLOWED_FIELD_TYPES = {'text', 'email', 'password', 'url', 'number', 'checkbox', 'select', 'textarea'}
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f'[Everlomp] ERROR: {message}', file=sys.stderr)
+    raise SystemExit(code)
+
+
+def read_stdin_limited(limit: int) -> bytes:
+    data = sys.stdin.buffer.read(limit + 1)
+    if len(data) > limit:
+        fail(f'External installer ZIP exceeds the {limit // (1024 * 1024)} MiB upload limit.', 10)
+    return data
+
+
+def validate_manifest(data: object, expected_id: str | None = None) -> dict:
+    if not isinstance(data, dict):
+        fail('manifest.json must contain a JSON object.', 20)
+
+    if data.get('schema') != 1:
+        fail('manifest.json must use schema 1.', 21)
+
+    package_id = str(data.get('id', '')).strip()
+    if not ID_RE.fullmatch(package_id):
+        fail('Manifest id must match ^[a-z0-9][a-z0-9-]{0,63}$.', 22)
+    if expected_id is not None and package_id != expected_id:
+        fail('Manifest id does not match the installed package directory.', 23)
+
+    name = str(data.get('name', '')).strip()
+    if not name or len(name) > 80:
+        fail('Manifest name is required and must be 80 characters or fewer.', 24)
+
+    version = str(data.get('version', '')).strip()
+    if version and len(version) > 40:
+        fail('Manifest version must be 40 characters or fewer.', 25)
+
+    description = str(data.get('description', '')).strip()
+    if len(description) > 600:
+        fail('Manifest description must be 600 characters or fewer.', 26)
+
+    if data.get('type', 'primary') != 'primary':
+        fail('External installer schema 1 currently supports only type "primary".', 27)
+
+    entrypoint = str(data.get('entrypoint', 'install.sh')).strip()
+    if entrypoint != 'install.sh':
+        fail('External installer schema 1 requires entrypoint "install.sh".', 28)
+
+    site_path = str(data.get('site_path', '/')).strip() or '/'
+    site_parts = PurePosixPath(site_path).parts
+    if (not site_path.startswith('/') or '\\' in site_path or '\x00' in site_path
+            or '..' in site_parts or '?' in site_path or '#' in site_path):
+        fail('Manifest site_path must be a safe absolute web path beginning with /.', 29)
+
+    requires = data.get('requires', {})
+    if requires is None:
+        requires = {}
+    if not isinstance(requires, dict):
+        fail('Manifest requires must be an object.', 30)
+    allowed_requires = {'database', 'openlitespeed_password', 'real_ip', 'domain'}
+    for key, value in requires.items():
+        if key not in allowed_requires or not isinstance(value, bool):
+            fail(f'Unsupported or invalid requirement: {key}', 31)
+
+    fields = data.get('fields', [])
+    if fields is None:
+        fields = []
+    if not isinstance(fields, list) or len(fields) > 20:
+        fail('Manifest fields must be an array containing at most 20 fields.', 32)
+
+    seen = set()
+    clean_fields = []
+    for field in fields:
+        if not isinstance(field, dict):
+            fail('Every manifest field must be an object.', 33)
+        field_name = str(field.get('name', '')).strip()
+        if not FIELD_RE.fullmatch(field_name) or field_name in seen:
+            fail(f'Invalid or duplicate field name: {field_name or "(empty)"}', 34)
+        seen.add(field_name)
+        field_type = str(field.get('type', 'text')).strip()
+        if field_type not in ALLOWED_FIELD_TYPES:
+            fail(f'Unsupported field type for {field_name}: {field_type}', 35)
+        label = str(field.get('label', field_name)).strip()
+        if not label or len(label) > 80:
+            fail(f'Field label for {field_name} must be 1-80 characters.', 36)
+        if 'required' in field and not isinstance(field['required'], bool):
+            fail(f'Field required flag for {field_name} must be boolean.', 37)
+        help_text = str(field.get('help', '')).strip()
+        if len(help_text) > 300:
+            fail(f'Field help text for {field_name} is too long.', 38)
+        max_length = field.get('max_length', 5000)
+        if not isinstance(max_length, int) or max_length < 1 or max_length > 10000:
+            fail(f'Field max_length for {field_name} must be 1-10000.', 39)
+        options = field.get('options', [])
+        if field_type == 'select':
+            if not isinstance(options, list) or not (1 <= len(options) <= 50):
+                fail(f'Select field {field_name} must define 1-50 options.', 40)
+            clean_options = []
+            for option in options:
+                if isinstance(option, str):
+                    value = label_text = option
+                elif isinstance(option, dict):
+                    value = str(option.get('value', ''))
+                    label_text = str(option.get('label', value))
+                else:
+                    fail(f'Invalid select option in {field_name}.', 41)
+                if not value or len(value) > 120 or len(label_text) > 120:
+                    fail(f'Invalid select option in {field_name}.', 42)
+                clean_options.append({'value': value, 'label': label_text})
+            field = dict(field)
+            field['options'] = clean_options
+        clean_fields.append(field)
+
+    cleaned = dict(data)
+    cleaned['id'] = package_id
+    cleaned['name'] = name
+    cleaned['version'] = version
+    cleaned['description'] = description
+    cleaned['type'] = 'primary'
+    cleaned['entrypoint'] = 'install.sh'
+    cleaned['site_path'] = site_path
+    cleaned['requires'] = requires
+    cleaned['fields'] = clean_fields
+    return cleaned
+
+
+def safe_zip_member(info: zipfile.ZipInfo) -> bool:
+    name = info.filename
+    if not name or '\x00' in name or '\\' in name:
+        return False
+    path = PurePosixPath(name)
+    if path.is_absolute() or '..' in path.parts:
+        return False
+    mode = (info.external_attr >> 16) & 0o177777
+    if mode and stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR):
+        return False
+    if mode and stat.S_ISLNK(mode):
+        return False
+    return True
+
+
+def locate_package_root(stage: Path) -> Path:
+    if (stage / 'manifest.json').is_file():
+        return stage
+    children = [p for p in stage.iterdir() if p.name not in {'.DS_Store', '__MACOSX'}]
+    dirs = [p for p in children if p.is_dir()]
+    files = [p for p in children if p.is_file()]
+    if not files and len(dirs) == 1 and (dirs[0] / 'manifest.json').is_file():
+        return dirs[0]
+    fail('ZIP must contain manifest.json at its root, or inside one top-level package directory.', 50)
+
+
+def import_package() -> None:
+    raw = read_stdin_limited(MAX_ZIP)
+    if not raw:
+        fail('No ZIP data was received.', 11)
+
+    PACKAGES.mkdir(parents=True, exist_ok=True)
+    os.chmod(PACKAGES, 0o755)
+
+    with tempfile.TemporaryDirectory(prefix='.external-import-', dir=str(HOME)) as temp_dir:
+        temp = Path(temp_dir)
+        zip_path = temp / 'package.zip'
+        zip_path.write_bytes(raw)
+        stage = temp / 'stage'
+        stage.mkdir()
+
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                infos = archive.infolist()
+                if not infos or len(infos) > MAX_FILES:
+                    fail(f'ZIP must contain between 1 and {MAX_FILES} entries.', 12)
+                total = 0
+                for info in infos:
+                    if not safe_zip_member(info):
+                        fail(f'ZIP contains an unsafe path or special file: {info.filename}', 13)
+                    total += int(info.file_size)
+                    if total > MAX_EXPANDED:
+                        fail(f'Expanded ZIP exceeds the {MAX_EXPANDED // (1024 * 1024)} MiB limit.', 14)
+                archive.extractall(stage)
+        except zipfile.BadZipFile:
+            fail('Uploaded file is not a valid ZIP archive.', 15)
+
+        root = locate_package_root(stage)
+        manifest_path = root / 'manifest.json'
+        if manifest_path.stat().st_size > 128 * 1024:
+            fail('manifest.json may not exceed 128 KiB.', 44)
+        terms_path = root / 'terms.md'
+        if terms_path.exists() and terms_path.stat().st_size > 256 * 1024:
+            fail('terms.md may not exceed 256 KiB.', 45)
+        try:
+            manifest = validate_manifest(json.loads(manifest_path.read_text(encoding='utf-8')))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            fail(f'Could not read manifest.json: {exc}', 16)
+
+        package_id = manifest['id']
+        target = PACKAGES / package_id
+        if target.exists() or target.is_symlink():
+            fail(f'An external installer with id "{package_id}" already exists.', 17)
+
+        install_script = root / 'install.sh'
+        if not install_script.is_file() or install_script.is_symlink():
+            fail('Package must contain a regular install.sh file.', 18)
+        if install_script.stat().st_size > 1024 * 1024:
+            fail('install.sh may not exceed 1 MiB.', 19)
+
+        # Normalize the validated manifest before storing it.
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+        shutil.copytree(root, target, symlinks=False)
+        for path in target.rglob('*'):
+            if path.is_symlink():
+                shutil.rmtree(target, ignore_errors=True)
+                fail('Package contains a symbolic link.', 43)
+            if path.is_dir():
+                os.chmod(path, 0o755)
+            elif path.name == 'install.sh':
+                os.chmod(path, 0o755)
+            else:
+                os.chmod(path, 0o644)
+        os.chmod(target, 0o755)
+
+    print(f'Imported external installer: {package_id}')
+
+
+def load_package(package_id: str) -> tuple[Path, dict]:
+    if not ID_RE.fullmatch(package_id):
+        fail('Invalid external installer package id.', 60)
+    root = PACKAGES / package_id
+    if not root.is_dir() or root.is_symlink():
+        fail('External installer package was not found.', 61)
+    manifest_file = root / 'manifest.json'
+    try:
+        manifest = validate_manifest(json.loads(manifest_file.read_text(encoding='utf-8')), package_id)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f'Could not read installed manifest.json: {exc}', 62)
+    return root, manifest
+
+
+def validate_field_values(manifest: dict, values: object) -> dict:
+    if not isinstance(values, dict):
+        fail('Installer fields payload must be an object.', 70)
+    result = {}
+    known = {f['name']: f for f in manifest.get('fields', [])}
+    for key in values:
+        if key not in known:
+            fail(f'Unknown installer field: {key}', 71)
+    for name, field in known.items():
+        field_type = str(field.get('type', 'text'))
+        required = bool(field.get('required', False))
+        value = values.get(name, field.get('default', False if field_type == 'checkbox' else ''))
+        if field_type == 'checkbox':
+            value = bool(value)
+            if required and not value:
+                fail(f'Required checkbox field is not accepted: {name}', 72)
+        else:
+            if isinstance(value, (dict, list)):
+                fail(f'Invalid value for installer field: {name}', 73)
+            value = str(value)
+            max_length = int(field.get('max_length', 5000))
+            if len(value) > max_length:
+                fail(f'Installer field is too long: {name}', 74)
+            if required and not value.strip():
+                fail(f'Required installer field is empty: {name}', 75)
+            if field_type == 'select':
+                allowed = {str(o.get('value', '')) for o in field.get('options', []) if isinstance(o, dict)}
+                if value not in allowed:
+                    fail(f'Invalid selection for installer field: {name}', 76)
+        result[name] = value
+    return result
+
+
+def install_package() -> None:
+    if PRIMARY.exists():
+        fail('A primary application is already installed.', 80)
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        fail(f'Invalid installer payload JSON: {exc}', 81)
+    if not isinstance(payload, dict):
+        fail('Installer payload must be a JSON object.', 82)
+    package_id = str(payload.get('package_id', '')).strip()
+    root, manifest = load_package(package_id)
+    fields = validate_field_values(manifest, payload.get('fields', {}))
+    script = root / 'install.sh'
+    if not script.is_file() or script.is_symlink():
+        fail('Package install.sh is missing or unsafe.', 83)
+
+    script_payload = {
+        'schema': 1,
+        'package_id': package_id,
+        'fields': fields,
+    }
+    env = {
+        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        'HOME': '/root',
+        'EVERLOMP_PACKAGE_ID': package_id,
+        'EVERLOMP_PACKAGE_DIR': str(root),
+    }
+    try:
+        result = subprocess.run(
+            [str(script)],
+            input=json.dumps(script_payload),
+            text=True,
+            cwd=str(root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=1800,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        fail('External installer exceeded the 30 minute execution limit.', 84)
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or '').strip()
+        if len(detail) > 4000:
+            detail = detail[-4000:]
+        fail(f'External installer failed with exit code {result.returncode}' + (f': {detail}' if detail else '.'), 85)
+
+    temp = PRIMARY.with_name('.primary-app.external.tmp')
+    temp.write_text(f'external:{package_id}\n', encoding='utf-8')
+    os.chmod(temp, 0o644)
+    os.replace(temp, PRIMARY)
+    print(f'Installed external primary application: {package_id}')
+
+
+def remove_package() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        fail(f'Invalid removal payload JSON: {exc}', 90)
+    if not isinstance(payload, dict):
+        fail('Removal payload must be a JSON object.', 91)
+    package_id = str(payload.get('package_id', '')).strip()
+    root, _ = load_package(package_id)
+    marker = PRIMARY.read_text(encoding='utf-8').strip() if PRIMARY.is_file() else ''
+    if marker == f'external:{package_id}':
+        fail('Cannot remove the installer package for the currently installed primary application.', 92)
+    shutil.rmtree(root)
+    print(f'Removed external installer: {package_id}')
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        fail('This helper must run as root.', 2)
+    if len(sys.argv) != 2 or sys.argv[1] not in {'import', 'install', 'remove'}:
+        print('Usage: everlomp-external-installer {import|install|remove}', file=sys.stderr)
+        raise SystemExit(1)
+    action = sys.argv[1]
+    if action == 'import':
+        import_package()
+    elif action == 'install':
+        install_package()
+    else:
+        remove_package()
+
+
+if __name__ == '__main__':
+    main()

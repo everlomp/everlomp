@@ -1,0 +1,424 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${1:-}"
+STATE_DIR="/var/www/.everlomp-filegator"
+APP_DIR="$STATE_DIR/app"
+INFO_FILE="$STATE_DIR/info.json"
+PHP_BIN="/usr/local/lsws/lsphp85/bin/php"
+DOWNLOAD_URL="https://github.com/filegator/static/raw/master/builds/filegator_latest.zip"
+LOCAL_ZIP="/home/everlomp/filegator_local.zip"
+VHOST_CONF="/usr/local/lsws/conf/vhosts/GPTCP1/vhconf.conf"
+OLS_BIN="/usr/local/lsws/bin/openlitespeed"
+OLS_CTL="/usr/local/lsws/bin/lswsctrl"
+
+if [ "$ACTION" != "install" ]; then
+    echo "Usage: everlomp-filegator install" >&2
+    exit 64
+fi
+
+install -d -o root -g nogroup -m 0710 "$STATE_DIR"
+
+if [ -e "$APP_DIR" ] || [ -e "$INFO_FILE" ]; then
+    echo "FileGator is already installed or has existing Everlomp state." >&2
+    exit 10
+fi
+
+if [ ! -x "$PHP_BIN" ]; then
+    echo "LSPHP CLI is unavailable: $PHP_BIN" >&2
+    exit 2
+fi
+
+for ext in mbstring zip; do
+    if ! "$PHP_BIN" -m | grep -Fxqi "$ext"; then
+        echo "Required PHP extension is missing: $ext" >&2
+        exit 3
+    fi
+done
+
+PAYLOAD="$(cat)"
+
+PARSED_PAYLOAD="$(python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+except Exception:
+    raise SystemExit(2)
+root = data.get("root", "/var/www")
+local_only = data.get("local_file_only", False)
+if not isinstance(root, str) or not isinstance(local_only, bool):
+    raise SystemExit(2)
+print(json.dumps({"root": root.strip(), "local_file_only": local_only}))
+' <<< "$PAYLOAD")" || {
+    echo "Invalid FileGator installer payload." >&2
+    exit 4
+}
+
+ROOT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["root"])' <<< "$PARSED_PAYLOAD")"
+LOCAL_FILE_ONLY="$(python3 -c 'import json,sys; print("1" if json.load(sys.stdin)["local_file_only"] else "0")' <<< "$PARSED_PAYLOAD")"
+
+if [ -z "$ROOT" ] || [ "${#ROOT}" -gt 512 ]; then
+    echo "Enter a valid FileGator root directory." >&2
+    exit 5
+fi
+
+ROOT_CANON="$(realpath -m -- "$ROOT")"
+
+case "$ROOT_CANON" in
+    /var/www|/var/www/*)
+        ;;
+    *)
+        echo "FileGator root must be /var/www or a directory below /var/www." >&2
+        exit 6
+        ;;
+esac
+
+mkdir -p -- "$ROOT_CANON"
+
+TMP_DIR="$(mktemp -d /tmp/everlomp-filegator.XXXXXX)"
+STAGE_DIR="$(mktemp -d "$STATE_DIR/.filegator-stage.XXXXXX")"
+
+cleanup() {
+    rm -rf -- "$TMP_DIR" "$STAGE_DIR"
+}
+trap cleanup EXIT
+
+PACKAGE_ZIP="$TMP_DIR/filegator.zip"
+
+if [ "$LOCAL_FILE_ONLY" = "1" ]; then
+    if [ ! -f "$LOCAL_ZIP" ]; then
+        echo "Local FileGator package not found: $LOCAL_ZIP" >&2
+        exit 16
+    fi
+
+    echo "[FileGator] Installing from local package: $LOCAL_ZIP" >&2
+    cp -- "$LOCAL_ZIP" "$PACKAGE_ZIP"
+else
+    echo "[FileGator] Downloading official prebuilt package..." >&2
+    REMOTE_OK=0
+
+    if curl -fL --retry 3 --retry-delay 2 \
+        "$DOWNLOAD_URL" \
+        -o "$PACKAGE_ZIP"; then
+        if unzip -tq "$PACKAGE_ZIP" >/dev/null 2>&1; then
+            REMOTE_OK=1
+        else
+            echo "[FileGator] Downloaded package is not a valid ZIP; trying local fallback." >&2
+        fi
+    else
+        echo "[FileGator] Download failed; trying local fallback." >&2
+    fi
+
+    if [ "$REMOTE_OK" != "1" ]; then
+        if [ -f "$LOCAL_ZIP" ]; then
+            echo "[FileGator] Using local fallback package: $LOCAL_ZIP" >&2
+            cp -- "$LOCAL_ZIP" "$PACKAGE_ZIP"
+        else
+            echo "Could not obtain a valid FileGator package and no local fallback exists at $LOCAL_ZIP." >&2
+            exit 17
+        fi
+    fi
+fi
+
+if ! unzip -tq "$PACKAGE_ZIP" >/dev/null 2>&1; then
+    echo "Selected FileGator package is not a valid ZIP archive." >&2
+    exit 18
+fi
+
+unzip -q "$PACKAGE_ZIP" -d "$TMP_DIR/unpacked"
+
+SOURCE_DIR="$(python3 - "$TMP_DIR/unpacked" <<'PY'
+from pathlib import Path
+import sys
+
+base = Path(sys.argv[1])
+for dist_index in sorted(base.rglob('dist/index.php')):
+    app = dist_index.parent.parent
+    if (app / 'configuration_sample.php').is_file() and (app / 'vendor').is_dir():
+        print(app)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+)" || {
+    echo "Downloaded FileGator package does not contain a production application tree." >&2
+    exit 7
+}
+
+rmdir "$STAGE_DIR"
+mv -- "$SOURCE_DIR" "$STAGE_DIR"
+
+if [ ! -f "$STAGE_DIR/configuration_sample.php" ] || [ ! -f "$STAGE_DIR/dist/index.php" ]; then
+    echo "FileGator package validation failed." >&2
+    exit 8
+fi
+
+cp -- "$STAGE_DIR/configuration_sample.php" "$STAGE_DIR/configuration.php"
+
+CSRF_KEY="$(openssl rand -hex 32)"
+ADMIN_PASSWORD="$(openssl rand -hex 16)"
+
+if [ -z "$CSRF_KEY" ] || [ -z "$ADMIN_PASSWORD" ]; then
+    echo "Could not generate FileGator security secrets." >&2
+    exit 9
+fi
+
+ADMIN_HASH="$($PHP_BIN -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$ADMIN_PASSWORD")"
+
+if [ -z "$ADMIN_HASH" ]; then
+    echo "Could not hash the FileGator admin password." >&2
+    exit 11
+fi
+
+python3 - "$STAGE_DIR/configuration.php" "$ROOT_CANON" "$CSRF_KEY" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+root = sys.argv[2]
+csrf = sys.argv[3]
+text = path.read_text()
+
+def php_single_quote(value: str) -> str:
+    return "'" + value.replace('\\', '\\\\').replace("'", "\\'") + "'"
+
+storage_pattern = re.compile(
+    r"(return\s+new\s+\\League\\Flysystem\\Adapter\\Local\(\s*)"
+    r"__DIR__\s*\.\s*'/repository'"
+    r"(\s*\);)",
+    re.S,
+)
+text, count = storage_pattern.subn(
+    lambda m: m.group(1) + php_single_quote(root) + m.group(2),
+    text,
+    count=1,
+)
+if count != 1:
+    print('Could not locate FileGator local repository configuration.', file=sys.stderr)
+    raise SystemExit(1)
+
+text, count = re.subn(
+    r"('csrf_key'\s*=>\s*)[\"'][^\"']*[\"']",
+    lambda m: m.group(1) + php_single_quote(csrf),
+    text,
+    count=1,
+)
+if count != 1:
+    print('Could not locate FileGator CSRF configuration.', file=sys.stderr)
+    raise SystemExit(1)
+
+# Harden FileGator's built-in failed-login protection. Keep the upstream
+# default of five attempts, but extend the IP lockout from 15 seconds to
+# five minutes.
+text, count = re.subn(
+    r"('lockout_timeout'\s*=>\s*)\d+",
+    r"\g<1>300",
+    text,
+    count=1,
+)
+if count != 1:
+    print('Could not locate FileGator lockout timeout configuration.', file=sys.stderr)
+    raise SystemExit(1)
+
+path.write_text(text)
+PY
+
+python3 - "$STAGE_DIR/dist/index.php" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+text, count = re.subn(
+    r"(define\(\s*'APP_PUBLIC_PATH'\s*,\s*)''(\s*\)\s*;)",
+    r"\1'/filegator/'\2",
+    text,
+    count=1,
+)
+if count != 1:
+    print('Could not configure FileGator public path.', file=sys.stderr)
+    raise SystemExit(1)
+path.write_text(text)
+PY
+
+python3 - "$STAGE_DIR/private/users.json" "$ADMIN_HASH" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+admin_hash = sys.argv[2]
+users = {
+    "1": {
+        "username": "admin",
+        "name": "Admin",
+        "role": "admin",
+        "homedir": "/",
+        "permissions": "read|write|upload|download|batchdownload|zip|chmod",
+        "password": admin_hash,
+    },
+    "2": {
+        "username": "guest",
+        "name": "Guest",
+        "role": "guest",
+        "homedir": "/",
+        "permissions": "",
+        "password": "",
+    },
+}
+path.write_text(json.dumps(users, separators=(",", ":")))
+PY
+
+chown -R root:root "$STAGE_DIR"
+find "$STAGE_DIR" -type d -exec chmod 0755 {} +
+find "$STAGE_DIR" -type f -exec chmod 0644 {} +
+
+chown -R nobody:nogroup "$STAGE_DIR/private"
+find "$STAGE_DIR/private" -type d -exec chmod 0750 {} +
+find "$STAGE_DIR/private" -type f -exec chmod 0640 {} +
+
+chown root:nogroup "$STAGE_DIR/configuration.php"
+chmod 0640 "$STAGE_DIR/configuration.php"
+
+VERSION="$($PHP_BIN -r '
+$text = file_get_contents($argv[1]);
+if (preg_match("/define\\(\\x27APP_VERSION\\x27,\\s*\\x27([^\\x27]+)\\x27\\)/", $text, $m)) {
+    echo $m[1];
+}
+' "$STAGE_DIR/dist/index.php")"
+
+[ -n "$VERSION" ] || VERSION="unknown"
+
+INFO_TMP="$(mktemp "$STATE_DIR/.filegator-info.XXXXXX")"
+python3 - "$INFO_TMP" "$ROOT_CANON" "$VERSION" <<'PY'
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "root": sys.argv[2],
+    "version": sys.argv[3],
+    "installed_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+}, separators=(",", ":")))
+PY
+chmod 0644 "$INFO_TMP"
+
+RESPONSE="$(python3 - "$ADMIN_PASSWORD" "$ROOT_CANON" "$VERSION" <<'PY'
+import json
+import sys
+print(json.dumps({
+    "username": "admin",
+    "password": sys.argv[1],
+    "root": sys.argv[2],
+    "version": sys.argv[3],
+}, separators=(",", ":")))
+PY
+)"
+
+if [ "$ROOT_CANON" = "/var/www" ]; then
+    chown root:nogroup "$ROOT_CANON"
+    chmod 1775 "$ROOT_CANON"
+else
+    chown nobody:nogroup "$ROOT_CANON"
+    chmod u+rwx,go+rx "$ROOT_CANON"
+fi
+
+mv -- "$STAGE_DIR" "$APP_DIR"
+if ! mv -f -- "$INFO_TMP" "$INFO_FILE"; then
+    rm -rf -- "$APP_DIR"
+    echo "Could not persist FileGator installation metadata." >&2
+    exit 12
+fi
+
+if [ ! -f "$VHOST_CONF" ]; then
+    rm -rf -- "$APP_DIR"
+    rm -f -- "$INFO_FILE"
+    echo "OpenLiteSpeed vhost configuration not found: $VHOST_CONF" >&2
+    exit 13
+fi
+
+VHOST_BACKUP="${VHOST_CONF}.everlomp-filegator-backup"
+cp -f -- "$VHOST_CONF" "$VHOST_BACKUP"
+
+python3 - "$VHOST_CONF" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+text = re.sub(
+    r'(?ms)^# BEGIN everlomp FileGator\n.*?^# END everlomp FileGator\n?',
+    '',
+    text,
+)
+text = re.sub(
+    r'(?ms)^# FileGator is optional\. Its application is installed persistently under\n'
+    r'# /home/everlomp/filegator; only dist/ is exposed to the web\.\n'
+    r'context /filegator/\s*\{.*?^[ \t]+\}\n^\}\n?',
+    '',
+    text,
+)
+
+block = """# BEGIN everlomp FileGator
+context /filegator/ {
+    location                /var/www/.everlomp-filegator/app/dist/
+    allowBrowse             1
+    indexFiles              index.php
+    addDefaultCharset       off
+
+    rewrite {
+        enable              0
+    }
+}
+# END everlomp FileGator
+"""
+
+anchor = re.search(r'(?m)^context /openlitespeed/\s*\{', text)
+if anchor:
+    text = text[:anchor.start()] + block + "\n" + text[anchor.start():]
+else:
+    text = text.rstrip() + "\n\n" + block
+
+path.write_text(text)
+PY
+
+set +e
+TEST_OUTPUT="$("$OLS_BIN" -t 2>&1)"
+TEST_RC=$?
+set -e
+printf '%s\n' "$TEST_OUTPUT" >&2
+echo "[FileGator] OpenLiteSpeed config-test exit status: ${TEST_RC}" >&2
+
+if printf '%s\n' "$TEST_OUTPUT" \
+    | grep -Eiq '\[(ERROR|FATAL)\]|syntax[[:space:]]+error|configuration[[:space:]]+error|failed[[:space:]]+to[[:space:]]+(load|parse|read)[[:space:]]+config'; then
+    cp -f -- "$VHOST_BACKUP" "$VHOST_CONF"
+    rm -rf -- "$APP_DIR"
+    rm -f -- "$INFO_FILE"
+    echo "OpenLiteSpeed rejected the FileGator context; installation rolled back." >&2
+    exit 14
+fi
+
+set +e
+RESTART_OUTPUT="$("$OLS_CTL" restart 2>&1)"
+RESTART_RC=$?
+set -e
+printf '%s\n' "$RESTART_OUTPUT" >&2
+
+if [ "$RESTART_RC" -ne 0 ]; then
+    cp -f -- "$VHOST_BACKUP" "$VHOST_CONF"
+    "$OLS_CTL" restart >/dev/null 2>&1 || true
+    rm -rf -- "$APP_DIR"
+    rm -f -- "$INFO_FILE"
+    echo "OpenLiteSpeed restart failed; FileGator installation rolled back." >&2
+    exit 15
+fi
+
+rm -f -- "$VHOST_BACKUP"
+trap - EXIT
+rm -rf -- "$TMP_DIR"
+
+printf '%s\n' "$RESPONSE"

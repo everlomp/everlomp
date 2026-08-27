@@ -1,0 +1,202 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${1:-}"
+OLS_CONF="/usr/local/lsws/conf/httpd_config.conf"
+PROXY_FILE="/home/everlomp/realip-proxy"
+FAILURE_FILE="/home/everlomp/realip-failed"
+
+if [ "$ACTION" != "configure" ]; then
+    echo "Usage: everlomp-realip configure" >&2
+    exit 64
+fi
+
+IFS= read -r PROXY_IP || true
+PROXY_IP="${PROXY_IP//$'\r'/}"
+
+if [ -z "$PROXY_IP" ]; then
+    echo "No proxy IP supplied." >&2
+    exit 2
+fi
+
+python3 - "$PROXY_IP" <<'PY'
+import ipaddress
+import sys
+
+try:
+    ip = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    print("Invalid proxy IP.", file=sys.stderr)
+    raise SystemExit(1)
+
+if not (ip.is_private or ip.is_loopback):
+    print(
+        "Refusing to trust a non-private proxy address automatically: "
+        + str(ip),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+
+REALIP_SUCCESS=0
+
+remember_realip_failure() {
+    if [ "$REALIP_SUCCESS" -eq 0 ]; then
+        mkdir -p /home/everlomp
+        printf '%s\n' "$PROXY_IP" > "$FAILURE_FILE"
+        chmod 0644 "$FAILURE_FILE"
+    fi
+}
+
+trap remember_realip_failure EXIT
+
+if [ ! -f "$OLS_CONF" ]; then
+    echo "OpenLiteSpeed configuration not found: $OLS_CONF" >&2
+    exit 3
+fi
+
+BACKUP="${OLS_CONF}.everlomp-realip-backup"
+cp -f "$OLS_CONF" "$BACKUP"
+
+python3 - "$OLS_CONF" "$PROXY_IP" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+proxy_ip = sys.argv[2]
+trusted_token = proxy_ip + "T"
+
+text = path.read_text()
+
+directive_re = re.compile(r'(?m)^[ \t]*useIpInProxyHeader[ \t]+\S+[ \t]*$')
+
+if directive_re.search(text):
+    text = directive_re.sub("useIpInProxyHeader        2", text, count=1)
+else:
+    show_version = re.compile(r'(?m)^(showVersionNumber[^\n]*\n)')
+    if show_version.search(text):
+        text = show_version.sub(
+            r'\1useIpInProxyHeader        2\n',
+            text,
+            count=1,
+        )
+    else:
+        text = "useIpInProxyHeader        2\n" + text
+
+block_re = re.compile(
+    r'(?ms)^accessControl[ \t]*\{.*?^\}'
+)
+
+match = block_re.search(text)
+
+if match:
+    block = match.group(0)
+    allow_re = re.compile(r'(?m)^([ \t]*allow[ \t]+)([^\n]*)$')
+    allow_match = allow_re.search(block)
+
+    if allow_match:
+        values = [
+            item.strip()
+            for item in allow_match.group(2).split(",")
+            if item.strip()
+        ]
+
+        # Remove an older exact token if somehow duplicated, then append it.
+        values = [v for v in values if v != trusted_token]
+
+        if not any(v.upper() in ("ALL", "*") for v in values):
+            values.insert(0, "ALL")
+
+        values.append(trusted_token)
+
+        new_allow = allow_match.group(1) + ", ".join(values)
+        block = allow_re.sub(new_allow, block, count=1)
+    else:
+        block = block[:-1] + f"    allow                   ALL, {trusted_token}\n}}"
+
+    text = text[:match.start()] + block + text[match.end():]
+else:
+    new_block = (
+        "accessControl {\n"
+        f"    allow                   ALL, {trusted_token}\n"
+        "    deny\n"
+        "}\n\n"
+    )
+
+    ext = re.search(r'(?m)^extProcessor\b', text)
+    if ext:
+        text = text[:ext.start()] + new_block + text[ext.start():]
+    else:
+        text += "\n" + new_block
+
+path.write_text(text)
+PY
+
+set +e
+TEST_OUTPUT="$(
+    /usr/local/lsws/bin/openlitespeed -t 2>&1
+)"
+TEST_RC=$?
+set -e
+
+printf '%s\n' "$TEST_OUTPUT"
+echo "[Everlomp] OpenLiteSpeed config-test exit status: ${TEST_RC}"
+
+if printf '%s\n' "$TEST_OUTPUT" \
+    | grep -Eiq '\[(ERROR|FATAL)\]|syntax[[:space:]]+error|configuration[[:space:]]+error|failed[[:space:]]+to[[:space:]]+(load|parse|read)[[:space:]]+config'; then
+
+    echo "OpenLiteSpeed reported a real configuration error. Restoring backup." >&2
+    cp -f "$BACKUP" "$OLS_CONF"
+    exit 4
+fi
+
+echo "[Everlomp] No OpenLiteSpeed config errors detected; applying configuration..."
+
+set +e
+RESTART_OUTPUT="$(
+    /usr/local/lsws/bin/lswsctrl restart 2>&1
+)"
+RESTART_RC=$?
+set -e
+
+printf '%s\n' "$RESTART_OUTPUT"
+
+if [ "$RESTART_RC" -ne 0 ]; then
+    echo "OpenLiteSpeed restart failed. Restoring backup." >&2
+    cp -f "$BACKUP" "$OLS_CONF"
+    /usr/local/lsws/bin/lswsctrl restart >/dev/null 2>&1 || true
+    exit 5
+fi
+
+sleep 2
+
+set +e
+STATUS_OUTPUT="$(
+    /usr/local/lsws/bin/lswsctrl status 2>&1
+)"
+STATUS_RC=$?
+set -e
+
+printf '%s\n' "$STATUS_OUTPUT"
+
+if ! printf '%s\n' "$STATUS_OUTPUT" \
+    | grep -q 'litespeed is running with PID'; then
+
+    echo "OpenLiteSpeed did not come back healthy. Restoring backup." >&2
+    cp -f "$BACKUP" "$OLS_CONF"
+    /usr/local/lsws/bin/lswsctrl restart >/dev/null 2>&1 || true
+    exit 6
+fi
+
+mkdir -p /home/everlomp
+printf '%s\n' "$PROXY_IP" > "$PROXY_FILE"
+chmod 0644 "$PROXY_FILE"
+
+echo "[Everlomp] Trusting proxy peer: $PROXY_IP"
+echo "[Everlomp] OpenLiteSpeed client-IP mode: Trusted IP Only"
+
+rm -f "$FAILURE_FILE"
+REALIP_SUCCESS=1
+
+echo "[Everlomp] Real-IP configuration applied and OpenLiteSpeed verified healthy."

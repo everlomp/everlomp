@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+import base64
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+KEY_PATH = Path('/run/secrets/key')
+STATE_DIR = Path('/var/www/.everlomp')
+MODE_PATH = STATE_DIR / 'key-mode'
+INSTANCE_PATH = Path('/run/everlomp/instance-id')
+SUPERVISOR_CONF = '/etc/everlomp/supervisord.conf'
+BASELINE_SERVICES = (
+    'mariadb',
+    'nginx',
+    'openlitespeed',
+    'cron',
+    'everlomp-bruteforce-guard',
+    'kopia-replication-api',
+)
+VALID_MODES = {'undecided', 'pending', 'enabled', 'disabled'}
+
+
+def ensure_state_dir():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        import grp
+        os.chown(STATE_DIR, 0, grp.getgrnam('nogroup').gr_gid)
+    except Exception:
+        pass
+    os.chmod(STATE_DIR, 0o750)
+
+
+def read_mode():
+    try:
+        mode = MODE_PATH.read_text(encoding='utf-8').strip()
+    except OSError:
+        return 'undecided'
+    return mode if mode in VALID_MODES else 'undecided'
+
+
+def write_mode(mode):
+    if mode not in VALID_MODES - {'undecided'}:
+        raise ValueError('Invalid key mode.')
+    ensure_state_dir()
+    tmp = MODE_PATH.with_name('.key-mode.tmp')
+    tmp.write_text(mode + '\n', encoding='utf-8')
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, MODE_PATH)
+    os.chmod(MODE_PATH, 0o600)
+
+
+def decode_key(raw):
+    raw = raw.strip()
+    if not raw or raw == b'placeholder-only':
+        raise ValueError('The mounted key is still the Evernode placeholder.')
+
+    try:
+        text = raw.decode('ascii')
+    except UnicodeDecodeError:
+        text = ''
+
+    if re.fullmatch(r'[0-9A-Fa-f]{64}', text):
+        key = bytes.fromhex(text)
+    elif re.fullmatch(r'[A-Za-z0-9_-]{43}={0,1}', text):
+        padding = '=' * ((4 - len(text) % 4) % 4)
+        key = base64.urlsafe_b64decode(text + padding)
+    elif len(raw) == 32:
+        key = raw
+    else:
+        raise ValueError('Key must represent exactly 32 bytes (43-char base64url or 64-char hex).')
+
+    if len(key) != 32:
+        raise ValueError('Key must decode to exactly 32 bytes.')
+    return key
+
+
+def key_info():
+    try:
+        raw = KEY_PATH.read_bytes()
+        key = decode_key(raw)
+        return True, '', hashlib.sha256(key).hexdigest()[:16]
+    except FileNotFoundError:
+        return False, 'Docker Swarm secret /run/secrets/key is not mounted.', ''
+    except (OSError, ValueError) as exc:
+        return False, str(exc), ''
+
+
+def service_status():
+    statuses = {name: 'UNKNOWN' for name in BASELINE_SERVICES}
+    try:
+        cp = subprocess.run(
+            ['/usr/bin/supervisorctl', '-c', SUPERVISOR_CONF, 'status'],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+        output = (cp.stdout or '') + '\n' + (cp.stderr or '')
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in statuses:
+                statuses[parts[0]] = parts[1]
+    except Exception:
+        pass
+    ready = all(status == 'RUNNING' for status in statuses.values())
+    return ready, statuses
+
+
+def status_payload(auto_finalize=True):
+    mode = read_mode()
+    valid, error, fingerprint = key_info()
+
+    if auto_finalize and mode == 'pending' and valid:
+        write_mode('enabled')
+        mode = 'enabled'
+
+    ready, services = service_status()
+    try:
+        instance = INSTANCE_PATH.read_text(encoding='ascii').strip()
+    except OSError:
+        instance = ''
+
+    return {
+        'ok': True,
+        'mode': mode,
+        'key_valid': valid,
+        'key_error': error,
+        'key_fingerprint': fingerprint,
+        'instance': instance,
+        'ready': ready,
+        'services': services,
+    }
+
+
+
+def schedule_task_replacement():
+    """Terminate container PID 1 after this helper has returned to PHP.
+
+    In Docker Swarm an exited task is replaced with a new task. This is
+    intentionally different from restarting services inside the existing
+    container, because Swarm secrets are mounted when the task is created.
+    """
+    pid = os.fork()
+    if pid != 0:
+        return
+
+    try:
+        os.setsid()
+    except OSError:
+        pass
+
+    try:
+        devnull = os.open('/dev/null', os.O_RDWR)
+        for fd in (0, 1, 2):
+            try:
+                os.dup2(devnull, fd)
+            except OSError:
+                pass
+        if devnull > 2:
+            os.close(devnull)
+    except OSError:
+        pass
+
+    try:
+        time.sleep(2.0)
+        os.kill(1, signal.SIGTERM)
+    except Exception:
+        pass
+    finally:
+        os._exit(0)
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else 'status'
+
+    if action == 'status':
+        print(json.dumps(status_payload(auto_finalize=False), separators=(',', ':')))
+        return 0
+
+    if action == 'boot-finalize':
+        payload = status_payload(auto_finalize=True)
+        print(payload['mode'])
+        return 0
+
+    if action == 'set-mode':
+        requested = sys.stdin.read(64).strip()
+        if requested not in {'pending', 'disabled', 'enabled'}:
+            print('Mode must be pending, disabled, or enabled.', file=sys.stderr)
+            return 2
+        if requested == 'enabled':
+            valid, error, _ = key_info()
+            if not valid:
+                print(error or 'A valid mounted key is required.', file=sys.stderr)
+                return 3
+        write_mode(requested)
+        print(json.dumps(status_payload(auto_finalize=False), separators=(',', ':')))
+        return 0
+
+    if action == 'replace-task':
+        mode = read_mode()
+        if mode not in {'pending', 'enabled'}:
+            print('Task replacement is only available while encryption key setup is pending or an enabled key is unavailable.', file=sys.stderr)
+            return 4
+        valid, _, _ = key_info()
+        if valid:
+            print(json.dumps({'ok': True, 'replacement_needed': False}, separators=(',', ':')))
+            return 0
+        schedule_task_replacement()
+        print(json.dumps({'ok': True, 'replacement_needed': True}, separators=(',', ':')))
+        return 0
+
+    print('Usage: everlomp-key {status|boot-finalize|set-mode|replace-task}', file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

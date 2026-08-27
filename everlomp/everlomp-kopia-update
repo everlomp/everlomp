@@ -1,0 +1,234 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG="/home/everlomp/backup.json"
+LOG_DIR="/var/log/everlomp"
+LOG_FILE="$LOG_DIR/kopia-update.log"
+LOCK_FILE="/run/everlomp-kopia-update.lock"
+SUPERVISOR_CONF="/etc/everlomp/supervisord.conf"
+CUSTOM_HELPER="/usr/local/sbin/everlomp-kopia-custom"
+
+mkdir -p "$LOG_DIR"
+touch "$LOG_FILE"
+chmod 0640 "$LOG_FILE" || true
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    exit 0
+fi
+
+update_state() {
+    local status="$1"
+    local detail="${2:-}"
+    local version="${3:-}"
+
+    [ -f "$CONFIG" ] || printf '{}\n' > "$CONFIG"
+
+    python3 - "$CONFIG" "$status" "$detail" "$version" <<'PY'
+from pathlib import Path
+import datetime, json, os, sys, tempfile
+
+path = Path(sys.argv[1])
+status, detail, version = sys.argv[2:5]
+
+try:
+    data = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+data["kopia_update_last_run"] = (
+    datetime.datetime.now(datetime.timezone.utc)
+    .replace(microsecond=0)
+    .isoformat()
+    .replace("+00:00", "Z")
+)
+data["kopia_update_last_status"] = status
+
+if detail:
+    data["kopia_update_last_detail"] = detail[-1000:]
+
+if version:
+    data["kopia_version"] = version
+
+fd, tmp = tempfile.mkstemp(prefix=".backup.", dir=str(path.parent))
+os.close(fd)
+Path(tmp).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+os.replace(tmp, path)
+
+# backup.json contains UI/status data, not credentials. Keep it owned by
+# root but readable by both supported PHP runtime users (nobody/www-data).
+try:
+    os.chown(path, 0, 0)
+except Exception:
+    pass
+
+os.chmod(path, 0o644)
+PY
+}
+
+normalize_version() {
+    printf '%s\n' "$1" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+        | head -n1
+}
+
+ensure_build_environment() {
+    local packages=()
+    local cmd
+
+    command -v git >/dev/null 2>&1 || packages+=(git)
+    command -v go >/dev/null 2>&1 || packages+=(golang-go)
+
+    if ((${#packages[@]})); then
+        printf '[%s] Installing Kopia build dependencies: %s\n' \
+            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            "${packages[*]}" >> "$LOG_FILE"
+
+        if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1; then
+            return 1
+        fi
+
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends \
+            "${packages[@]}" \
+            >> "$LOG_FILE" 2>&1; then
+            return 1
+        fi
+
+        rm -rf /var/lib/apt/lists/*
+    fi
+
+    for cmd in tar make node npm git go; do
+        command -v "$cmd" >/dev/null 2>&1 || return 1
+    done
+}
+
+[ -x "$CUSTOM_HELPER" ] || {
+    update_state "failed" "Everlomp custom Kopia builder is missing."
+    exit 2
+}
+
+CURRENT_VERSION="$("$CUSTOM_HELPER" installed-version 2>/dev/null || true)"
+if [ -z "$CURRENT_VERSION" ]; then
+    update_state "failed" "Kopia is not installed."
+    exit 3
+fi
+
+TARGET_VERSION="$("$CUSTOM_HELPER" latest-version 2>> "$LOG_FILE" || true)"
+if [ -z "$TARGET_VERSION" ]; then
+    update_state "failed" "Could not resolve the latest stable Kopia release." "$CURRENT_VERSION"
+    exit 4
+fi
+
+printf '[%s] Checking Kopia updates (installed: %s, latest: %s).\n' \
+    "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+    "$CURRENT_VERSION" \
+    "$TARGET_VERSION" >> "$LOG_FILE"
+
+BUILD_VERSION="$TARGET_VERSION"
+STATUS_ON_SUCCESS="updated"
+DETAIL_ON_SUCCESS="Updated Everlomp Kopia from $CURRENT_VERSION to $TARGET_VERSION."
+
+if dpkg --compare-versions "$CURRENT_VERSION" ge "$TARGET_VERSION"; then
+    BUILD_VERSION="$CURRENT_VERSION"
+
+    if "$CUSTOM_HELPER" verify \
+        /usr/local/bin/kopia \
+        "$CURRENT_VERSION" \
+        >> "$LOG_FILE" 2>&1; then
+
+        update_state \
+            "up-to-date" \
+            "Latest stable release is $TARGET_VERSION; custom embedded /kopia/ UI verified." \
+            "$CURRENT_VERSION"
+        exit 0
+    fi
+
+    STATUS_ON_SUCCESS="repaired"
+    DETAIL_ON_SUCCESS="Rebuilt the Everlomp /kopia/-aware binary for Kopia $CURRENT_VERSION."
+fi
+
+if ! ensure_build_environment; then
+    update_state \
+        "failed" \
+        "Could not install or verify the Git/Go/Node build environment required for Kopia." \
+        "$CURRENT_VERSION"
+    exit 5
+fi
+
+PREBUILT_DIR="$(mktemp -d /tmp/everlomp-kopia-update.XXXXXX)"
+trap 'rm -rf "$PREBUILT_DIR"' EXIT
+PREBUILT="$PREBUILT_DIR/kopia"
+
+printf '[%s] Building Everlomp Kopia %s from official source.\n' \
+    "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+    "$BUILD_VERSION" >> "$LOG_FILE"
+
+if ! "$CUSTOM_HELPER" build \
+    "$BUILD_VERSION" \
+    "$PREBUILT" \
+    >> "$LOG_FILE" 2>&1; then
+
+    update_state \
+        "failed" \
+        "Kopia update blocked: the custom embedded HTMLUI build failed for $BUILD_VERSION." \
+        "$CURRENT_VERSION"
+    exit 6
+fi
+
+cp -L -a /usr/local/bin/kopia "$PREBUILT_DIR/kopia.previous"
+
+if ! "$CUSTOM_HELPER" install \
+    "$PREBUILT" \
+    "$BUILD_VERSION" \
+    >> "$LOG_FILE" 2>&1; then
+
+    install -m 0755 "$PREBUILT_DIR/kopia.previous" /usr/local/bin/kopia || true
+    ln -sfn /usr/local/bin/kopia /usr/bin/kopia || true
+    update_state \
+        "failed" \
+        "The new Kopia binary was built but could not be installed; the previous executable was restored." \
+        "$CURRENT_VERSION"
+    exit 7
+fi
+
+if [ -x /usr/local/sbin/everlomp-backup ]; then
+    if ! /usr/local/sbin/everlomp-backup \
+        repair-kopia-route \
+        >> "$LOG_FILE" 2>&1; then
+
+        install -m 0755 "$PREBUILT_DIR/kopia.previous" /usr/local/bin/kopia || true
+        install -d -o root -g nogroup -m 0750 /var/www/.everlomp/kopia-runtime || true
+        install -m 0755 "$PREBUILT_DIR/kopia.previous" /var/www/.everlomp/kopia-runtime/kopia || true
+        ln -sfn /usr/local/bin/kopia /usr/bin/kopia || true
+        update_state \
+            "failed" \
+            "Kopia was built, but repairing the /kopia/ proxy route failed; the previous executable was restored." \
+            "$CURRENT_VERSION"
+        exit 8
+    fi
+fi
+
+if [ -f "$SUPERVISOR_CONF" ] \
+    && /usr/bin/supervisorctl \
+        -c "$SUPERVISOR_CONF" \
+        status kopia 2>/dev/null \
+        | grep -qE 'RUNNING|STARTING'; then
+
+    /usr/bin/supervisorctl \
+        -c "$SUPERVISOR_CONF" \
+        restart kopia \
+        >> "$LOG_FILE" 2>&1 || true
+fi
+
+printf '[%s] Kopia source-build update complete: %s -> %s.\n' \
+    "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+    "$CURRENT_VERSION" \
+    "$BUILD_VERSION" >> "$LOG_FILE"
+
+update_state \
+    "$STATUS_ON_SUCCESS" \
+    "$DETAIL_ON_SUCCESS" \
+    "$BUILD_VERSION"
