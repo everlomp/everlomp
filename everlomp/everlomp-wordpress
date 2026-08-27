@@ -19,7 +19,7 @@ WP="/usr/local/bin/wp"
 PHP_BIN="/usr/local/lsws/lsphp85/bin/php"
 
 WORDPRESS_LATEST_URL="https://wordpress.org/latest.zip"
-WORDPRESS_FALLBACK_VERSION="7.0.4"
+WORDPRESS_FALLBACK_VERSION="6.6.7"
 WORDPRESS_FALLBACK_ZIP="/home/everlomp/wordpress-${WORDPRESS_FALLBACK_VERSION}.zip"
 WPADDONS_DIR="/home/everlomp/wpaddons"
 WP_THEME_MANIFEST="$WPADDONS_DIR/themes.json"
