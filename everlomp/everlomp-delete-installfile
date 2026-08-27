@@ -30,7 +30,7 @@ fi
 PRIMARY_APP="$(tr -d '\r\n' < "$PRIMARY_APP_FILE" 2>/dev/null || true)"
 
 case "$PRIMARY_APP" in
-    wordpress|phpbb)
+    wordpress|drupal|phpbb)
         ;;
     external:*)
         EXTERNAL_ID="${PRIMARY_APP#external:}"
