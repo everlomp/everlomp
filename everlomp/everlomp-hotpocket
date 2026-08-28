@@ -10,13 +10,19 @@ ENABLED_FILE="/var/www/.everlomp/hotpocket.enabled"
 if [ "$ACTION" = "add-listener" ]; then
     PAYLOAD_FILE="$(mktemp /tmp/everlomp-listener-payload.XXXXXX)"
     PARSED_FILE="$(mktemp /tmp/everlomp-listener-parsed.XXXXXX)"
-    BACKUP_FILE=""
+    RESOLVED_VHOST_FILE="$(mktemp /tmp/everlomp-listener-vhost.XXXXXX)"
+    VHOST_BACKUP_FILE=""
+    SERVER_BACKUP_FILE=""
 
     cleanup_listener() {
-        rm -f "$PAYLOAD_FILE" "$PARSED_FILE"
+        rm -f "$PAYLOAD_FILE" "$PARSED_FILE" "$RESOLVED_VHOST_FILE"
 
-        if [ -n "$BACKUP_FILE" ]; then
-            rm -f "$BACKUP_FILE"
+        if [ -n "$VHOST_BACKUP_FILE" ]; then
+            rm -f "$VHOST_BACKUP_FILE"
+        fi
+
+        if [ -n "$SERVER_BACKUP_FILE" ]; then
+            rm -f "$SERVER_BACKUP_FILE"
         fi
     }
 
@@ -37,12 +43,34 @@ except Exception:
     print("Invalid listenerURL request.", file=sys.stderr)
     raise SystemExit(1)
 
-suffix = str(payload.get("url_suffix", "")).strip().strip("/")
+namespace = str(payload.get("namespace", "evernode")).strip().lower()
+path = str(payload.get("path", payload.get("url_suffix", ""))).strip().strip("/")
 scope = str(payload.get("scope", "")).strip()
-target = str(payload.get("target", "")).strip().strip("/")
+index_file = str(payload.get("index_file", "index.html")).strip()
+host = str(payload.get("host", "")).strip().lower()
+port_raw = payload.get("port", "")
+try:
+    port = int(port_raw)
+except (TypeError, ValueError):
+    port = 0
+
+if not index_file:
+    index_file = "index.html"
+
+if namespace not in ("evernode", "hotpocket"):
+    print("Listener namespace must be evernode or hotpocket.", file=sys.stderr)
+    raise SystemExit(1)
 
 if scope not in ("state", "seed"):
     print("Listener scope must be state or seed.", file=sys.stderr)
+    raise SystemExit(1)
+
+if not host or len(host) > 253 or not re.fullmatch(r"[a-z0-9.-]+", host):
+    print("A valid current domain is required to identify the OpenLiteSpeed vhost.", file=sys.stderr)
+    raise SystemExit(1)
+
+if port < 1 or port > 65535:
+    print("A valid current listener port is required to identify the OpenLiteSpeed vhost.", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -67,20 +95,23 @@ def validate_relative(label, value):
             raise SystemExit(1)
 
 
-validate_relative("listenerURL suffix", suffix)
-validate_relative("Listener target", target)
+validate_relative("listenerURL path", path)
 
-# Do not let "outside consensus" secretly point back into state/.
-if scope == "seed" and (target == "state" or target.startswith("state/")):
+if len(index_file) > 128 or not re.fullmatch(r"[A-Za-z0-9._-]+", index_file):
+    print("Invalid index filename. Example: index.html", file=sys.stderr)
+    raise SystemExit(1)
+
+# "Seed — outside consensus" must not point back into seed/state.
+if scope == "seed" and (path == "state" or path.startswith("state/")):
     print(
         "A seed listener may not target state/. Choose the state scope instead.",
         file=sys.stderr,
     )
     raise SystemExit(1)
 
-uri = "/evernode/"
-if suffix:
-    uri += suffix + "/"
+uri = f"/{namespace}/"
+if path:
+    uri += path + "/"
 
 if scope == "state":
     base = "/contract/contract_fs/seed/state"
@@ -88,14 +119,17 @@ else:
     base = "/contract/contract_fs/seed"
 
 location = base
-if target:
-    location += "/" + target
+if path:
+    location += "/" + path
 
 location += "/"
 
 print(uri)
 print(location)
 print(base)
+print(index_file)
+print(host)
+print(port)
 PY
     then
         exit 65
@@ -103,7 +137,7 @@ PY
 
     mapfile -t LISTENER_VALUES < "$PARSED_FILE"
 
-    if [ "${#LISTENER_VALUES[@]}" -ne 3 ]; then
+    if [ "${#LISTENER_VALUES[@]}" -ne 6 ]; then
         echo "Could not parse listenerURL configuration." >&2
         exit 66
     fi
@@ -111,6 +145,9 @@ PY
     URI="${LISTENER_VALUES[0]}"
     LOCATION="${LISTENER_VALUES[1]}"
     BASE="${LISTENER_VALUES[2]}"
+    INDEX_FILE="${LISTENER_VALUES[3]}"
+    REQUEST_HOST="${LISTENER_VALUES[4]}"
+    REQUEST_PORT="${LISTENER_VALUES[5]}"
 
     if [ ! -d "$BASE" ]; then
         echo "Contract directory does not exist: $BASE" >&2
@@ -132,50 +169,236 @@ PY
             "$TARGET_DIR"
     fi
 
-    #
-    # Find Everlomp's OpenLiteSpeed vhost.
-    #
-    VHOST_ROOT="/usr/local/lsws/conf/vhosts"
+    SERVER_CONF="/usr/local/lsws/conf/httpd_config.conf"
 
-    if [ ! -d "$VHOST_ROOT" ]; then
-        echo "OpenLiteSpeed vhost directory does not exist: $VHOST_ROOT" >&2
+    if [ ! -f "$SERVER_CONF" ]; then
+        echo "OpenLiteSpeed server configuration is missing: $SERVER_CONF" >&2
         exit 68
     fi
 
-    mapfile -t VHOST_CANDIDATES < <(
-        find "$VHOST_ROOT" \
-            -type f \
-            -name 'vhconf.conf' \
-            -print 2>/dev/null \
-            | sort
+    #
+    # Resolve the vhost that actually receives REQUEST_HOST from OLS listener
+    # mappings. This avoids guessing based on installed applications.
+    #
+    if ! python3 - "$SERVER_CONF" "$REQUEST_HOST" "$REQUEST_PORT" > "$RESOLVED_VHOST_FILE" <<'PY'
+from pathlib import Path
+import fnmatch
+import os
+import re
+import sys
+
+server_path = Path(sys.argv[1])
+host = sys.argv[2].strip().lower().rstrip(".")
+request_port = int(sys.argv[3])
+server_root = Path("/usr/local/lsws")
+
+text = server_path.read_text(encoding="utf-8")
+lines = text.splitlines(keepends=True)
+
+
+def block_ranges(kind):
+    result = []
+    i = 0
+    opener = re.compile(r"^\s*" + re.escape(kind) + r"\s+([^\s{]+)\s*\{\s*(?:#.*)?$")
+    while i < len(lines):
+        match = opener.match(lines[i])
+        if not match:
+            i += 1
+            continue
+
+        name = match.group(1)
+        start = i
+        depth = 0
+        opened = False
+        j = i
+
+        while j < len(lines):
+            code = lines[j].split("#", 1)[0]
+            if "{" in code:
+                opened = True
+            depth += code.count("{")
+            depth -= code.count("}")
+
+            if opened and depth == 0:
+                break
+            j += 1
+
+        if j >= len(lines):
+            print(f"Unterminated OpenLiteSpeed {kind} block: {name}", file=sys.stderr)
+            raise SystemExit(1)
+
+        result.append((name, start, j))
+        i = j + 1
+
+    return result
+
+
+def domain_score(pattern, candidate_host):
+    pattern = pattern.strip().lower().rstrip(".")
+    if not pattern:
+        return 0
+
+    if pattern == candidate_host:
+        return 300
+
+    if pattern == "*":
+        return 100
+
+    if "*" in pattern and fnmatch.fnmatchcase(candidate_host, pattern):
+        # Prefer more specific wildcard mappings.
+        return 200 + min(len(pattern.replace("*", "")), 90)
+
+    return 0
+
+
+
+def configured_listener_port(start, end):
+    for line in lines[start + 1:end]:
+        match = re.match(r"^\s*address\s+([^\s#]+)", line)
+        if not match:
+            continue
+
+        address = match.group(1).strip().strip('"\'')
+
+        # OLS normally uses forms such as *:8088, 0.0.0.0:443 or [::]:443.
+        port_match = re.search(r":([0-9]{1,5})$", address)
+        if port_match:
+            port = int(port_match.group(1))
+            if 1 <= port <= 65535:
+                return port
+
+        # Be conservative if a config contains only a numeric port.
+        if address.isdigit():
+            port = int(address)
+            if 1 <= port <= 65535:
+                return port
+
+    return None
+
+
+matches = []
+
+for listener_name, start, end in block_ranges("listener"):
+    listener_port = configured_listener_port(start, end)
+    for line in lines[start + 1:end]:
+        match = re.match(r"^\s*map\s+([^\s]+)\s+(.+?)\s*(?:#.*)?$", line)
+        if not match:
+            continue
+
+        vhost_name = match.group(1)
+        domain_text = match.group(2)
+        domains = [
+            item.strip()
+            for item in re.split(r"[\s,]+", domain_text)
+            if item.strip()
+        ]
+
+        best = max((domain_score(domain, host) for domain in domains), default=0)
+        if best:
+            matches.append((listener_port == request_port, best, vhost_name, listener_name, listener_port))
+
+if not matches:
+    print(
+        f"No OpenLiteSpeed listener mapping matches host {host}.",
+        file=sys.stderr,
     )
+    raise SystemExit(1)
 
-    VHOST_PREFERRED=()
+# The same hostname may intentionally be mapped on several listeners. Prefer
+# the listener that actually accepted this PHP request, then apply the normal
+# exact/wildcard hostname specificity within that listener.
+port_matches = [item for item in matches if item[0]]
+candidates = port_matches if port_matches else matches
 
-    for CONF in "${VHOST_CANDIDATES[@]}"; do
-        if grep -Eq \
-            '^[[:space:]]*context[[:space:]]+/(phpmyadmin|filegator|kopia|openlitespeed)/' \
-            "$CONF"; then
-            VHOST_PREFERRED+=("$CONF")
-        fi
-    done
+top_score = max(item[1] for item in candidates)
+top = [item for item in candidates if item[1] == top_score]
+top_vhosts = sorted({item[2] for item in top})
 
-    if [ "${#VHOST_PREFERRED[@]}" -eq 1 ]; then
-        VHOST_CONF="${VHOST_PREFERRED[0]}"
-    elif [ "${#VHOST_CANDIDATES[@]}" -eq 1 ]; then
-        VHOST_CONF="${VHOST_CANDIDATES[0]}"
-    else
-        echo "Could not uniquely identify the Everlomp OpenLiteSpeed vhost configuration." >&2
-        echo "Found ${#VHOST_CANDIDATES[@]} candidate vhconf.conf files." >&2
+if len(top_vhosts) != 1:
+    details = ", ".join(
+        sorted(
+            f"{item[2]} via {item[3]}:{item[4] if item[4] is not None else '?'}"
+            for item in top
+        )
+    )
+    print(
+        "OpenLiteSpeed host mapping is ambiguous for "
+        + host
+        + f" on request port {request_port}: "
+        + details,
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+vhost_name = top_vhosts[0]
+vhost_blocks = [
+    (name, start, end)
+    for name, start, end in block_ranges("virtualHost")
+    if name == vhost_name
+]
+
+if len(vhost_blocks) != 1:
+    print(
+        f"Could not uniquely find virtualHost {vhost_name} in {server_path}.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+_, start, end = vhost_blocks[0]
+block_text = "".join(lines[start:end + 1])
+config_match = re.search(r"(?m)^\s*configFile\s+([^\s#]+)", block_text)
+
+if not config_match:
+    print(
+        f"virtualHost {vhost_name} has no configFile directive.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+raw = config_match.group(1).strip().strip("\"'")
+raw = raw.replace("$SERVER_ROOT", str(server_root))
+raw = raw.replace("$VH_NAME", vhost_name)
+
+candidate = Path(raw)
+if not candidate.is_absolute():
+    candidate = server_root / candidate
+
+try:
+    vhost_conf = candidate.resolve()
+except Exception:
+    vhost_conf = Path(os.path.normpath(str(candidate)))
+
+if not vhost_conf.is_file():
+    print(
+        f"OpenLiteSpeed vhost configuration does not exist: {vhost_conf}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+print(vhost_name)
+print(vhost_conf)
+PY
+    then
         exit 69
     fi
 
-    echo "[Everlomp] OpenLiteSpeed vhost: $VHOST_CONF"
+    mapfile -t VHOST_VALUES < "$RESOLVED_VHOST_FILE"
+
+    if [ "${#VHOST_VALUES[@]}" -ne 2 ]; then
+        echo "Could not resolve the active OpenLiteSpeed virtual host." >&2
+        exit 69
+    fi
+
+    VHOST_NAME="${VHOST_VALUES[0]}"
+    VHOST_CONF="${VHOST_VALUES[1]}"
+
+    echo "[Everlomp] Current domain: $REQUEST_HOST"
+    echo "[Everlomp] Request listener port: $REQUEST_PORT"
+    echo "[Everlomp] OpenLiteSpeed vhost: $VHOST_NAME"
+    echo "[Everlomp] OpenLiteSpeed vhost config: $VHOST_CONF"
 
     #
-    # ADD ONLY.
-    #
-    # If this URI already exists, do not alter it.
+    # ADD ONLY. If this exact URI already exists, do not alter it.
     #
     if python3 - "$VHOST_CONF" "$URI" <<'PY'
 import re
@@ -185,7 +408,6 @@ path = sys.argv[1]
 uri = sys.argv[2]
 
 text = open(path, "r", encoding="utf-8").read()
-
 pattern = r"(?m)^\s*context\s+" + re.escape(uri) + r"\s*\{"
 
 raise SystemExit(0 if re.search(pattern, text) else 1)
@@ -195,8 +417,185 @@ PY
         exit 70
     fi
 
-    BACKUP_FILE="$(mktemp /tmp/everlomp-vhconf.XXXXXX)"
-    cp -p "$VHOST_CONF" "$BACKUP_FILE"
+    VHOST_BACKUP_FILE="$(mktemp /tmp/everlomp-vhconf.XXXXXX)"
+    SERVER_BACKUP_FILE="$(mktemp /tmp/everlomp-httpd-config.XXXXXX)"
+    cp -p "$VHOST_CONF" "$VHOST_BACKUP_FILE"
+    cp -p "$SERVER_CONF" "$SERVER_BACKUP_FILE"
+
+    rollback_ols_config() {
+        echo "[Everlomp] Restoring previous OpenLiteSpeed configuration..." >&2
+        cp -p "$VHOST_BACKUP_FILE" "$VHOST_CONF" || true
+        cp -p "$SERVER_BACKUP_FILE" "$SERVER_CONF" || true
+    }
+
+    #
+    # /contract is outside the normal vhost root. Disable restraint only for
+    # the actual vhost mapped to the current domain.
+    #
+    if ! python3 - "$SERVER_CONF" "$VHOST_NAME" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+server_path = Path(sys.argv[1])
+vhost_name = sys.argv[2]
+
+text = server_path.read_text(encoding="utf-8")
+lines = text.splitlines(keepends=True)
+
+opener = re.compile(
+    r"^\s*virtualHost\s+" + re.escape(vhost_name) + r"\s*\{\s*(?:#.*)?$"
+)
+
+matches = []
+i = 0
+
+while i < len(lines):
+    if not opener.match(lines[i]):
+        i += 1
+        continue
+
+    start = i
+    depth = 0
+    opened = False
+    j = i
+
+    while j < len(lines):
+        code = lines[j].split("#", 1)[0]
+        if "{" in code:
+            opened = True
+        depth += code.count("{")
+        depth -= code.count("}")
+
+        if opened and depth == 0:
+            break
+        j += 1
+
+    if j >= len(lines):
+        print(f"Unterminated virtualHost block: {vhost_name}", file=sys.stderr)
+        raise SystemExit(1)
+
+    matches.append((start, j))
+    i = j + 1
+
+if len(matches) != 1:
+    print(
+        f"Could not uniquely identify virtualHost {vhost_name}.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+start, end = matches[0]
+
+restrained_line = None
+for line_no in range(start + 1, end):
+    if re.match(r"^\s*restrained\s+\S+", lines[line_no]):
+        restrained_line = line_no
+        break
+
+if restrained_line is not None:
+    indent = re.match(r"^(\s*)", lines[restrained_line]).group(1)
+    newline = "\r\n" if lines[restrained_line].endswith("\r\n") else "\n"
+    lines[restrained_line] = f"{indent}restrained              0{newline}"
+else:
+    indent = "    "
+    for line_no in range(start + 1, end):
+        if re.match(
+            r"^\s*(?:vhRoot|configFile|allowSymbolLink|enableScript)\s+",
+            lines[line_no],
+        ):
+            indent = re.match(r"^(\s*)", lines[line_no]).group(1)
+            break
+
+    newline = "\r\n" if lines[end].endswith("\r\n") else "\n"
+    lines.insert(end, f"{indent}restrained              0{newline}")
+
+server_path.write_text("".join(lines), encoding="utf-8")
+PY
+    then
+        rollback_ols_config
+        echo "Could not configure the active OpenLiteSpeed vhost to serve /contract paths." >&2
+        exit 71
+    fi
+
+    #
+    # Protect this exact listener URI from vhost-level CMS/front-controller
+    # rewrite rules if the vhost has a rewrite block. Context-level rewriting
+    # is disabled below as well, which also blocks inherited .htaccess rules.
+    #
+    if ! python3 - "$VHOST_CONF" "$URI" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+uri = sys.argv[2]
+text = path.read_text(encoding="utf-8")
+lines = text.splitlines(keepends=True)
+
+marker = f"# Everlomp listener rewrite bypass: {uri}"
+if marker in text:
+    raise SystemExit(0)
+
+# OLS vhost-level rewrite rules match the URL path including an optional
+# leading slash.
+relative = uri.strip("/")
+pattern = "^/?" + re.escape(relative)
+if uri.endswith("/"):
+    pattern += "(?:/|$)"
+else:
+    pattern += "(?:/|$)"
+
+# Find a top-level rewrite block. Do not manufacture one if the vhost has none;
+# the static context's rewrite disable is sufficient in that case.
+depth = 0
+rewrite_start = None
+rewrite_end = None
+
+for i, line in enumerate(lines):
+    code = line.split("#", 1)[0]
+    stripped = code.strip()
+
+    if depth == 0 and re.match(r"^rewrite\s*\{\s*$", stripped):
+        rewrite_start = i
+        local_depth = code.count("{") - code.count("}")
+        j = i + 1
+        while j < len(lines):
+            next_code = lines[j].split("#", 1)[0]
+            local_depth += next_code.count("{") - next_code.count("}")
+            if local_depth == 0:
+                rewrite_end = j
+                break
+            j += 1
+        break
+
+    depth += code.count("{") - code.count("}")
+
+if rewrite_start is None or rewrite_end is None:
+    raise SystemExit(0)
+
+indent = re.match(r"^(\s*)", lines[rewrite_start]).group(1) + "  "
+newline = "\r\n" if lines[rewrite_start].endswith("\r\n") else "\n"
+
+insert_at = rewrite_end
+for line_no in range(rewrite_start + 1, rewrite_end):
+    stripped = lines[line_no].strip()
+    if re.match(r"^(?:RewriteRule|RewriteCond|RewriteFile)\b", stripped, re.IGNORECASE):
+        insert_at = line_no
+        break
+
+lines[insert_at:insert_at] = [
+    f"{indent}{marker}{newline}",
+    f"{indent}RewriteRule {pattern} - [L]{newline}",
+]
+
+path.write_text("".join(lines), encoding="utf-8")
+PY
+    then
+        rollback_ols_config
+        echo "Could not protect the listener URL from OpenLiteSpeed rewrite rules." >&2
+        exit 72
+    fi
 
     cat >> "$VHOST_CONF" <<EOF
 
@@ -204,71 +603,79 @@ PY
 context $URI {
     location                $LOCATION
     allowBrowse             1
+    indexFiles              $INDEX_FILE
+
+    rewrite  {
+        enable              0
+        inherit             0
+    }
 }
 EOF
 
     echo "[Everlomp] Added listenerURL:"
     echo "[Everlomp]   $URI"
     echo "[Everlomp]   -> $LOCATION"
+    echo "[Everlomp]   index: $INDEX_FILE"
 
     OPENLITESPEED="/usr/local/lsws/bin/openlitespeed"
     LSWSCTRL="/usr/local/lsws/bin/lswsctrl"
 
     if [ ! -x "$OPENLITESPEED" ]; then
-        cp -p "$BACKUP_FILE" "$VHOST_CONF"
+        rollback_ols_config
         echo "OpenLiteSpeed binary is unavailable." >&2
-        exit 71
+        exit 73
     fi
 
     if [ ! -x "$LSWSCTRL" ]; then
-        cp -p "$BACKUP_FILE" "$VHOST_CONF"
+        rollback_ols_config
         echo "OpenLiteSpeed control utility is unavailable." >&2
-        exit 72
+        exit 74
     fi
 
-echo "[Everlomp] Testing OpenLiteSpeed configuration..."
+    echo "[Everlomp] Testing OpenLiteSpeed configuration..."
 
-TEST_CODE=0
-TEST_OUTPUT="$("$OPENLITESPEED" -t 2>&1)" || TEST_CODE=$?
+    if TEST_OUTPUT="$("$OPENLITESPEED" -t 2>&1)"; then
+        TEST_CODE=0
+    else
+        TEST_CODE=$?
+    fi
 
-if [ -n "$TEST_OUTPUT" ]; then
-    printf '%s\n' "$TEST_OUTPUT" >&2
-fi
+    if [ -n "$TEST_OUTPUT" ]; then
+        printf '%s\n' "$TEST_OUTPUT" >&2
+    fi
 
-case "$TEST_CODE" in
-    0)
-        echo "[Everlomp] OpenLiteSpeed configuration is valid."
-        ;;
+    case "$TEST_CODE" in
+        0)
+            echo "[Everlomp] OpenLiteSpeed configuration is valid."
+            ;;
 
-    1)
-        echo "[Everlomp] OpenLiteSpeed configuration is valid with warnings; continuing." >&2
-        ;;
+        1)
+            echo "[Everlomp] OpenLiteSpeed configuration is valid with warnings; continuing." >&2
+            ;;
 
-    *)
-        cp -p "$BACKUP_FILE" "$VHOST_CONF"
+        *)
+            rollback_ols_config
+            echo "OpenLiteSpeed rejected the listenerURL configuration." >&2
+            echo "openlitespeed -t exited with code $TEST_CODE." >&2
+            exit 75
+            ;;
+    esac
 
-        echo "OpenLiteSpeed rejected the listenerURL configuration." >&2
-        echo "openlitespeed -t exited with code $TEST_CODE." >&2
-
-        exit 73
-        ;;
-esac
-
-    echo "[Everlomp] Restarting OpenLiteSpeed..."
+    echo "[Everlomp] Gracefully restarting OpenLiteSpeed..."
 
     if ! "$LSWSCTRL" restart; then
-        echo "[Everlomp] Restart failed; restoring previous vhost configuration." >&2
+        echo "[Everlomp] Restart failed; restoring previous OpenLiteSpeed configuration." >&2
 
-        cp -p "$BACKUP_FILE" "$VHOST_CONF"
+        rollback_ols_config
 
         "$OPENLITESPEED" -t >/dev/null 2>&1 || true
         "$LSWSCTRL" restart >/dev/null 2>&1 || true
 
-        exit 74
+        exit 76
     fi
 
     echo "[Everlomp] listenerURL added successfully."
-    echo "$URI -> $LOCATION"
+    echo "$URI -> $LOCATION (index: $INDEX_FILE)"
 
     exit 0
 fi
