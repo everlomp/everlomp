@@ -7,8 +7,254 @@ SUPERVISOR_CONF="/etc/everlomp/supervisord.conf"
 SUPERVISORCTL="/usr/bin/supervisorctl"
 ENABLED_FILE="/var/www/.everlomp/hotpocket.enabled"
 
+if [ "$ACTION" = "add-listener" ]; then
+    PAYLOAD_FILE="$(mktemp /tmp/everlomp-listener-payload.XXXXXX)"
+    PARSED_FILE="$(mktemp /tmp/everlomp-listener-parsed.XXXXXX)"
+    BACKUP_FILE=""
+
+    cleanup_listener() {
+        rm -f "$PAYLOAD_FILE" "$PARSED_FILE"
+
+        if [ -n "$BACKUP_FILE" ]; then
+            rm -f "$BACKUP_FILE"
+        fi
+    }
+
+    trap cleanup_listener EXIT
+
+    cat > "$PAYLOAD_FILE"
+
+    if ! python3 - "$PAYLOAD_FILE" > "$PARSED_FILE" <<'PY'
+import json
+import re
+import sys
+
+payload_file = sys.argv[1]
+
+try:
+    payload = json.loads(open(payload_file, "r", encoding="utf-8").read())
+except Exception:
+    print("Invalid listenerURL request.", file=sys.stderr)
+    raise SystemExit(1)
+
+suffix = str(payload.get("url_suffix", "")).strip().strip("/")
+scope = str(payload.get("scope", "")).strip()
+target = str(payload.get("target", "")).strip().strip("/")
+
+if scope not in ("state", "seed"):
+    print("Listener scope must be state or seed.", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def validate_relative(label, value):
+    if len(value) > 240:
+        print(f"{label} is too long.", file=sys.stderr)
+        raise SystemExit(1)
+
+    if not value:
+        return
+
+    for part in value.split("/"):
+        if not part or part in (".", ".."):
+            print(f"{label} contains an invalid path component.", file=sys.stderr)
+            raise SystemExit(1)
+
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", part):
+            print(
+                f"{label} may only use letters, numbers, dots, underscores, dashes and slashes.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+
+validate_relative("listenerURL suffix", suffix)
+validate_relative("Listener target", target)
+
+# Do not let "outside consensus" secretly point back into state/.
+if scope == "seed" and (target == "state" or target.startswith("state/")):
+    print(
+        "A seed listener may not target state/. Choose the state scope instead.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+uri = "/evernode/"
+if suffix:
+    uri += suffix + "/"
+
+if scope == "state":
+    base = "/contract/contract_fs/seed/state"
+else:
+    base = "/contract/contract_fs/seed"
+
+location = base
+if target:
+    location += "/" + target
+
+location += "/"
+
+print(uri)
+print(location)
+print(base)
+PY
+    then
+        exit 65
+    fi
+
+    mapfile -t LISTENER_VALUES < "$PARSED_FILE"
+
+    if [ "${#LISTENER_VALUES[@]}" -ne 3 ]; then
+        echo "Could not parse listenerURL configuration." >&2
+        exit 66
+    fi
+
+    URI="${LISTENER_VALUES[0]}"
+    LOCATION="${LISTENER_VALUES[1]}"
+    BASE="${LISTENER_VALUES[2]}"
+
+    if [ ! -d "$BASE" ]; then
+        echo "Contract directory does not exist: $BASE" >&2
+        exit 67
+    fi
+
+    TARGET_DIR="${LOCATION%/}"
+
+    if [ "$TARGET_DIR" != "$BASE" ]; then
+        BASE_UID="$(stat -c '%u' "$BASE")"
+        BASE_GID="$(stat -c '%g' "$BASE")"
+        BASE_MODE="$(stat -c '%a' "$BASE")"
+
+        install \
+            -d \
+            -o "$BASE_UID" \
+            -g "$BASE_GID" \
+            -m "$BASE_MODE" \
+            "$TARGET_DIR"
+    fi
+
+    #
+    # Find Everlomp's OpenLiteSpeed vhost.
+    #
+    VHOST_ROOT="/usr/local/lsws/conf/vhosts"
+
+    if [ ! -d "$VHOST_ROOT" ]; then
+        echo "OpenLiteSpeed vhost directory does not exist: $VHOST_ROOT" >&2
+        exit 68
+    fi
+
+    mapfile -t VHOST_CANDIDATES < <(
+        find "$VHOST_ROOT" \
+            -type f \
+            -name 'vhconf.conf' \
+            -print 2>/dev/null \
+            | sort
+    )
+
+    VHOST_PREFERRED=()
+
+    for CONF in "${VHOST_CANDIDATES[@]}"; do
+        if grep -Eq \
+            '^[[:space:]]*context[[:space:]]+/(phpmyadmin|filegator|kopia|openlitespeed)/' \
+            "$CONF"; then
+            VHOST_PREFERRED+=("$CONF")
+        fi
+    done
+
+    if [ "${#VHOST_PREFERRED[@]}" -eq 1 ]; then
+        VHOST_CONF="${VHOST_PREFERRED[0]}"
+    elif [ "${#VHOST_CANDIDATES[@]}" -eq 1 ]; then
+        VHOST_CONF="${VHOST_CANDIDATES[0]}"
+    else
+        echo "Could not uniquely identify the Everlomp OpenLiteSpeed vhost configuration." >&2
+        echo "Found ${#VHOST_CANDIDATES[@]} candidate vhconf.conf files." >&2
+        exit 69
+    fi
+
+    echo "[Everlomp] OpenLiteSpeed vhost: $VHOST_CONF"
+
+    #
+    # ADD ONLY.
+    #
+    # If this URI already exists, do not alter it.
+    #
+    if python3 - "$VHOST_CONF" "$URI" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+uri = sys.argv[2]
+
+text = open(path, "r", encoding="utf-8").read()
+
+pattern = r"(?m)^\s*context\s+" + re.escape(uri) + r"\s*\{"
+
+raise SystemExit(0 if re.search(pattern, text) else 1)
+PY
+    then
+        echo "listenerURL already exists: $URI" >&2
+        exit 70
+    fi
+
+    BACKUP_FILE="$(mktemp /tmp/everlomp-vhconf.XXXXXX)"
+    cp -p "$VHOST_CONF" "$BACKUP_FILE"
+
+    cat >> "$VHOST_CONF" <<EOF
+
+# Everlomp smart-contract listenerURL
+context $URI {
+    location                $LOCATION
+    allowBrowse             1
+}
+EOF
+
+    echo "[Everlomp] Added listenerURL:"
+    echo "[Everlomp]   $URI"
+    echo "[Everlomp]   -> $LOCATION"
+
+    OPENLITESPEED="/usr/local/lsws/bin/openlitespeed"
+    LSWSCTRL="/usr/local/lsws/bin/lswsctrl"
+
+    if [ ! -x "$OPENLITESPEED" ]; then
+        cp -p "$BACKUP_FILE" "$VHOST_CONF"
+        echo "OpenLiteSpeed binary is unavailable." >&2
+        exit 71
+    fi
+
+    if [ ! -x "$LSWSCTRL" ]; then
+        cp -p "$BACKUP_FILE" "$VHOST_CONF"
+        echo "OpenLiteSpeed control utility is unavailable." >&2
+        exit 72
+    fi
+
+    echo "[Everlomp] Testing OpenLiteSpeed configuration..."
+
+    if ! "$OPENLITESPEED" -t; then
+        cp -p "$BACKUP_FILE" "$VHOST_CONF"
+        echo "OpenLiteSpeed rejected the listenerURL configuration." >&2
+        exit 73
+    fi
+
+    echo "[Everlomp] Restarting OpenLiteSpeed..."
+
+    if ! "$LSWSCTRL" restart; then
+        echo "[Everlomp] Restart failed; restoring previous vhost configuration." >&2
+
+        cp -p "$BACKUP_FILE" "$VHOST_CONF"
+
+        "$OPENLITESPEED" -t >/dev/null 2>&1 || true
+        "$LSWSCTRL" restart >/dev/null 2>&1 || true
+
+        exit 74
+    fi
+
+    echo "[Everlomp] listenerURL added successfully."
+    echo "$URI -> $LOCATION"
+
+    exit 0
+fi
+
 if [ "$ACTION" != "enable" ]; then
-    echo "Usage: everlomp-hotpocket enable" >&2
+    echo "Usage: everlomp-hotpocket enable|add-listener" >&2
     exit 64
 fi
 
