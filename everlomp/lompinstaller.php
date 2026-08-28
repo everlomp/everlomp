@@ -29,7 +29,9 @@ $externalInstallerDir      = '/home/everlomp/external-installs';
 $externalInstallerExampleFile = '/home/everlomp/external-installer-example.zip';
 $sshConfiguredFile       = '/var/www/.everlomp/ssh.configured';
 $contractEnvFile         = '/contract/env.vars';
-
+$listenerUrlSuffix = '';
+$listenerScope = 'state';
+$listenerTarget = '';
 $scriptName = str_replace('\\', '/', (string) ($_SERVER['SCRIPT_NAME'] ?? '/install.php'));
 $panelUrl = $scriptName !== '' && str_starts_with($scriptName, '/') ? $scriptName : '/install.php';
 
@@ -1834,6 +1836,90 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    if ($action === 'add_listenerurl') {
+        $listenerUrlSuffix = trim((string) ($_POST['listener_url_suffix'] ?? ''));
+        $listenerUrlSuffix = trim($listenerUrlSuffix, '/');
+
+        $listenerScope = trim((string) ($_POST['listener_scope'] ?? 'state'));
+
+        $listenerTarget = trim((string) ($_POST['listener_target'] ?? ''));
+        $listenerTarget = trim($listenerTarget, '/');
+
+        $validListenerRelativePath = static function (string $value): bool {
+            if (strlen($value) > 240) {
+                return false;
+            }
+
+            if ($value === '') {
+                return true;
+            }
+
+            foreach (explode('/', $value) as $part) {
+                if (
+                    $part === ''
+                    || $part === '.'
+                    || $part === '..'
+                    || preg_match('/^[A-Za-z0-9._-]+$/D', $part) !== 1
+                ) {
+                    return false;
+                }
+            }
+
+            return true;
+        };
+
+        if (!$hotpocketEnabled) {
+            $error = 'Enable HotPocket before adding a smart-contract listenerURL.';
+        } elseif (!in_array($listenerScope, ['state', 'seed'], true)) {
+            $error = 'Choose a valid listenerURL storage location.';
+        } elseif (!$validListenerRelativePath($listenerUrlSuffix)) {
+            $error = 'Enter a valid /evernode/ listenerURL suffix.';
+        } elseif (!$validListenerRelativePath($listenerTarget)) {
+            $error = 'Enter a valid smart-contract target path.';
+        } elseif (
+            $listenerScope === 'seed'
+            && (
+                $listenerTarget === 'state'
+                || str_starts_with($listenerTarget, 'state/')
+            )
+        ) {
+            $error = 'A seed listener cannot target state/. Choose the state-folder option instead.';
+        } else {
+            [$code, $stdout, $stderr] = runEverlompHelper(
+                '/usr/local/sbin/everlomp-hotpocket',
+                'add-listener',
+                json_encode([
+                    'url_suffix' => $listenerUrlSuffix,
+                    'scope' => $listenerScope,
+                    'target' => $listenerTarget,
+                ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)
+            );
+
+            if ($code === 0) {
+                $listenerUri = '/evernode/'
+                    . ($listenerUrlSuffix !== '' ? $listenerUrlSuffix . '/' : '');
+
+                $listenerRoot = $listenerScope === 'state'
+                    ? '/contract/contract_fs/seed/state'
+                    : '/contract/contract_fs/seed';
+
+                $listenerLocation = $listenerRoot
+                    . ($listenerTarget !== '' ? '/' . $listenerTarget : '');
+
+                $message = 'listenerURL added: '
+                    . $listenerUri
+                    . ' → '
+                    . $listenerLocation;
+            } else {
+                $error = $stderr !== ''
+                    ? $stderr
+                    : ($stdout !== ''
+                        ? $stdout
+                        : 'Could not add the listenerURL.');
+            }
+        }
+    }
+    
     if ($action === 'install_wordpress') {
         $siteUrl = rtrim(trim((string) ($_POST['site_url'] ?? '')), '/');
         $siteTitle = trim((string) ($_POST['site_title'] ?? ''));
