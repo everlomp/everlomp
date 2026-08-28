@@ -16,7 +16,7 @@ Actions:
 
 from __future__ import annotations
 
-HELPER_BUILD = 'v8-home-contract-library'
+HELPER_BUILD = 'v9-contract-deploy-manifest'
 
 import fnmatch
 import io
@@ -48,6 +48,8 @@ HP_CONFIG_FILE = Path('/contract/cfg/hp.cfg')
 STATE_DIR = Path('/contract/contract_fs/seed/state')
 SEED_DIR = Path('/contract/contract_fs/seed')
 CONTRACT_ZIP_DIR = Path('/home/everlomp/hotpocket-contracts')
+DEPLOY_MANIFEST_NAME = 'contract.deploy.json'
+MAX_DEPLOY_MANIFEST = 256 * 1024
 
 MAX_JSON_STDIN = 64 * 1024
 MAX_ZIP_COMPRESSED = 100 * 1024 * 1024
@@ -725,6 +727,126 @@ def action_write_config() -> None:
     print(f'Saved HotPocket configuration to {HP_CONFIG_FILE}.')
 
 
+def _nonempty_manifest_string(manifest: dict, key: str) -> str | None:
+    if key not in manifest or manifest[key] is None:
+        return None
+    value = manifest[key]
+    if not isinstance(value, str):
+        fail(f"{DEPLOY_MANIFEST_NAME}: '{key}' must be a string when provided.", 65)
+    value = value.strip()
+    if value == '':
+        return None
+    if len(value.encode('utf-8')) > 16384 or any(ch in value for ch in ('\x00', '\r', '\n')):
+        fail(f"{DEPLOY_MANIFEST_NAME}: '{key}' is too large or contains unsupported control characters.", 65)
+    return value
+
+
+def _nonempty_manifest_string_list(manifest: dict, key: str) -> list[str] | None:
+    if key not in manifest or manifest[key] is None:
+        return None
+    value = manifest[key]
+    if not isinstance(value, list):
+        fail(f"{DEPLOY_MANIFEST_NAME}: '{key}' must be an array when provided.", 65)
+    if len(value) == 0:
+        return None
+    if len(value) > 1000:
+        fail(f"{DEPLOY_MANIFEST_NAME}: '{key}' contains too many entries.", 65)
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            fail(f"{DEPLOY_MANIFEST_NAME}: every '{key}' entry must be text.", 65)
+        item = item.strip()
+        if item == '':
+            fail(f"{DEPLOY_MANIFEST_NAME}: '{key}' cannot contain empty entries.", 65)
+        if len(item.encode('utf-8')) > 1024 or any(ch in item for ch in ('\x00', '\r', '\n')):
+            fail(f"{DEPLOY_MANIFEST_NAME}: '{key}' contains an invalid entry.", 65)
+        if item not in result:
+            result.append(item)
+    return result or None
+
+
+def prepare_deploy_hp_config(staging: Path) -> tuple[str, str | None, list[str]]:
+    manifest_path = staging / DEPLOY_MANIFEST_NAME
+    try:
+        st = manifest_path.lstat()
+    except FileNotFoundError:
+        fail(f'The smart contract ZIP must contain {DEPLOY_MANIFEST_NAME} at the root of seed/state.', 65)
+    except OSError as exc:
+        fail(f'Could not inspect {DEPLOY_MANIFEST_NAME}: {exc}', 75)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        fail(f'{DEPLOY_MANIFEST_NAME} must be a regular file.', 65)
+    if st.st_size < 2 or st.st_size > MAX_DEPLOY_MANIFEST:
+        fail(f'{DEPLOY_MANIFEST_NAME} must be valid JSON and no larger than {MAX_DEPLOY_MANIFEST // 1024} KiB.', 65)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f'Could not parse {DEPLOY_MANIFEST_NAME}: {exc}', 65)
+    if not isinstance(manifest, dict):
+        fail(f'{DEPLOY_MANIFEST_NAME} must contain a JSON object.', 65)
+
+    try:
+        original_text = HP_CONFIG_FILE.read_text(encoding='utf-8')
+    except OSError as exc:
+        fail(f'Could not read {HP_CONFIG_FILE} before contract deployment: {exc}', 67)
+    config = load_hp_config()
+
+    contract = config.get('contract')
+    if not isinstance(contract, dict):
+        fail("HotPocket configuration requires 'contract' to be a JSON object.", 65)
+    mesh = config.get('mesh')
+    if not isinstance(mesh, dict):
+        fail("HotPocket configuration requires 'mesh' to be a JSON object.", 65)
+    consensus = contract.get('consensus')
+    if not isinstance(consensus, dict):
+        fail("HotPocket configuration requires 'contract.consensus' to be a JSON object.", 65)
+    environment = contract.get('environment')
+    if isinstance(environment, list) and len(environment) == 0:
+        contract['environment'] = {}
+        environment = contract['environment']
+    if not isinstance(environment, dict):
+        fail("HotPocket configuration requires 'contract.environment' to be a JSON object.", 65)
+
+    changed: list[str] = []
+
+    bin_path = _nonempty_manifest_string(manifest, 'deployBinPath')
+    if bin_path is not None:
+        contract['bin_path'] = bin_path
+        changed.append('contract.bin_path')
+
+    bin_args = _nonempty_manifest_string(manifest, 'deployBinArgs')
+    if bin_args is not None:
+        contract['bin_args'] = bin_args
+        changed.append('contract.bin_args')
+
+    if 'roundtime' in manifest and manifest['roundtime'] is not None:
+        roundtime = manifest['roundtime']
+        if roundtime == 0:
+            roundtime = None
+        elif isinstance(roundtime, bool) or not isinstance(roundtime, int) or roundtime < 1:
+            fail(f"{DEPLOY_MANIFEST_NAME}: 'roundtime' must be a positive integer, 0, or null.", 65)
+        if roundtime is not None:
+            consensus['roundtime'] = roundtime
+            changed.append('contract.consensus.roundtime')
+
+    unl = _nonempty_manifest_string_list(manifest, 'unl')
+    if unl is not None:
+        contract['unl'] = unl
+        changed.append('contract.unl')
+
+    known_peers = _nonempty_manifest_string_list(manifest, 'knownPeers')
+    if known_peers is not None:
+        mesh['known_peers'] = known_peers
+        changed.append('mesh.known_peers')
+
+    if not changed:
+        return original_text, None, []
+
+    encoded = json.dumps(config, ensure_ascii=False, indent=2) + '\n'
+    if len(encoded.encode('utf-8')) > MAX_JSON_STDIN:
+        fail('Merged HotPocket configuration is too large.', 65)
+    return original_text, encoded, changed
+
+
 def safe_zip_parts(name: str) -> tuple[str, ...]:
     if not name or '\x00' in name or '\\' in name or name.startswith('/'):
         fail(f'Unsafe ZIP entry path: {name!r}', 65)
@@ -832,23 +954,41 @@ def replace_state_from_data(data: bytes, source_label: str) -> None:
         raise
 
     assert staging is not None
+    original_hp_config, merged_hp_config, hp_config_changes = prepare_deploy_hp_config(staging)
     backup = parent / f'.state-backup-{uuid.uuid4().hex}'
     had_target = STATE_DIR.exists()
     try:
         if had_target:
             os.rename(STATE_DIR, backup)
         os.rename(staging, STATE_DIR)
+        if merged_hp_config is not None:
+            write_preserving(HP_CONFIG_FILE, merged_hp_config)
+            load_hp_config()
     except BaseException as exc:
-        if STATE_DIR.exists() and not had_target:
-            shutil.rmtree(STATE_DIR, ignore_errors=True)
-        if had_target and backup.exists() and not STATE_DIR.exists():
-            os.rename(backup, STATE_DIR)
+        rollback_errors: list[str] = []
+        try:
+            if merged_hp_config is not None:
+                write_preserving(HP_CONFIG_FILE, original_hp_config)
+        except BaseException as rollback_exc:
+            rollback_errors.append(f'hp.cfg rollback failed: {rollback_exc}')
+        try:
+            if STATE_DIR.exists():
+                shutil.rmtree(STATE_DIR, ignore_errors=True)
+            if had_target and backup.exists():
+                os.rename(backup, STATE_DIR)
+        except BaseException as rollback_exc:
+            rollback_errors.append(f'state rollback failed: {rollback_exc}')
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
-        fail(f'Could not activate the uploaded smart contract state: {exc}', 75)
+        suffix = (' ' + '; '.join(rollback_errors)) if rollback_errors else ''
+        fail(f'Could not activate the uploaded smart contract and its HotPocket configuration: {exc}.{suffix}', 75)
     if backup.exists():
         shutil.rmtree(backup)
     print(f'Replaced {STATE_DIR} with {entries_count} validated ZIP entries from {source_label}.')
+    if hp_config_changes:
+        print(f'Applied {DEPLOY_MANIFEST_NAME} overrides to {HP_CONFIG_FILE}: {", ".join(hp_config_changes)}.')
+    else:
+        print(f'{DEPLOY_MANIFEST_NAME} contained no non-empty overrides; existing {HP_CONFIG_FILE} values were kept.')
 
 
 
