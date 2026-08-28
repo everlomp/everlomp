@@ -684,6 +684,7 @@ COPY everlomp/everlomp-lsws-password /usr/local/sbin/everlomp-lsws-password
 COPY everlomp/everlomp-key /usr/local/sbin/everlomp-key
 COPY everlomp/everlomp-secret /usr/local/sbin/everlomp-secret
 COPY everlomp/everlomp-kopia-priv /usr/local/sbin/everlomp-kopia-priv
+COPY everlomp/hotpocket-contracts /home/everlomp/hotpocket-contracts
 
 RUN chown everlomp:everlomp \
         /home/everlomp/phpBB-3.3.17.zip \
