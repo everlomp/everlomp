@@ -29,9 +29,7 @@ $externalInstallerDir      = '/home/everlomp/external-installs';
 $externalInstallerExampleFile = '/home/everlomp/external-installer-example.zip';
 $sshConfiguredFile       = '/var/www/.everlomp/ssh.configured';
 $contractEnvFile         = '/contract/env.vars';
-$listenerUrlSuffix = '';
-$listenerScope = 'state';
-$listenerTarget = '';
+
 $scriptName = str_replace('\\', '/', (string) ($_SERVER['SCRIPT_NAME'] ?? '/install.php'));
 $panelUrl = $scriptName !== '' && str_starts_with($scriptName, '/') ? $scriptName : '/install.php';
 
@@ -870,7 +868,10 @@ $kopiaGeneratedRepository = '';
 $kopiaGeneratedVersion = '';
 $sshGeneratedUsername = '';
 $sshGeneratedPassword = '';
-
+$listenerNamespace = 'evernode';
+$listenerPath = '';
+$listenerScope = 'state';
+$listenerIndexFile = 'index.html';
 if (($_GET['database'] ?? '') === 'created') {
     $message = 'MariaDB administrator account created.';
 }
@@ -1837,12 +1838,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'add_listenerurl') {
-        $listenerUrlSuffix = trim((string) ($_POST['listener_url_suffix'] ?? ''));
-        $listenerUrlSuffix = trim($listenerUrlSuffix, '/');
+        $listenerNamespace = trim((string) ($_POST['listener_namespace'] ?? 'evernode'));
+        $listenerPath = trim((string) ($_POST['listener_path'] ?? $_POST['listener_url_suffix'] ?? ''));
+        $listenerPath = trim($listenerPath, '/');
 
         $listenerScope = trim((string) ($_POST['listener_scope'] ?? 'state'));
 
-        $listenerTarget = $listenerUrlSuffix;
+        $listenerIndexFile = trim((string) ($_POST['listener_index_file'] ?? 'index.html'));
+        if ($listenerIndexFile === '') {
+            $listenerIndexFile = 'index.html';
+        }
+
+        $listenerHost = strtolower(trim($host));
+        $listenerPort = trim((string) ($_SERVER['SERVER_PORT'] ?? ''));
 
         $validListenerRelativePath = static function (string $value): bool {
             if (strlen($value) > 240) {
@@ -1869,17 +1877,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (!$hotpocketEnabled) {
             $error = 'Enable HotPocket before adding a smart-contract listenerURL.';
+        } elseif (!in_array($listenerNamespace, ['evernode', 'hotpocket'], true)) {
+            $error = 'Choose a valid listener namespace.';
         } elseif (!in_array($listenerScope, ['state', 'seed'], true)) {
             $error = 'Choose a valid listenerURL storage location.';
-        } elseif (!$validListenerRelativePath($listenerUrlSuffix)) {
-            $error = 'Enter a valid /evernode/ listenerURL suffix.';
-        } elseif (!$validListenerRelativePath($listenerTarget)) {
-            $error = 'Enter a valid smart-contract target path.';
+        } elseif (!$validListenerRelativePath($listenerPath)) {
+            $error = 'Enter a valid listener path.';
+        } elseif (
+            strlen($listenerIndexFile) > 128
+            || preg_match('/^[A-Za-z0-9._-]+$/D', $listenerIndexFile) !== 1
+        ) {
+            $error = 'Enter a valid index filename, for example index.html.';
+        } elseif (
+            $listenerHost === ''
+            || strlen($listenerHost) > 253
+            || preg_match('/^[A-Za-z0-9.-]+$/D', $listenerHost) !== 1
+        ) {
+            $error = 'Could not determine the current domain for the OpenLiteSpeed listener.';
+        } elseif (
+            $listenerPort === ''
+            || !ctype_digit($listenerPort)
+            || (int) $listenerPort < 1
+            || (int) $listenerPort > 65535
+        ) {
+            $error = 'Could not determine the OpenLiteSpeed listener port for this request.';
         } elseif (
             $listenerScope === 'seed'
             && (
-                $listenerTarget === 'state'
-                || str_starts_with($listenerTarget, 'state/')
+                $listenerPath === 'state'
+                || str_starts_with($listenerPath, 'state/')
             )
         ) {
             $error = 'A seed listener cannot target state/. Choose the state-folder option instead.';
@@ -1888,27 +1914,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 '/usr/local/sbin/everlomp-hotpocket',
                 'add-listener',
                 json_encode([
-                    'url_suffix' => $listenerUrlSuffix,
+                    'namespace' => $listenerNamespace,
+                    'path' => $listenerPath,
                     'scope' => $listenerScope,
-                    'target' => $listenerTarget,
+                    'index_file' => $listenerIndexFile,
+                    'host' => $listenerHost,
+                    'port' => (int) $listenerPort,
                 ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)
             );
 
             if ($code === 0) {
-                $listenerUri = '/evernode/'
-                    . ($listenerUrlSuffix !== '' ? $listenerUrlSuffix . '/' : '');
+                $listenerUri = '/'
+                    . $listenerNamespace
+                    . '/'
+                    . ($listenerPath !== '' ? $listenerPath . '/' : '');
 
                 $listenerRoot = $listenerScope === 'state'
                     ? '/contract/contract_fs/seed/state'
                     : '/contract/contract_fs/seed';
 
                 $listenerLocation = $listenerRoot
-                    . ($listenerTarget !== '' ? '/' . $listenerTarget : '');
+                    . ($listenerPath !== '' ? '/' . $listenerPath : '');
 
                 $message = 'listenerURL added: '
                     . $listenerUri
                     . ' → '
-                    . $listenerLocation;
+                    . $listenerLocation
+                    . ' · index: '
+                    . $listenerIndexFile;
             } else {
                 $error = $stderr !== ''
                     ? $stderr
@@ -1918,7 +1951,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
     }
-    
+
     if ($action === 'install_wordpress') {
         $siteUrl = rtrim(trim((string) ($_POST['site_url'] ?? '')), '/');
         $siteTitle = trim((string) ($_POST['site_title'] ?? ''));
@@ -2210,7 +2243,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $boardName = trim((string) ($_POST['phpbb_board_name'] ?? ''));
         $boardDescription = trim((string) ($_POST['phpbb_board_description'] ?? ''));
         $adminUser = trim((string) ($_POST['phpbb_admin_user'] ?? ''));
-        $adminEmail = trim((string) ($_POST['phpbb_admin_email'] ?? ''));
+        $adminEmail = trim((string) ($_POST['phpbb_admin_email'] ?? 'admin@local.local'));
         $adminPassword = (string) ($_POST['phpbb_admin_password'] ?? '');
         $adminPasswordConfirm = (string) ($_POST['phpbb_admin_password_confirm'] ?? '');
         $dbMode = (string) ($_POST['db_mode'] ?? 'auto');
@@ -3074,7 +3107,7 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 
 <div class="split">
 <label>phpBB admin username<input type="text" name="phpbb_admin_user" value="admin" maxlength="60" required></label>
-<label>phpBB admin email<input type="email" name="phpbb_admin_email" required></label>
+<label>phpBB admin email<input type="email" name="phpbb_admin_email" value="<?= h((string) ($_POST['phpbb_admin_email'] ?? 'admin@local.local')) ?>" required></label>
 </div>
 
 <div class="split">
@@ -3473,14 +3506,13 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <div class="wizard-callout"><div class="wizard-callout-icon">i</div><div><strong>This is the one installer opportunity to enable HotPocket.</strong><br>If you do not need smart contracts, leave it off. If you skip it and later remove the installer, the Everlomp installer will no longer be available to enable it for you.</div></div>
 <div class="wizard-choice-grid" style="margin-top:16px"><div class="choice-card recommended"><span class="choice-badge">For smart contracts</span><h3>Enable HotPocket</h3><p>Starts HotPocket now, enables autostart, and prepares the bootstrap-contract runtime for deployments.</p><form method="post" class="wizard-ajax-form"><input type="hidden" name="action" value="enable_hotpocket"><div class="terms-agreements"><label class="terms-check"><input type="checkbox" name="accept_hotpocket_terms" value="1" required><span>I accept the <a target="_blank" rel="noopener noreferrer" href="https://github.com/EvernodeXRPL/hpcore/blob/main/evernode-license.pdf">HotPocket license terms</a>.</span></label></div><div class="wizard-actions"><button type="submit">Enable HotPocket</button></div></form></div><div class="choice-card"><span class="choice-badge">Normal web apps</span><h3>Keep it off</h3><p>Recommended if you only need WordPress, Drupal, phpBB, PHP/web files, or other non-smart-contract workloads.</p><div class="wizard-actions"><button type="button" class="secondary" onclick="skipHotPocket()">Continue without HotPocket</button></div></div></div>
 <?php endif; ?>
-
 <div class="wizard-divider"></div>
 
 <h3>Add a listenerURL to your smart contract</h3>
 
 <p>
-    Expose a smart-contract seed directory through a URL beginning with
-    <code>/evernode/</code>.
+    Expose a smart-contract seed directory through either the
+    <code>/evernode/</code> or <code>/hotpocket/</code> URL namespace.
 </p>
 
 <?php if ($hotpocketEnabled): ?>
@@ -3497,53 +3529,85 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
     <div class="split">
 
         <label>
-            Listener prefix
+            URL namespace
 
-            <input type="text"
-                   value="/evernode/"
-                   readonly>
+            <select name="listener_namespace" required>
+                <option value="evernode"
+                    <?= $listenerNamespace === 'evernode' ? 'selected' : '' ?>>
+                    Evernode — /evernode/
+                </option>
+
+                <option value="hotpocket"
+                    <?= $listenerNamespace === 'hotpocket' ? 'selected' : '' ?>>
+                    HotPocket — /hotpocket/
+                </option>
+            </select>
         </label>
 
         <label>
-            URL after /evernode/
+            Listener path
 
             <input type="text"
-                   name="listener_url_suffix"
+                   name="listener_path"
                    maxlength="240"
-                   value="<?= h($listenerUrlSuffix) ?>"
-                   placeholder="(optional)">
+                   value="<?= h($listenerPath) ?>"
+                   placeholder="test">
 
+            <small>
+                Optional. Example: <code>test</code> becomes
+                <code>/evernode/test/</code> or <code>/hotpocket/test/</code>.
+            </small>
         </label>
 
     </div>
 
-    <label>
-        Where should it point?
+    <div class="split">
 
-        <select name="listener_scope" required>
+        <label>
+            Where should it point?
 
-            <option value="state"
-                <?= $listenerScope === 'state' ? 'selected' : '' ?>>
-                In state folder — subject to consensus
-            </option>
+            <select name="listener_scope" required>
 
-            <option value="seed"
-                <?= $listenerScope === 'seed' ? 'selected' : '' ?>>
-                In seed folder — outside consensus
-            </option>
+                <option value="state"
+                    <?= $listenerScope === 'state' ? 'selected' : '' ?>>
+                    In state folder — subject to consensus
+                </option>
 
-        </select>
-    </label>
+                <option value="seed"
+                    <?= $listenerScope === 'seed' ? 'selected' : '' ?>>
+                    In seed folder — outside consensus
+                </option>
+
+            </select>
+        </label>
+
+        <label>
+            Index file
+
+            <input type="text"
+                   name="listener_index_file"
+                   maxlength="128"
+                   value="<?= h($listenerIndexFile) ?>"
+                   placeholder="index.html">
+
+            <small>
+                File served when the listener URL points to a directory.
+                Default: <code>index.html</code>.
+            </small>
+        </label>
+
+    </div>
+
     <div class="wizard-callout">
         <div class="wizard-callout-icon">↗</div>
 
         <div>
             <strong>State folder</strong><br>
-            <code>/contract/contract_fs/seed/state/&lt;your folder&gt;</code>
+            <code>/contract/contract_fs/seed/state/&lt;path&gt;</code>
             <br><br>
 
             <strong>Seed folder</strong><br>
-            <code>/contract/contract_fs/seed/&lt;your folder&gt;</code>
+            <code>/contract/contract_fs/seed/&lt;path&gt;</code>
         </div>
     </div>
 
@@ -3562,11 +3626,11 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 </div>
 
 <?php endif; ?>
-                                                                                                                                                                                                                 
-</div>endif
+
+</div>
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(5)">← Applications</button><button type="button" onclick="completeHotPocketStep()" <?= $hotpocketEnabled ? '' : 'disabled data-hotpocket-continue' ?>>Continue to Backups →</button></div>
 </section>
-endif
+
 <section id="wizard-step-7" class="wizard-panel" data-step="7">
 <div class="wizard-kicker">Step 7 of 9 · Backup installation</div>
 <h2 class="wizard-title">Schedule backups first. Then install Kopia.</h2>
