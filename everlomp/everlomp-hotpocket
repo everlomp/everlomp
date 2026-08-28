@@ -226,13 +226,33 @@ EOF
         exit 72
     fi
 
-    echo "[Everlomp] Testing OpenLiteSpeed configuration..."
+echo "[Everlomp] Testing OpenLiteSpeed configuration..."
 
-    if ! "$OPENLITESPEED" -t; then
+TEST_CODE=0
+TEST_OUTPUT="$("$OPENLITESPEED" -t 2>&1)" || TEST_CODE=$?
+
+if [ -n "$TEST_OUTPUT" ]; then
+    printf '%s\n' "$TEST_OUTPUT" >&2
+fi
+
+case "$TEST_CODE" in
+    0)
+        echo "[Everlomp] OpenLiteSpeed configuration is valid."
+        ;;
+
+    1)
+        echo "[Everlomp] OpenLiteSpeed configuration is valid with warnings; continuing." >&2
+        ;;
+
+    *)
         cp -p "$BACKUP_FILE" "$VHOST_CONF"
+
         echo "OpenLiteSpeed rejected the listenerURL configuration." >&2
+        echo "openlitespeed -t exited with code $TEST_CODE." >&2
+
         exit 73
-    fi
+        ;;
+esac
 
     echo "[Everlomp] Restarting OpenLiteSpeed..."
 
