@@ -966,7 +966,7 @@ if (($_GET['hotpocket_site'] ?? '') === 'configured') {
 
 if (($_GET['hotpocket'] ?? '') === 'enabled') {
     $message = (($_GET['contract'] ?? '') === 'uploaded')
-        ? 'Smart contract deployed to /contract/contract_fs/seed/state and HotPocket enabled. Supervisor will now autostart it and keep it running.'
+        ? 'Smart contract deployed to /contract/contract_fs/seed/state, contract.deploy.json merged into hp.cfg, and HotPocket enabled. Supervisor will now autostart it and keep it running.'
         : 'HotPocket enabled. Supervisor will now autostart it and keep it running.';
 }
 
@@ -3924,7 +3924,7 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <div data-hotpocket-contract-browser-source style="margin-top:14px">
 <label>Smart contract ZIP
 <input type="file" name="hotpocket_contract_zip" accept=".zip,application/zip">
-<small>Maximum compressed size: 100 MiB. The archive replaces the entire <code>/contract/contract_fs/seed/state</code> directory.</small>
+<small>Maximum compressed size: 100 MiB. The archive replaces the entire <code>/contract/contract_fs/seed/state</code> directory and must contain <code>contract.deploy.json</code> at its root.</small>
 </label>
 </div>
 <div data-hotpocket-contract-library-source class="hidden" style="margin-top:14px">
@@ -3935,10 +3935,11 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <option value="<?= h((string) $libraryFile['name']) ?>" <?= $hotpocketContractLibraryFile === (string) $libraryFile['name'] ? 'selected' : '' ?>><?= h((string) $libraryFile['name']) ?> · <?= h(number_format(((int) $libraryFile['size']) / 1048576, 2)) ?> MiB</option>
 <?php endforeach; ?>
 </select>
-<small>Drop reusable contract ZIPs into <code><?= h($hotpocketContractLibraryDir) ?></code>. Only direct, regular <code>.zip</code> files up to 100 MiB are listed.</small>
+<small>Drop reusable contract ZIPs into <code><?= h($hotpocketContractLibraryDir) ?></code>. Each deployable ZIP must contain <code>contract.deploy.json</code> at the root of the resulting state directory.</small>
 </label>
 <?php if ($hotpocketContractLibrary === []): ?><div class="warning"><strong>No saved ZIPs found yet.</strong> Put one or more <code>.zip</code> files in <code><?= h($hotpocketContractLibraryDir) ?></code>, then reload this step.</div><?php endif; ?>
 </div>
+<div class="wizard-callout" style="margin-top:12px"><div class="wizard-callout-icon">{}</div><div><strong>Deployment manifest → hp.cfg</strong><br>After extraction, Everlomp reads <code>/contract/contract_fs/seed/state/contract.deploy.json</code>. Non-empty values update <code>contract.bin_path</code>, <code>contract.bin_args</code>, <code>contract.consensus.roundtime</code>, <code>contract.unl</code>, and <code>mesh.known_peers</code>. Missing or empty values keep the current <code>hp.cfg</code> value.</div></div>
 <div class="warning"><strong>Destructive replacement:</strong> whichever source you choose, existing files in <code>/contract/contract_fs/seed/state</code> are removed and replaced by the selected ZIP.</div>
 </div>
 <div class="wizard-actions"><button type="submit">Enable HotPocket</button></div>
