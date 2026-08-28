@@ -3474,10 +3474,120 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <div class="wizard-callout"><div class="wizard-callout-icon">i</div><div><strong>This is the one installer opportunity to enable HotPocket.</strong><br>If you do not need smart contracts, leave it off. If you skip it and later remove the installer, the Everlomp installer will no longer be available to enable it for you.</div></div>
 <div class="wizard-choice-grid" style="margin-top:16px"><div class="choice-card recommended"><span class="choice-badge">For smart contracts</span><h3>Enable HotPocket</h3><p>Starts HotPocket now, enables autostart, and prepares the bootstrap-contract runtime for deployments.</p><form method="post" class="wizard-ajax-form"><input type="hidden" name="action" value="enable_hotpocket"><div class="terms-agreements"><label class="terms-check"><input type="checkbox" name="accept_hotpocket_terms" value="1" required><span>I accept the <a target="_blank" rel="noopener noreferrer" href="https://github.com/EvernodeXRPL/hpcore/blob/main/evernode-license.pdf">HotPocket license terms</a>.</span></label></div><div class="wizard-actions"><button type="submit">Enable HotPocket</button></div></form></div><div class="choice-card"><span class="choice-badge">Normal web apps</span><h3>Keep it off</h3><p>Recommended if you only need WordPress, Drupal, phpBB, PHP/web files, or other non-smart-contract workloads.</p><div class="wizard-actions"><button type="button" class="secondary" onclick="skipHotPocket()">Continue without HotPocket</button></div></div></div>
 <?php endif; ?>
+
+<div class="wizard-divider"></div>
+
+<h3>Add a listenerURL to your smart contract</h3>
+
+<p>
+    Expose a smart-contract seed directory through a URL beginning with
+    <code>/evernode/</code>.
+</p>
+
+<?php if ($hotpocketEnabled): ?>
+
+<form method="post"
+      autocomplete="off"
+      class="wizard-ajax-form"
+      data-step="6">
+
+    <input type="hidden"
+           name="action"
+           value="add_listenerurl">
+
+    <div class="split">
+
+        <label>
+            Listener prefix
+
+            <input type="text"
+                   value="/evernode/"
+                   readonly>
+        </label>
+
+        <label>
+            URL after /evernode/
+
+            <input type="text"
+                   name="listener_url_suffix"
+                   maxlength="240"
+                   value="<?= h($listenerUrlSuffix) ?>"
+                   placeholder="my-contract">
+
+            <small>
+                Optional. Leave blank for
+                <code>/evernode/</code>.
+            </small>
+        </label>
+
+    </div>
+
+    <label>
+        Where should it point?
+
+        <select name="listener_scope" required>
+
+            <option value="state"
+                <?= $listenerScope === 'state' ? 'selected' : '' ?>>
+                In state folder — subject to consensus
+            </option>
+
+            <option value="seed"
+                <?= $listenerScope === 'seed' ? 'selected' : '' ?>>
+                In seed folder — outside consensus
+            </option>
+
+        </select>
+    </label>
+
+    <label>
+        Folder inside selected location
+
+        <input type="text"
+               name="listener_target"
+               maxlength="240"
+               value="<?= h($listenerTarget) ?>"
+               placeholder="public">
+
+        <small>
+            Optional relative folder. You can also use nested paths,
+            for example <code>public/api</code>.
+        </small>
+    </label>
+
+    <div class="wizard-callout">
+        <div class="wizard-callout-icon">↗</div>
+
+        <div>
+            <strong>State folder</strong><br>
+            <code>/contract/contract_fs/seed/state/&lt;your folder&gt;</code>
+            <br><br>
+
+            <strong>Seed folder</strong><br>
+            <code>/contract/contract_fs/seed/&lt;your folder&gt;</code>
+        </div>
+    </div>
+
+    <div class="wizard-actions">
+        <button type="submit">
+            Add listenerURL
+        </button>
+    </div>
+
+</form>
+
+<?php else: ?>
+
+<div class="wizard-lock">
+    Enable HotPocket above before adding a smart-contract listenerURL.
 </div>
+
+<?php endif; ?>
+                                                                                                                                                                                                                 
+</div>endif
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(5)">← Applications</button><button type="button" onclick="completeHotPocketStep()" <?= $hotpocketEnabled ? '' : 'disabled data-hotpocket-continue' ?>>Continue to Backups →</button></div>
 </section>
-
+endif
 <section id="wizard-step-7" class="wizard-panel" data-step="7">
 <div class="wizard-kicker">Step 7 of 9 · Backup installation</div>
 <h2 class="wizard-title">Schedule backups first. Then install Kopia.</h2>
