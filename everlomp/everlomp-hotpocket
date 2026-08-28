@@ -5,6 +5,8 @@ Actions:
   enable          Enable/autostart HotPocket under Supervisor and start it.
   add-listener    Add a smart-contract listenerURL to the active OLS vhost.
   replace-state   Safely replace /contract/contract_fs/seed/state from ZIP stdin.
+  list-contract-zips List deployable ZIP files from /home/everlomp/hotpocket-contracts.
+  deploy-contract-zip Deploy one saved ZIP from /home/everlomp/hotpocket-contracts.
   configure-site  Save the future website root/subfolder/index selection without switching OLS yet.
   list-site-dirs List safe existing subfolders under seed/state and seed.
   finalize-site   Apply the saved website root at final installer cleanup.
@@ -14,10 +16,13 @@ Actions:
 
 from __future__ import annotations
 
+HELPER_BUILD = 'v8-home-contract-library'
+
 import fnmatch
 import io
 import json
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -42,6 +47,7 @@ SITE_INFO_FILE = Path('/home/everlomp/hotpocket-site.json')
 HP_CONFIG_FILE = Path('/contract/cfg/hp.cfg')
 STATE_DIR = Path('/contract/contract_fs/seed/state')
 SEED_DIR = Path('/contract/contract_fs/seed')
+CONTRACT_ZIP_DIR = Path('/home/everlomp/hotpocket-contracts')
 
 MAX_JSON_STDIN = 64 * 1024
 MAX_ZIP_COMPRESSED = 100 * 1024 * 1024
@@ -733,12 +739,11 @@ def safe_zip_parts(name: str) -> tuple[str, ...]:
     return parts
 
 
-def action_replace_state() -> None:
+def replace_state_from_data(data: bytes, source_label: str) -> None:
     if ENABLED_FILE.exists():
         fail('HotPocket is already enabled. Use evdevkit for normal smart-contract deployment instead of this installer upload.', 66)
-    data = sys.stdin.buffer.read(MAX_ZIP_COMPRESSED + 1)
     if not data:
-        fail('No smart contract ZIP data was received.', 65)
+        fail(f'No smart contract ZIP data was received from {source_label}.', 65)
     if len(data) > MAX_ZIP_COMPRESSED:
         fail('Smart contract ZIP exceeds the 100 MiB compressed-size limit.', 65)
     parent = STATE_DIR.parent
@@ -820,7 +825,7 @@ def action_replace_state() -> None:
     except zipfile.BadZipFile:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
-        fail('The uploaded file is not a valid ZIP archive.', 65)
+        fail(f'The selected smart contract file from {source_label} is not a valid ZIP archive.', 65)
     except BaseException:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
@@ -843,7 +848,91 @@ def action_replace_state() -> None:
         fail(f'Could not activate the uploaded smart contract state: {exc}', 75)
     if backup.exists():
         shutil.rmtree(backup)
-    print(f'Replaced {STATE_DIR} with {entries_count} validated ZIP entries.')
+    print(f'Replaced {STATE_DIR} with {entries_count} validated ZIP entries from {source_label}.')
+
+
+
+def action_replace_state() -> None:
+    data = sys.stdin.buffer.read(MAX_ZIP_COMPRESSED + 1)
+    replace_state_from_data(data, 'browser upload')
+
+
+def ensure_contract_zip_dir() -> None:
+    if CONTRACT_ZIP_DIR.exists():
+        if CONTRACT_ZIP_DIR.is_symlink() or not CONTRACT_ZIP_DIR.is_dir():
+            fail(f'Contract ZIP library path is unsafe: {CONTRACT_ZIP_DIR}', 67)
+        return
+    try:
+        CONTRACT_ZIP_DIR.mkdir(parents=True, mode=0o755)
+        try:
+            account = pwd.getpwnam('everlomp')
+            os.chown(CONTRACT_ZIP_DIR, account.pw_uid, account.pw_gid)
+        except KeyError:
+            pass
+        os.chmod(CONTRACT_ZIP_DIR, 0o755)
+    except OSError as exc:
+        fail(f'Could not create contract ZIP library {CONTRACT_ZIP_DIR}: {exc}', 75)
+
+
+def safe_contract_zip_file(name: str) -> Path:
+    name = name.strip()
+    if not name or len(name.encode('utf-8')) > 255 or '\x00' in name or '/' in name or '\\' in name:
+        fail('Choose a valid contract ZIP filename.', 65)
+    if name in ('.', '..') or not name.lower().endswith('.zip'):
+        fail('Saved smart contracts must be .zip files.', 65)
+    ensure_contract_zip_dir()
+    path = CONTRACT_ZIP_DIR / name
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        fail(f'The saved contract ZIP no longer exists: {name}', 66)
+    except OSError as exc:
+        fail(f'Could not inspect saved contract ZIP {name}: {exc}', 75)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        fail(f'Refusing unsafe saved contract ZIP: {name}', 67)
+    if st.st_size < 1 or st.st_size > MAX_ZIP_COMPRESSED:
+        fail(f'Saved contract ZIP must be between 1 byte and 100 MiB: {name}', 65)
+    return path
+
+
+def action_list_contract_zips() -> None:
+    ensure_contract_zip_dir()
+    files: list[dict[str, int | str]] = []
+    try:
+        for entry in CONTRACT_ZIP_DIR.iterdir():
+            try:
+                st = entry.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                continue
+            if not entry.name.lower().endswith('.zip'):
+                continue
+            if st.st_size < 1 or st.st_size > MAX_ZIP_COMPRESSED:
+                continue
+            files.append({'name': entry.name, 'size': st.st_size, 'mtime': int(st.st_mtime)})
+    except OSError as exc:
+        fail(f'Could not read contract ZIP library {CONTRACT_ZIP_DIR}: {exc}', 75)
+    files.sort(key=lambda item: (-int(item['mtime']), str(item['name']).lower()))
+    print(json.dumps({'directory': str(CONTRACT_ZIP_DIR), 'files': files}, ensure_ascii=False))
+
+
+def action_deploy_contract_zip() -> None:
+    if ENABLED_FILE.exists():
+        fail('HotPocket is already enabled. Use evdevkit for normal smart-contract deployment instead of this installer library.', 66)
+    payload = read_json_stdin()
+    name = payload.get('name')
+    if not isinstance(name, str):
+        fail('Choose a saved contract ZIP to deploy.', 65)
+    path = safe_contract_zip_file(name)
+    try:
+        with path.open('rb') as handle:
+            data = handle.read(MAX_ZIP_COMPRESSED + 1)
+    except OSError as exc:
+        fail(f'Could not read saved contract ZIP {name}: {exc}', 75)
+    if len(data) > MAX_ZIP_COMPRESSED:
+        fail('Smart contract ZIP exceeds the 100 MiB compressed-size limit.', 65)
+    replace_state_from_data(data, f'saved ZIP {name}')
 
 
 def supervisor(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -912,13 +1001,17 @@ def main() -> None:
     require_root()
     action = sys.argv[1] if len(sys.argv) > 1 else ''
     if len(sys.argv) != 2:
-        fail('Usage: everlomp-hotpocket enable|add-listener|replace-state|configure-site|list-site-dirs|finalize-site|read-config|write-config', 64)
+        fail('Usage: everlomp-hotpocket enable|add-listener|replace-state|list-contract-zips|deploy-contract-zip|configure-site|list-site-dirs|finalize-site|read-config|write-config', 64)
     if action == 'enable':
         action_enable()
     elif action == 'add-listener':
         action_add_listener()
     elif action == 'replace-state':
         action_replace_state()
+    elif action == 'list-contract-zips':
+        action_list_contract_zips()
+    elif action == 'deploy-contract-zip':
+        action_deploy_contract_zip()
     elif action == 'configure-site':
         action_configure_site()
     elif action == 'list-site-dirs':
@@ -930,7 +1023,7 @@ def main() -> None:
     elif action == 'write-config':
         action_write_config()
     else:
-        fail('Usage: everlomp-hotpocket enable|add-listener|replace-state|configure-site|list-site-dirs|finalize-site|read-config|write-config', 64)
+        fail('Usage: everlomp-hotpocket enable|add-listener|replace-state|list-contract-zips|deploy-contract-zip|configure-site|list-site-dirs|finalize-site|read-config|write-config', 64)
 
 
 if __name__ == '__main__':
