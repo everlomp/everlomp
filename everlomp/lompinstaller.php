@@ -1842,8 +1842,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $listenerScope = trim((string) ($_POST['listener_scope'] ?? 'state'));
 
-        $listenerTarget = trim((string) ($_POST['listener_target'] ?? ''));
-        $listenerTarget = trim($listenerTarget, '/');
+        $listenerTarget = $listenerUrlSuffix;
 
         $validListenerRelativePath = static function (string $value): bool {
             if (strlen($value) > 240) {
@@ -3539,22 +3538,6 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 
         </select>
     </label>
-
-    <label>
-        Folder inside selected location
-
-        <input type="text"
-               name="listener_target"
-               maxlength="240"
-               value="<?= h($listenerTarget) ?>"
-               placeholder="public">
-
-        <small>
-            Optional relative folder. You can also use nested paths,
-            for example <code>public/api</code>.
-        </small>
-    </label>
-
     <div class="wizard-callout">
         <div class="wizard-callout-icon">↗</div>
 
