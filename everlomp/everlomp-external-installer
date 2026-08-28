@@ -289,8 +289,16 @@ def validate_field_values(manifest: dict, values: object) -> dict:
 
 
 def install_package() -> None:
-    if PRIMARY.exists():
-        fail('A primary application is already installed.', 80)
+    current_primary = ''
+
+    if PRIMARY.is_file():
+        try:
+            current_primary = PRIMARY.read_text(encoding='utf-8').strip()
+        except OSError:
+            current_primary = ''
+
+    if current_primary:
+        fail(f'A primary application is already installed: {current_primary}', 80)
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError as exc:
@@ -336,10 +344,43 @@ def install_package() -> None:
             detail = detail[-4000:]
         fail(f'External installer failed with exit code {result.returncode}' + (f': {detail}' if detail else '.'), 85)
 
+    expected_primary = f'external:{package_id}'
+
     temp = PRIMARY.with_name('.primary-app.external.tmp')
-    temp.write_text(f'external:{package_id}\n', encoding='utf-8')
-    os.chmod(temp, 0o644)
-    os.replace(temp, PRIMARY)
+
+    try:
+        temp.write_text(expected_primary + '\n', encoding='utf-8')
+        os.chmod(temp, 0o644)
+        os.replace(temp, PRIMARY)
+    except OSError as exc:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        fail(
+            f'External application installed successfully, but Everlomp '
+            f'could not register it as the primary application: {exc}',
+            86
+        )
+
+    try:
+        registered_primary = PRIMARY.read_text(encoding='utf-8').strip()
+    except OSError as exc:
+        fail(
+            f'External application installed successfully, but Everlomp '
+            f'could not verify primary application state: {exc}',
+            87
+        )
+
+    if registered_primary != expected_primary:
+        fail(
+            f'External application installed successfully, but Everlomp '
+            f'primary application state is invalid. '
+            f'Expected "{expected_primary}", got "{registered_primary}".',
+            88
+        )
+
     print(f'Installed external primary application: {package_id}')
 
 
