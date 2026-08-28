@@ -3511,12 +3511,8 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
                    name="listener_url_suffix"
                    maxlength="240"
                    value="<?= h($listenerUrlSuffix) ?>"
-                   placeholder="my-contract">
+                   placeholder="(optional)">
 
-            <small>
-                Optional. Leave blank for
-                <code>/evernode/</code>.
-            </small>
         </label>
 
     </div>
