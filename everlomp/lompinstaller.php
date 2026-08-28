@@ -18,6 +18,7 @@ $phpmyadminIndexFile    = '/usr/local/everlomp/phpmyadmin/index.php';
 $realIpProxyFile         = '/home/everlomp/realip-proxy';
 $realIpFailedFile        = '/home/everlomp/realip-failed';
 $hotpocketEnabledFile     = '/var/www/.everlomp/hotpocket.enabled';
+$hotpocketSiteInfoFile    = '/home/everlomp/hotpocket-site.json';
 $filegatorInfoFile        = '/var/www/.everlomp-filegator/info.json';
 $filegatorIndexFile       = '/var/www/.everlomp-filegator/app/dist/index.php';
 $backupInfoFile           = '/home/everlomp/backup.json';
@@ -30,13 +31,18 @@ $externalInstallerExampleFile = '/home/everlomp/external-installer-example.zip';
 $sshConfiguredFile       = '/var/www/.everlomp/ssh.configured';
 $contractEnvFile         = '/contract/env.vars';
 
-$scriptName = str_replace('\\', '/', (string) ($_SERVER['SCRIPT_NAME'] ?? '/install.php'));
-$panelUrl = $scriptName !== '' && str_starts_with($scriptName, '/') ? $scriptName : '/install.php';
+$scriptName = str_replace('\\', '/', (string) ($_SERVER['SCRIPT_NAME'] ?? '/lompinstaller.php'));
+$panelUrl = $scriptName !== '' && str_starts_with($scriptName, '/') ? $scriptName : '/lompinstaller.php';
 
 if (!isset($_SESSION['everlomp_key_replace_csrf']) || !is_string($_SESSION['everlomp_key_replace_csrf']) || strlen($_SESSION['everlomp_key_replace_csrf']) < 32) {
     $_SESSION['everlomp_key_replace_csrf'] = bin2hex(random_bytes(32));
 }
 $keyReplaceCsrf = (string) $_SESSION['everlomp_key_replace_csrf'];
+
+if (!isset($_SESSION['everlomp_hotpocket_config_csrf']) || !is_string($_SESSION['everlomp_hotpocket_config_csrf']) || strlen($_SESSION['everlomp_hotpocket_config_csrf']) < 32) {
+    $_SESSION['everlomp_hotpocket_config_csrf'] = bin2hex(random_bytes(32));
+}
+$hotpocketConfigCsrf = (string) $_SESSION['everlomp_hotpocket_config_csrf'];
 
 function h(string $value): string
 {
@@ -770,6 +776,8 @@ if (
 $wordpressInstalled = $primaryApp === 'wordpress';
 $drupalInstalled = $primaryApp === 'drupal';
 $phpbbInstalled = $primaryApp === 'phpbb';
+$hotpocketSiteSelected = $primaryApp === 'hotpocket-folder';
+$hotpocketSiteInfo = readJsonFile($hotpocketSiteInfoFile);
 $phpmyadminInstalled = is_file($phpmyadminIndexFile);
 $hotpocketEnabled = is_file($hotpocketEnabledFile);
 $filegatorInstalled = is_file($filegatorIndexFile);
@@ -853,6 +861,35 @@ $everlompTerms = is_readable($everlompTermsFile)
 
 $termsAccepted = (($_SESSION['everlomp_terms_accepted'] ?? false) === true);
 $action = '';
+$hotpocketContractChoice = in_array((string) ($_POST['hotpocket_contract_choice'] ?? ''), ['yes', 'no'], true)
+    ? (string) $_POST['hotpocket_contract_choice']
+    : '';
+
+$hotpocketSiteScope = in_array((string) ($_POST['hotpocket_site_scope'] ?? ''), ['state', 'seed'], true)
+    ? (string) $_POST['hotpocket_site_scope']
+    : (in_array((string) ($hotpocketSiteInfo['scope'] ?? ''), ['state', 'seed'], true) ? (string) $hotpocketSiteInfo['scope'] : 'state');
+$hotpocketSiteSubfolder = $_SERVER['REQUEST_METHOD'] === 'POST' && (string) ($_POST['action'] ?? '') === 'configure_hotpocket_site'
+    ? trim((string) ($_POST['hotpocket_site_subfolder'] ?? ''))
+    : trim((string) ($hotpocketSiteInfo['subfolder'] ?? ''));
+$hotpocketSiteDirectories = ['state' => [], 'seed' => []];
+if ($primaryApp === '' || $hotpocketSiteSelected) {
+    [$siteDirsCode, $siteDirsStdout] = runEverlompHelper('/usr/local/sbin/everlomp-hotpocket', 'list-site-dirs');
+    if ($siteDirsCode === 0 && $siteDirsStdout !== '') {
+        $siteDirsDecoded = json_decode($siteDirsStdout, true);
+        if (is_array($siteDirsDecoded)) {
+            $hotpocketSiteDirectories['state'] = normalizedStringList($siteDirsDecoded['state'] ?? []);
+            $hotpocketSiteDirectories['seed'] = normalizedStringList($siteDirsDecoded['seed'] ?? []);
+        }
+    }
+}
+$hotpocketSiteStoredIndexes = normalizedStringList($hotpocketSiteInfo['index_files'] ?? []);
+if ($hotpocketSiteStoredIndexes === []) $hotpocketSiteStoredIndexes = ['index.html', 'index.php'];
+$hotpocketSiteDefaultIndexes = $_SERVER['REQUEST_METHOD'] === 'POST' && (string) ($_POST['action'] ?? '') === 'configure_hotpocket_site'
+    ? normalizedStringList($_POST['hotpocket_site_default_indexes'] ?? [])
+    : array_values(array_intersect(['index.html', 'index.php'], $hotpocketSiteStoredIndexes));
+$hotpocketSiteCustomIndexes = $_SERVER['REQUEST_METHOD'] === 'POST' && (string) ($_POST['action'] ?? '') === 'configure_hotpocket_site'
+    ? normalizedStringList(preg_split('/[\s,]+/', trim((string) ($_POST['hotpocket_site_custom_indexes'] ?? ''))) ?: [])
+    : array_values(array_diff($hotpocketSiteStoredIndexes, ['index.html', 'index.php']));
 
 $message = '';
 $error = '';
@@ -896,8 +933,14 @@ if (($_GET['realip'] ?? '') === 'configured') {
     $message = 'Real client IP forwarding configured successfully.';
 }
 
+if (($_GET['hotpocket_site'] ?? '') === 'configured') {
+    $message = 'HotPocket website folder selected. Everlomp will keep serving the installer until the final cleanup step, then switch the website root.';
+}
+
 if (($_GET['hotpocket'] ?? '') === 'enabled') {
-    $message = 'HotPocket enabled. Supervisor will now autostart it and keep it running.';
+    $message = (($_GET['contract'] ?? '') === 'uploaded')
+        ? 'Smart contract uploaded to /contract/contract_fs/seed/state and HotPocket enabled. Supervisor will now autostart it and keep it running.'
+        : 'HotPocket enabled. Supervisor will now autostart it and keep it running.';
 }
 
 if (
@@ -948,6 +991,100 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!$termsAccepted && $action !== 'accept_terms') {
         $error = 'Accept the Everlomp installation terms before changing or installing anything.';
         $action = '__blocked_until_terms_are_accepted__';
+    }
+
+    if (in_array($action, ['hotpocket_config_read', 'hotpocket_config_write'], true)) {
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, max-age=0');
+        header('Pragma: no-cache');
+
+        $csrf = (string) ($_POST['csrf'] ?? '');
+        if ($csrf === '' || !hash_equals($hotpocketConfigCsrf, $csrf)) {
+            http_response_code(403);
+            echo json_encode(['ok' => false, 'message' => 'The HotPocket configuration editor session expired. Reload the installer and try again.']);
+            exit;
+        }
+
+        if ($action === 'hotpocket_config_read') {
+            [$code, $stdout, $stderr] = runEverlompHelper(
+                '/usr/local/sbin/everlomp-hotpocket',
+                'read-config'
+            );
+            if ($code !== 0) {
+                http_response_code(409);
+                echo json_encode([
+                    'ok' => false,
+                    'message' => $stderr !== '' ? $stderr : ($stdout !== '' ? $stdout : 'Could not read /contract/cfg/hp.cfg.'),
+                ]);
+                exit;
+            }
+            try {
+                // IMPORTANT: decode JSON objects as stdClass, not associative PHP arrays.
+                // json_decode(..., true) collapses an empty JSON object {} into an empty
+                // PHP array, which json_encode() then emits as []. HotPocket requires
+                // object-valued sections such as contract.environment to remain objects.
+                $config = json_decode($stdout, false, 512, JSON_THROW_ON_ERROR);
+            } catch (JsonException $exception) {
+                http_response_code(500);
+                echo json_encode(['ok' => false, 'message' => 'HotPocket returned an invalid hp.cfg document.']);
+                exit;
+            }
+            if (!is_object($config)) {
+                http_response_code(500);
+                echo json_encode(['ok' => false, 'message' => 'HotPocket returned an invalid hp.cfg document.']);
+                exit;
+            }
+            echo json_encode([
+                'ok' => true,
+                'config' => $config,
+                'editable' => !$hotpocketEnabled,
+                'path' => '/contract/cfg/hp.cfg',
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($hotpocketEnabled) {
+            http_response_code(409);
+            echo json_encode(['ok' => false, 'message' => 'HotPocket is already enabled. The installer only changes hp.cfg before HotPocket starts.']);
+            exit;
+        }
+
+        $configJson = (string) ($_POST['config_json'] ?? '');
+        if ($configJson === '' || strlen($configJson) > 64 * 1024) {
+            http_response_code(400);
+            echo json_encode(['ok' => false, 'message' => 'HotPocket configuration must be valid JSON up to 64 KiB.']);
+            exit;
+        }
+
+        $decodedObject = json_decode($configJson);
+        if (!is_object($decodedObject)) {
+            http_response_code(400);
+            echo json_encode(['ok' => false, 'message' => 'HotPocket configuration root must be a JSON object.']);
+            exit;
+        }
+        // Keep the object/array distinction from the submitted JSON. In particular,
+        // an empty object {} must never be converted to [] while returning the saved
+        // configuration to the browser.
+        $normalizedConfig = json_encode($decodedObject, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        [$code, $stdout, $stderr] = runEverlompHelper(
+            '/usr/local/sbin/everlomp-hotpocket',
+            'write-config',
+            $normalizedConfig
+        );
+        if ($code !== 0) {
+            http_response_code(409);
+            echo json_encode([
+                'ok' => false,
+                'message' => $stderr !== '' ? $stderr : ($stdout !== '' ? $stdout : 'Could not save /contract/cfg/hp.cfg.'),
+            ]);
+            exit;
+        }
+        echo json_encode([
+            'ok' => true,
+            'message' => $stdout !== '' ? $stdout : 'HotPocket configuration saved.',
+            'config' => $decodedObject,
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        exit;
     }
 
     if ($action === 'test_kopia_offsite_connection') {
@@ -1753,6 +1890,64 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    if ($action === 'configure_hotpocket_site') {
+        $hotpocketSiteScope = trim((string) ($_POST['hotpocket_site_scope'] ?? ''));
+        $hotpocketSiteSubfolder = trim((string) ($_POST['hotpocket_site_subfolder'] ?? ''));
+        $hotpocketSiteDefaultIndexes = normalizedStringList($_POST['hotpocket_site_default_indexes'] ?? []);
+        $customRaw = trim((string) ($_POST['hotpocket_site_custom_indexes'] ?? ''));
+        $hotpocketSiteCustomIndexes = normalizedStringList(preg_split('/[\s,]+/', $customRaw) ?: []);
+        $hotpocketSiteIndexFiles = array_values(array_unique(array_merge($hotpocketSiteDefaultIndexes, $hotpocketSiteCustomIndexes)));
+
+        $validIndex = static function (string $name): bool {
+            return strlen($name) >= 1
+                && strlen($name) <= 128
+                && preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]*$/D', $name) === 1;
+        };
+        $validSubfolder = static function (string $value): bool {
+            if ($value === '') return true;
+            if (strlen($value) > 240 || str_starts_with($value, '/') || str_contains($value, '\\') || str_contains($value, '//')) return false;
+            foreach (explode('/', $value) as $part) {
+                if ($part === '' || $part === '.' || $part === '..' || strlen($part) > 128 || preg_match('/^[A-Za-z0-9._-]+$/D', $part) !== 1) return false;
+            }
+            return true;
+        };
+
+        if ($primaryApp !== '' && $primaryApp !== 'hotpocket-folder') {
+            $error = 'A different primary application is already configured.';
+        } elseif (!in_array($hotpocketSiteScope, ['state', 'seed'], true)) {
+            $error = 'Choose either /contract/contract_fs/seed/state or /contract/contract_fs/seed as the website root.';
+        } elseif (!$validSubfolder($hotpocketSiteSubfolder)) {
+            $error = 'Subfolder must be a relative path such as public or public/html. Do not use an absolute path, backslashes, empty path segments, . or ...';
+        } elseif ($hotpocketSiteIndexFiles === []) {
+            $error = 'Choose at least one index filename. index.html and index.php are enabled by default, or you can add your own.';
+        } elseif (count($hotpocketSiteIndexFiles) > 16) {
+            $error = 'Use no more than 16 index filenames.';
+        } elseif (array_filter($hotpocketSiteIndexFiles, static fn(string $name): bool => !$validIndex($name)) !== []) {
+            $error = 'Index filenames may contain only letters, numbers, dots, underscores, and hyphens, and must start with a letter or number.';
+        } else {
+            [$code, $stdout, $stderr] = runEverlompHelper(
+                '/usr/local/sbin/everlomp-hotpocket',
+                'configure-site',
+                json_encode([
+                    'scope' => $hotpocketSiteScope,
+                    'subfolder' => $hotpocketSiteSubfolder,
+                    'index_files' => $hotpocketSiteIndexFiles,
+                    'host' => strtolower(trim($host)),
+                    'port' => (int) ($_SERVER['SERVER_PORT'] ?? 0),
+                ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)
+            );
+
+            if ($code === 0) {
+                header('Location: ' . $panelUrl . '?hotpocket_site=configured');
+                exit;
+            }
+
+            $error = $stderr !== ''
+                ? $stderr
+                : ($stdout !== '' ? $stdout : 'Could not point the website at the HotPocket contract folder.');
+        }
+    }
+
     if ($action === 'enable_ssh') {
         if ($primaryApp === '') {
             $error = 'Install a primary application before enabling SSH.';
@@ -1801,39 +1996,110 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } elseif (!$sshDecisionMade) {
             $error = 'Choose whether SSH should be enabled before removing the Everlomp installer.';
         } else {
-            [$code, $stdout, $stderr] = runEverlompHelper(
-                '/usr/local/sbin/everlomp-delete-installfile',
-                'delete'
-            );
-
-            if ($code === 0) {
-                header('Location: /');
-                exit;
+            // A HotPocket-folder website must stay on the normal Everlomp document
+            // root until this exact final step, otherwise /lompinstaller.php becomes
+            // unreachable and Step 6+ POST requests return 404. Finalize it now.
+            if ($primaryApp === 'hotpocket-folder') {
+                ignore_user_abort(true);
+                @set_time_limit(180);
+                [$siteCode, $siteStdout, $siteStderr] = runEverlompHelper(
+                    '/usr/local/sbin/everlomp-hotpocket',
+                    'finalize-site'
+                );
+                if ($siteCode !== 0) {
+                    $error = $siteStderr !== ''
+                        ? $siteStderr
+                        : ($siteStdout !== '' ? $siteStdout : 'Could not activate the selected HotPocket website root.');
+                }
             }
 
-            $error = $stderr !== '' ? $stderr : ($stdout !== '' ? $stdout : 'Could not delete the Everlomp install page.');
+            if ($error === '') {
+                [$code, $stdout, $stderr] = runEverlompHelper(
+                    '/usr/local/sbin/everlomp-delete-installfile',
+                    'delete'
+                );
+
+                if ($code === 0) {
+                    header('Location: /');
+                    exit;
+                }
+
+                $error = $stderr !== '' ? $stderr : ($stdout !== '' ? $stdout : 'Could not delete the Everlomp install page.');
+            }
         }
     }
 
     if ($action === 'enable_hotpocket') {
+        $hotpocketContractChoice = (string) ($_POST['hotpocket_contract_choice'] ?? '');
+        $contractUploaded = false;
+
         if ((string) ($_POST['accept_hotpocket_terms'] ?? '') !== '1') {
             $error = 'Accept the HotPocket license terms before enabling HotPocket.';
+        } elseif (!in_array($hotpocketContractChoice, ['yes', 'no'], true)) {
+            $error = 'Choose YES or NO for whether you want to upload a smart contract now. HotPocket will not start until you make this choice.';
         } elseif ($hotpocketEnabled) {
             $message = 'HotPocket is already enabled.';
         } else {
-            [$code, $stdout, $stderr] = runEverlompHelper(
-                '/usr/local/sbin/everlomp-hotpocket',
-                'enable'
-            );
+            if ($hotpocketContractChoice === 'yes') {
+                $upload = $_FILES['hotpocket_contract_zip'] ?? null;
 
-            if ($code === 0) {
-                header('Location: ' . $panelUrl . '?hotpocket=enabled');
-                exit;
+                if (!is_array($upload)) {
+                    $error = 'Choose the smart contract ZIP you want to install before starting HotPocket.';
+                } elseif ((int) ($upload['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+                    $error = 'Smart contract ZIP upload failed with code ' . (string) ($upload['error'] ?? 'unknown') . '.';
+                } else {
+                    $originalName = (string) ($upload['name'] ?? '');
+                    $tmpName = (string) ($upload['tmp_name'] ?? '');
+                    $size = (int) ($upload['size'] ?? 0);
+
+                    if (!preg_match('/\.zip$/i', $originalName)) {
+                        $error = 'Smart contracts must be uploaded as .zip files.';
+                    } elseif ($size < 1 || $size > 100 * 1024 * 1024) {
+                        $error = 'Smart contract ZIP must be between 1 byte and 100 MiB.';
+                    } elseif ($tmpName === '' || !is_uploaded_file($tmpName) || !is_readable($tmpName)) {
+                        $error = 'The uploaded smart contract ZIP could not be read safely.';
+                    } else {
+                        $zipData = file_get_contents($tmpName);
+                        if (!is_string($zipData) || strlen($zipData) !== $size) {
+                            $error = 'The uploaded smart contract ZIP could not be read completely.';
+                        } else {
+                            // IMPORTANT: the helper must validate the ZIP (including zip-slip/symlinks),
+                            // replace the complete state directory, and return non-zero on any failure.
+                            [$replaceCode, $replaceStdout, $replaceStderr] = runEverlompHelper(
+                                '/usr/local/sbin/everlomp-hotpocket',
+                                'replace-state',
+                                $zipData
+                            );
+
+                            if ($replaceCode !== 0) {
+                                $error = $replaceStderr !== ''
+                                    ? $replaceStderr
+                                    : ($replaceStdout !== '' ? $replaceStdout : 'Could not replace the smart contract state directory.');
+                            } else {
+                                $contractUploaded = true;
+                            }
+                        }
+                    }
+                }
             }
 
-            $error = $stderr !== ''
-                ? $stderr
-                : ($stdout !== '' ? $stdout : 'Could not enable HotPocket.');
+            // Enabling is deliberately last: HotPocket cannot be started until the
+            // user has explicitly answered YES/NO, and a requested upload succeeded.
+            if ($error === '') {
+                [$code, $stdout, $stderr] = runEverlompHelper(
+                    '/usr/local/sbin/everlomp-hotpocket',
+                    'enable'
+                );
+
+                if ($code === 0) {
+                    header('Location: ' . $panelUrl . '?hotpocket=enabled' . ($contractUploaded ? '&contract=uploaded' : ''));
+                    exit;
+                }
+
+                $error = $stderr !== ''
+                    ? $stderr
+                    : ($stdout !== '' ? $stdout : 'Could not enable HotPocket.');
+            }
         }
     }
 
@@ -2373,6 +2639,8 @@ $externalInstalledId = externalInstallerIdFromPrimary($primaryApp);
 $wordpressInstalled = $primaryApp === 'wordpress';
 $drupalInstalled = $primaryApp === 'drupal';
 $phpbbInstalled = $primaryApp === 'phpbb';
+$hotpocketSiteSelected = $primaryApp === 'hotpocket-folder';
+$hotpocketSiteInfo = readJsonFile($hotpocketSiteInfoFile);
 $phpmyadminInstalled = is_file($phpmyadminIndexFile);
 $hotpocketEnabled = is_file($hotpocketEnabledFile);
 $filegatorInstalled = is_file($filegatorIndexFile);
@@ -2391,6 +2659,7 @@ $sshMappingReady = $sshPublicPort !== '' && $sshHostDomain !== '';
 );
 $kopiaBuildToolsReady = kopiaBuildToolsReady();
 $kopiaUrl = '/kopia/';
+$primaryAppDisplay = $hotpocketSiteSelected ? 'HotPocket folder website' : $primaryApp;
 
 $realIpTrustedProxy = readTextFile($realIpProxyFile);
 $realIpFailedProxy = readTextFile($realIpFailedFile);
@@ -2479,6 +2748,9 @@ form{display:grid;gap:14px;margin-top:20px}label{display:grid;gap:7px;font-size:
 @media(max-width:560px){.wizard-nav{grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.wizard-sidebar{padding:12px}.wizard-card{padding:18px}.wizard-actions.end{align-items:stretch}.wizard-actions.end>*{width:100%}}
 
 .key-gate{position:fixed;inset:0;z-index:10000;display:grid;place-items:center;padding:22px;background:rgba(5,7,11,.86);backdrop-filter:blur(14px)}.key-gate.hidden{display:none}.key-gate-card{width:min(720px,100%);max-height:calc(100vh - 44px);overflow:auto;padding:28px;border:1px solid #30394a;border-radius:22px;background:linear-gradient(180deg,#171c27,#10141c);box-shadow:0 30px 120px rgba(0,0,0,.55)}.key-gate-kicker{font-size:12px;font-weight:900;text-transform:uppercase;letter-spacing:.13em;color:#aeb8ca}.key-gate-card h2{margin:8px 0 10px;font-size:clamp(28px,5vw,42px);letter-spacing:-.04em}.key-gate-card p{color:var(--muted);line-height:1.65}.key-gate-choice{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:22px}.key-gate-option{padding:18px;border:1px solid var(--border);border-radius:16px;background:#0d1118}.key-gate-option.recommended{border-color:rgba(120,146,249,.5)}.key-gate-option h3{margin:6px 0}.key-field-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}.key-field-row input{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.key-wait-list{display:grid;gap:10px;margin:20px 0}.key-wait-item{display:flex;align-items:center;gap:10px;padding:11px 13px;border:1px solid var(--border);border-radius:12px;background:#0d1118;color:var(--muted)}.key-wait-item.good{color:var(--good);border-color:rgba(99,210,151,.28)}.key-wait-item.active{color:#dce3ff;border-color:rgba(120,146,249,.35)}.key-spinner{width:16px;height:16px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:button-spin .7s linear infinite}.key-gate-error{margin-top:14px;padding:12px 14px;border:1px solid rgba(255,125,142,.4);border-radius:12px;color:#ffd5dc;background:rgba(255,108,128,.07)}.key-gate-note{padding:14px;border:1px solid rgba(242,198,109,.26);border-radius:12px;background:rgba(242,198,109,.07);color:#e8d5ac;line-height:1.55}.key-fingerprint{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}@media(max-width:700px){.key-gate-choice{grid-template-columns:1fr}.key-field-row{grid-template-columns:1fr}.key-gate-card{padding:20px}}
+
+.hp-config-modal-backdrop{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;padding:24px;background:rgba(3,5,9,.78);backdrop-filter:blur(8px)}
+.hp-config-modal-backdrop.hidden{display:none}.hp-config-modal{width:min(1040px,100%);max-height:calc(100vh - 48px);display:flex;flex-direction:column;border:1px solid var(--border);border-radius:20px;background:var(--panel);box-shadow:0 28px 90px rgba(0,0,0,.55);overflow:hidden}.hp-config-modal-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:20px 22px;border-bottom:1px solid var(--border)}.hp-config-modal-header h3{margin:0 0 4px;font-size:21px}.hp-config-modal-header p{margin:0;color:var(--muted);font-size:13px}.hp-config-modal-body{padding:18px 22px;overflow:auto}.hp-config-modal-footer{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;padding:16px 22px;border-top:1px solid var(--border);background:#0d1118}.hp-config-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.hp-config-tabs button.active{outline:2px solid rgba(120,146,249,.5);outline-offset:1px}.hp-config-group{margin:0 0 12px;padding:14px;border:1px solid var(--border);border-radius:14px;background:#0d1118}.hp-config-group>summary{cursor:pointer;font-weight:800}.hp-config-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:12px}.hp-config-field{display:grid;gap:7px;min-width:0}.hp-config-field.full{grid-column:1/-1}.hp-config-field-label{font-size:12px;font-weight:800;color:#dce2f1;overflow-wrap:anywhere}.hp-config-field small{color:var(--muted);font-weight:500}.hp-config-json-value{min-height:100px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}.hp-config-secret-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.hp-config-raw{min-height:480px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;white-space:pre;overflow:auto}.hp-config-status{font-size:13px;color:var(--muted)}.hp-config-status.error{color:#ff9cab}.hp-config-status.success{color:#8ee3b5}.hp-config-loading{padding:28px;text-align:center;color:var(--muted)}body.hp-config-modal-open{overflow:hidden}@media(max-width:760px){.hp-config-modal-backdrop{padding:10px}.hp-config-modal{max-height:calc(100vh - 20px)}.hp-config-fields{grid-template-columns:1fr}.hp-config-field.full{grid-column:auto}.hp-config-modal-header,.hp-config-modal-body,.hp-config-modal-footer{padding-left:14px;padding-right:14px}}
 </style>
 </head>
 <body>
@@ -3290,7 +3562,10 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
     'domainOnly' => $domainOnlyReady,
     'filegator' => $filegatorInstalled,
     'primaryApp' => $primaryApp,
+    'primaryAppDisplay' => $primaryAppDisplay,
+    'hotpocketSite' => $hotpocketSiteSelected,
     'hotpocket' => $hotpocketEnabled,
+    'hotpocketConfigCsrf' => $hotpocketConfigCsrf,
     'kopia' => $kopiaConfigured,
     'publicKopiaUrl' => $kopiaDashboardUrl,
     'backupScheduleConfigured' => array_key_exists('sql_schedule', $backupInfo),
@@ -3311,6 +3586,7 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
         'phpBB forum' => $phpbbInstalled ? ($phpbbBaseUrl !== '' ? $phpbbBaseUrl . '/' : '/') : '',
         'phpBB Admin' => $phpbbInstalled ? $phpbbAdminDashboardUrl : '',
         'External application' => $externalInstalledId !== '' ? $externalSiteUrl : '',
+        'HotPocket folder website' => $hotpocketSiteSelected ? ($publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . '/' : '/') : '',
         'Kopia' => $kopiaConfigured ? $kopiaDashboardUrl : '',
         'Kopia Replication' => $kopiaConfigured ? $kopiaReplicationDashboardUrl : '',
     ], static fn($value) => $value !== ''),
@@ -3384,7 +3660,7 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
 <div class="wizard-callout" style="margin-top:12px"><div class="wizard-callout-icon">↗</div><div class="host-rule"><strong>Domain-only access rule:</strong><br>Run this website through <code>https://your-domain.tld</code>. Never use <code>your-domain.tld:PORT</code>, a raw IP address, or a port-qualified public URL for Everlomp.</div></div>
 <div class="wizard-status-row"><span class="wizard-pill <?= $domainOnlyReady ? 'good' : 'warn' ?>">Domain host: <?= $domainOnlyReady ? 'valid' : 'fix required' ?></span><span class="wizard-pill <?= $realIpReady ? 'good' : 'warn' ?>">Real client IP: <?= $realIpReady ? 'active' : 'not ready' ?></span><span class="wizard-pill <?= $lswsPasswordConfigured ? 'good' : 'warn' ?>">WebAdmin: <?= $lswsPasswordConfigured ? 'secured' : 'password required' ?></span></div>
 <div class="meta"><div>Current Host header: <strong><?= h($host !== '' ? $host : 'missing') ?></strong></div><div>Direct/request peer: <strong><?= h($requestPeerIp !== '' ? $requestPeerIp : 'unknown') ?></strong></div><div>Forwarded client header: <strong><?= h($forwardedClientIp !== '' ? $forwardedClientIp : 'missing') ?></strong></div><?php if ($realIpTrustedProxy !== ''): ?><div>Trusted proxy peer: <strong><?= h($realIpTrustedProxy) ?></strong></div><?php endif; ?></div>
-<?php if (!$domainOnlyReady): ?><div class="warning"><strong>Do not continue on this URL.</strong> Open Everlomp through its final HTTPS domain without an explicit port. Example: <code>https://example.com/install.php</code>, not <code>https://example.com:8443/install.php</code>.</div><?php endif; ?>
+<?php if (!$domainOnlyReady): ?><div class="warning"><strong>Do not continue on this URL.</strong> Open Everlomp through its final HTTPS domain without an explicit port. Example: <code>https://example.com/lompinstaller.php</code>, not <code>https://example.com:8443/lompinstaller.php</code>.</div><?php endif; ?>
 <?php if (!$realIpReady): ?>
 <div class="wizard-divider"></div>
 <h3>Real client IP forwarding</h3>
@@ -3432,7 +3708,7 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
 <section id="wizard-step-5" class="wizard-panel" data-step="5">
 <div class="wizard-kicker">Step 5 of 9 · Primary application</div>
 <h2 class="wizard-title">Choose what this server will run.</h2>
-<p class="wizard-lead">Availability is calculated from the server state. WordPress, Drupal, phpBB, and uploaded external packages are primary-app alternatives: you can install one, not multiple. External package requirements are declared by their manifest.</p>
+<p class="wizard-lead">Availability is calculated from the server state. You can install one primary application, or skip application installation and point the website directly at a HotPocket contract folder.</p>
 <div id="wizard-apps-content" class="wizard-choice-grid">
 <section class="choice-card <?= $wordpressInstalled ? 'recommended' : '' ?>">
 <span class="choice-badge"><?= $wordpressInstalled ? 'Installed' : ($primaryApp === '' ? 'Available' : 'Unavailable') ?></span><h3>WordPress</h3><p>CMS, blog, and website platform. The installer can auto-create a restricted local database or use an existing MySQL/MariaDB database. Outbound email requires an external SMTP/mail provider; WP Mail SMTP is available as an optional install add-on.</p>
@@ -3479,6 +3755,72 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 </div>
 </section>
 <?php endforeach; ?>
+<section class="choice-card <?= $hotpocketSiteSelected ? 'recommended' : '' ?>" style="grid-column:1/-1">
+<span class="choice-badge"><?= $hotpocketSiteSelected ? 'Selected' : ($primaryApp === '' ? 'No app required' : 'Unavailable') ?></span>
+<h3>Use my HotPocket folder as the website</h3>
+<p>Skip WordPress, Drupal, phpBB, and other app installers. Choose <code>seed</code> or <code>seed/state</code>, then optionally point the website at a subfolder such as <code>public</code> or <code>public/html</code>.</p>
+<div class="wizard-callout" style="margin:14px 0"><div class="wizard-callout-icon">i</div><div><strong>When does this become the live website?</strong><br>Your HotPocket folder, optional subfolder, and index filenames are saved during this step, but OpenLiteSpeed keeps serving the normal Everlomp web root while setup is still running so <code>/lompinstaller.php</code> continues to work. The selected HotPocket path becomes the live website root only when you finish setup and permanently remove the installer in Step 9.</div></div>
+<?php if ($hotpocketSiteSelected): ?>
+<div class="status good">● Website folder selected</div>
+<div class="meta">
+<div>Website root: <strong><?= h((string) ($hotpocketSiteInfo['document_root'] ?? (($hotpocketSiteScope === 'seed' ? '/contract/contract_fs/seed' : '/contract/contract_fs/seed/state') . ($hotpocketSiteSubfolder !== '' ? '/' . $hotpocketSiteSubfolder : '')))) ?></strong></div>
+<div>Index files: <strong><?= h(implode(', ', normalizedStringList($hotpocketSiteInfo['index_files'] ?? ['index.html', 'index.php']))) ?></strong></div>
+</div>
+<div class="wizard-callout" style="margin-top:14px"><div class="wizard-callout-icon">i</div><div><strong>The switch is intentionally deferred.</strong><br>Everlomp keeps <code>/lompinstaller.php</code> reachable while you configure hp.cfg, upload a contract ZIP, backups, and SSH. The selected HotPocket path becomes the live website root when you permanently remove the installer in Step 9.</div></div>
+<div class="wizard-actions"><button type="button" class="secondary" onclick="toggleHotPocketSiteChooser(true)">Change website folder / indexes</button></div>
+<?php elseif ($primaryApp === ''): ?>
+<button type="button" onclick="toggleHotPocketSiteChooser(true)">I dont want to install an app, just point my website to my hotpocket folder</button>
+<?php else: ?>
+<div class="wizard-actions"><button type="button" disabled>Another primary app is installed</button></div>
+<?php endif; ?>
+<?php if ($primaryApp === '' || $hotpocketSiteSelected): ?>
+<div id="hotpocket-site-chooser" class="hidden" style="margin-top:16px">
+<form method="post" class="wizard-ajax-form" data-step="5" data-advance="6" data-hotpocket-site-form>
+<input type="hidden" name="action" value="configure_hotpocket_site">
+<script type="application/json" data-hotpocket-site-directories><?= json_encode($hotpocketSiteDirectories, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?></script>
+<h3>Choose the HotPocket base folder</h3>
+<div class="db-choice">
+<label class="db-option"><input type="radio" name="hotpocket_site_scope" value="state" <?= $hotpocketSiteScope === 'state' ? 'checked' : '' ?> required><span><strong>/contract/contract_fs/seed/state</strong><span>Use contract state as the base website directory.</span></span></label>
+<label class="db-option"><input type="radio" name="hotpocket_site_scope" value="seed" <?= $hotpocketSiteScope === 'seed' ? 'checked' : '' ?> required><span><strong>/contract/contract_fs/seed</strong><span>Use the entire contract seed as the base website directory.</span></span></label>
+</div>
+<div class="wizard-divider"></div>
+<h3>Optional subfolder</h3>
+<p>Use the base folder itself, pick an existing directory, or type a relative subfolder. Nested paths such as <code>public/html</code> are supported.</p>
+<div class="split">
+<label>Pick an existing subfolder
+<select data-hotpocket-site-dir-picker>
+<option value="">Use the base folder itself</option>
+</select>
+<small>Only real directories are listed; symlinks are excluded.</small>
+</label>
+<label>Or enter a subfolder
+<input type="text" name="hotpocket_site_subfolder" data-hotpocket-site-subfolder maxlength="240" value="<?= h($hotpocketSiteSubfolder) ?>" placeholder="public or public/html" autocomplete="off">
+<small>Relative path only. The directory may be created later by your Step 6 contract ZIP, but it must exist before the final website handoff.</small>
+</label>
+</div>
+<div class="access-box" style="margin-top:14px"><div class="access-box-title"><strong>Final website root preview</strong></div><code data-hotpocket-site-root-preview></code></div>
+<div class="wizard-divider"></div>
+<h3>Index files</h3>
+<p><code>index.html</code> and <code>index.php</code> are enabled by default. Keep either one, remove either one, and add your own filenames such as <code>evernode.html</code>.</p>
+<div class="terms-agreements">
+<label class="terms-check"><input type="checkbox" name="hotpocket_site_default_indexes[]" value="index.html" <?= in_array('index.html', $hotpocketSiteDefaultIndexes, true) ? 'checked' : '' ?>><span><code>index.html</code></span></label>
+<label class="terms-check"><input type="checkbox" name="hotpocket_site_default_indexes[]" value="index.php" <?= in_array('index.php', $hotpocketSiteDefaultIndexes, true) ? 'checked' : '' ?>><span><code>index.php</code></span></label>
+<div data-hotpocket-index-builder>
+<div data-hotpocket-index-list class="wizard-status-row"></div>
+<div class="copy-field">
+<input type="text" data-hotpocket-index-input maxlength="128" placeholder="evernode.html or app.php" autocomplete="off">
+<button type="button" class="secondary" onclick="addHotPocketSiteIndex(this)">Add index file</button>
+</div>
+<input type="hidden" name="hotpocket_site_custom_indexes" data-hotpocket-index-hidden value="<?= h(implode(',', $hotpocketSiteCustomIndexes)) ?>">
+<small>Add your own filenames as needed; the total index-file limit is 16. Letters, numbers, dots, underscores, and hyphens are allowed.</small>
+</div>
+</div>
+<div class="warning" style="margin-top:14px"><strong>This selection does not switch the document root yet.</strong> The installer stays reachable through Step 9. When you permanently remove Everlomp, OpenLiteSpeed switches <code>/</code> to the exact HotPocket base + subfolder shown in the preview above.</div>
+<div class="wizard-actions"><button type="button" class="secondary" onclick="toggleHotPocketSiteChooser(false)">Cancel</button><button type="submit"><?= $hotpocketSiteSelected ? 'Save Website Folder Changes' : 'Use HotPocket Folder as Website' ?></button></div>
+</form>
+</div>
+<?php endif; ?>
+</section>
 <section class="choice-card">
 <span class="choice-badge">External installers</span><h3>Upload installer ZIP</h3>
 <p>Add a package containing <code>manifest.json</code> and <code>install.sh</code>. Valid packages are stored under <code>/home/everlomp/external-installs/&lt;id&gt;/</code> and automatically appear here.</p>
@@ -3501,10 +3843,48 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <p class="wizard-lead">Enable HotPocket only if this application will run smart contracts. If you enable it, Everlomp starts HotPocket under Supervisor and the bootstrap contract runs on it so you have a target ready for contract deployment.</p>
 <div class="wizard-card">
 <?php if ($hotpocketEnabled): ?>
-<div class="status good">● HotPocket enabled</div><h3>Smart-contract runtime is active</h3><p>Supervisor is configured to autostart HotPocket and keep it running. The bootstrap contract can run here so contracts can be deployed to this runtime.</p>
+<div class="status good">● HotPocket enabled</div><h3>Smart-contract runtime is active</h3><p>Supervisor is configured to autostart HotPocket and keep it running. Future smart-contract uploads/deployments can be done the normal way with <code>evdevkit</code>.</p>
 <?php else: ?>
 <div class="wizard-callout"><div class="wizard-callout-icon">i</div><div><strong>This is the one installer opportunity to enable HotPocket.</strong><br>If you do not need smart contracts, leave it off. If you skip it and later remove the installer, the Everlomp installer will no longer be available to enable it for you.</div></div>
-<div class="wizard-choice-grid" style="margin-top:16px"><div class="choice-card recommended"><span class="choice-badge">For smart contracts</span><h3>Enable HotPocket</h3><p>Starts HotPocket now, enables autostart, and prepares the bootstrap-contract runtime for deployments.</p><form method="post" class="wizard-ajax-form"><input type="hidden" name="action" value="enable_hotpocket"><div class="terms-agreements"><label class="terms-check"><input type="checkbox" name="accept_hotpocket_terms" value="1" required><span>I accept the <a target="_blank" rel="noopener noreferrer" href="https://github.com/EvernodeXRPL/hpcore/blob/main/evernode-license.pdf">HotPocket license terms</a>.</span></label></div><div class="wizard-actions"><button type="submit">Enable HotPocket</button></div></form></div><div class="choice-card"><span class="choice-badge">Normal web apps</span><h3>Keep it off</h3><p>Recommended if you only need WordPress, Drupal, phpBB, PHP/web files, or other non-smart-contract workloads.</p><div class="wizard-actions"><button type="button" class="secondary" onclick="skipHotPocket()">Continue without HotPocket</button></div></div></div>
+<div class="wizard-choice-grid" style="margin-top:16px">
+<div class="choice-card recommended">
+<span class="choice-badge">For smart contracts</span>
+<h3>Enable HotPocket</h3>
+<p>Before HotPocket can start, choose whether you want to upload your smart contract now.</p>
+<form method="post" enctype="multipart/form-data" class="wizard-ajax-form" data-step="6" data-advance="7" data-hotpocket-enable-form>
+<input type="hidden" name="action" value="enable_hotpocket">
+<div class="terms-agreements">
+<label class="terms-check"><input type="checkbox" name="accept_hotpocket_terms" value="1" required><span>I accept the <a target="_blank" rel="noopener noreferrer" href="https://github.com/EvernodeXRPL/hpcore/blob/main/evernode-license.pdf">HotPocket license terms</a>.</span></label>
+</div>
+<div class="wizard-divider"></div>
+<div class="access-box" style="margin-top:0">
+<div class="access-box-title"><strong>HotPocket runtime configuration</strong><button type="button" class="secondary" onclick="openHotPocketConfigModal()">Edit hp.cfg</button></div>
+<p style="margin:0">Load the real <code>/contract/cfg/hp.cfg</code>, adjust its current values in a structured editor or advanced raw JSON view, and save it before HotPocket starts.</p>
+</div>
+<div class="wizard-divider"></div>
+<h3>Upload a smart contract NOW?</h3>
+<p>You must answer <strong>YES</strong> or <strong>NO</strong> before HotPocket can be enabled.</p>
+<div class="db-choice">
+<label class="db-option"><input type="radio" name="hotpocket_contract_choice" value="yes" <?= $hotpocketContractChoice === 'yes' ? 'checked' : '' ?> required onchange="toggleHotPocketContractUpload(this.form)"><span><strong>YES — upload it now</strong><span>The ZIP contents will completely replace everything currently in <code>/contract/contract_fs/seed/state</code> before HotPocket starts.</span></span></label>
+<label class="db-option"><input type="radio" name="hotpocket_contract_choice" value="no" <?= $hotpocketContractChoice === 'no' ? 'checked' : '' ?> required onchange="toggleHotPocketContractUpload(this.form)"><span><strong>NO — start with the current contract</strong><span>You can upload/deploy the smart contract later the normal way with <code>evdevkit</code>.</span></span></label>
+</div>
+<div data-hotpocket-contract-upload class="<?= $hotpocketContractChoice === 'yes' ? '' : 'hidden' ?>" style="margin-top:14px">
+<label>Smart contract ZIP
+<input type="file" name="hotpocket_contract_zip" accept=".zip,application/zip" <?= $hotpocketContractChoice === 'yes' ? 'required' : '' ?>>
+<small>Required when YES is selected. Maximum compressed size: 100 MiB. The archive replaces the entire <code>/contract/contract_fs/seed/state</code> directory.</small>
+</label>
+<div class="warning"><strong>Destructive replacement:</strong> existing files in <code>/contract/contract_fs/seed/state</code> are removed and replaced by the files from this ZIP.</div>
+</div>
+<div class="wizard-actions"><button type="submit">Enable HotPocket</button></div>
+</form>
+</div>
+<div class="choice-card">
+<span class="choice-badge">Normal web apps</span>
+<h3>Keep it off</h3>
+<p>Recommended if you only need WordPress, Drupal, phpBB, PHP/web files, or other non-smart-contract workloads.</p>
+<div class="wizard-actions"><button type="button" class="secondary" onclick="skipHotPocket()">Continue without HotPocket</button></div>
+</div>
+</div>
 <?php endif; ?>
 <div class="wizard-divider"></div>
 
@@ -3672,7 +4052,7 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <p class="wizard-lead">You can use the navigator on the left to revisit any previous step instantly without reloading the page. Do that now if you want to check a credential, optional component, SSH choice, or backup setting.</p>
 <div class="wizard-card">
 <h3>Installation review</h3>
-<div class="review-grid"><div class="review-item"><small>Terms</small><strong><?= $termsAccepted ? 'Accepted' : 'Incomplete' ?></strong></div><div class="review-item"><small>MariaDB</small><strong><?= $databaseConfigured ? 'Configured' : 'Incomplete' ?></strong></div><div class="review-item"><small>OpenLiteSpeed / Real IP</small><strong><?= ($lswsPasswordConfigured && $realIpReady && $domainOnlyReady) ? 'Ready' : 'Needs attention' ?></strong></div><div class="review-item"><small>FileGator</small><strong><?= $filegatorInstalled ? 'Installed' : 'Skipped / not installed' ?></strong></div><div class="review-item"><small>Primary app</small><strong><?= $primaryApp !== '' ? h($primaryApp) : 'None' ?></strong></div><div class="review-item"><small>HotPocket</small><strong><?= $hotpocketEnabled ? 'Enabled' : 'Off' ?></strong></div><div class="review-item"><small>Kopia</small><strong><?= $kopiaConfigured ? 'Configured' : 'Review backup step' ?></strong></div><div class="review-item"><small>SSH / GPTCP2</small><strong><?= $sshDecisionMade ? ($sshEnabled ? 'Enabled · port ' . h($sshPublicPort) : 'Disabled') : 'Not decided' ?></strong></div><div class="review-item"><small>Installer</small><strong>Still present</strong></div></div>
+<div class="review-grid"><div class="review-item"><small>Terms</small><strong><?= $termsAccepted ? 'Accepted' : 'Incomplete' ?></strong></div><div class="review-item"><small>MariaDB</small><strong><?= $databaseConfigured ? 'Configured' : 'Incomplete' ?></strong></div><div class="review-item"><small>OpenLiteSpeed / Real IP</small><strong><?= ($lswsPasswordConfigured && $realIpReady && $domainOnlyReady) ? 'Ready' : 'Needs attention' ?></strong></div><div class="review-item"><small>FileGator</small><strong><?= $filegatorInstalled ? 'Installed' : 'Skipped / not installed' ?></strong></div><div class="review-item"><small>Primary app</small><strong><?= $primaryApp !== '' ? h($primaryAppDisplay) : 'None' ?></strong></div><div class="review-item"><small>HotPocket</small><strong><?= $hotpocketEnabled ? 'Enabled' : 'Off' ?></strong></div><div class="review-item"><small>Kopia</small><strong><?= $kopiaConfigured ? 'Configured' : 'Review backup step' ?></strong></div><div class="review-item"><small>SSH / GPTCP2</small><strong><?= $sshDecisionMade ? ($sshEnabled ? 'Enabled · port ' . h($sshPublicPort) : 'Disabled') : 'Not decided' ?></strong></div><div class="review-item"><small>Installer</small><strong>Still present</strong></div></div>
 <div class="wizard-divider"></div><div class="access-box"><div class="access-box-title"><strong>Quick access · dashboard URLs</strong><button type="button" class="secondary" onclick="copyAllDashboardUrls(this)">Copy all URLs</button></div><div style="display:grid;gap:10px">
 <?php if ($phpmyadminInstalled): ?><div class="copy-field"><input data-dashboard-label="phpMyAdmin" data-dashboard-url id="finish-url-phpmyadmin" type="text" readonly value="<?= h($phpMyAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-phpmyadmin',this)">Copy</button></div><?php endif; ?>
 <?php if ($lswsPasswordConfigured): ?><div class="copy-field"><input data-dashboard-label="OpenLiteSpeed WebAdmin" data-dashboard-url id="finish-url-openlitespeed" type="text" readonly value="<?= h($openLiteSpeedDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-openlitespeed',this)">Copy</button></div><?php endif; ?>
@@ -3680,11 +4060,12 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <?php if ($drupalInstalled): ?><div class="copy-field"><input data-dashboard-label="Drupal Admin" data-dashboard-url id="finish-url-drupal" type="text" readonly value="<?= h($drupalAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-drupal',this)">Copy</button></div><?php endif; ?>
 <?php if ($phpbbInstalled): ?><div class="copy-field"><input data-dashboard-label="phpBB Admin" data-dashboard-url id="finish-url-phpbb" type="text" readonly value="<?= h($phpbbAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-phpbb',this)">Copy</button></div><?php endif; ?>
 <?php if ($externalInstalledId !== ''): ?><div class="copy-field"><input data-dashboard-label="External application" data-dashboard-url id="finish-url-external" type="text" readonly value="<?= h($externalSiteUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-external',this)">Copy</button></div><?php endif; ?>
+<?php if ($hotpocketSiteSelected): ?><div class="copy-field"><input data-dashboard-label="HotPocket folder website" data-dashboard-url id="finish-url-hotpocket-site" type="text" readonly value="<?= h($publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . '/' : '/') ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-hotpocket-site',this)">Copy</button></div><?php endif; ?>
 <?php if ($filegatorInstalled): ?><div class="copy-field"><input data-dashboard-label="FileGator" data-dashboard-url id="finish-url-filegator" type="text" readonly value="<?= h($fileGatorDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-filegator',this)">Copy</button></div><?php endif; ?>
 <?php if ($kopiaConfigured): ?><div class="copy-field"><input data-dashboard-label="Kopia" data-dashboard-url id="finish-url-kopia" type="text" readonly value="<?= h($kopiaDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-kopia',this)">Copy</button></div><div class="copy-field"><input data-dashboard-label="Kopia Replication" data-dashboard-url id="finish-url-kopia-replication" type="text" readonly value="<?= h($kopiaReplicationDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-kopia-replication',this)">Copy</button></div><?php endif; ?>
 </div></div>
 </div>
-<div class="finish-warning" style="margin-top:16px"><h3>⚠ Remove the Everlomp installer when you are done.</h3><p>Leaving <strong>/install.php</strong> exposed means leaving an administrative installation surface on the server. Removing it deletes the installer interface, the original redirecting bootstrap index if it is still unchanged, helper programs, installer metadata, bundled WordPress/Drupal/phpBB installation files, uploaded external-installer packages, and the installer’s passwordless web sudo permissions.</p><p><strong>It does not remove</strong> your installed primary application (WordPress, Drupal, phpBB, or external), FileGator, phpMyAdmin, OpenLiteSpeed, MariaDB, HotPocket, Kopia, SSH if you enabled it, or application/database data.</p><?php if ($primaryApp !== '' && $sshDecisionMade): ?><form method="post" onsubmit="return confirm('Permanently remove the Everlomp installer, helper programs, and bundled installation files? This cannot be undone from the installer.');"><input type="hidden" name="action" value="delete_everlomp_installfile"><div class="wizard-actions"><button type="submit">Permanently Remove Everlomp Installer</button></div></form><?php elseif ($primaryApp === ''): ?><div class="wizard-lock">Install a primary application before the installer can be removed.</div><?php else: ?><div class="wizard-lock">Choose whether SSH should be enabled before the installer can be removed.</div><?php endif; ?></div>
+<div class="finish-warning" style="margin-top:16px"><h3>⚠ Remove the Everlomp installer when you are done.</h3><?php if ($hotpocketSiteSelected): ?><p><strong>HotPocket website handoff:</strong> this final action first switches OpenLiteSpeed to <?= h((string) ($hotpocketSiteInfo['document_root'] ?? '/contract/contract_fs/seed/state')) ?> using your saved index list, then removes the installer.</p><?php endif; ?><p>Leaving <strong>/lompinstaller.php</strong> exposed means leaving an administrative installation surface on the server. Removing it deletes the installer interface, the original redirecting bootstrap index if it is still unchanged, helper programs, installer metadata, bundled WordPress/Drupal/phpBB installation files, uploaded external-installer packages, and the installer’s passwordless web sudo permissions.</p><p><strong>It does not remove</strong> your installed primary application (WordPress, Drupal, phpBB, or external), FileGator, phpMyAdmin, OpenLiteSpeed, MariaDB, HotPocket, Kopia, SSH if you enabled it, or application/database data.</p><?php if ($primaryApp !== '' && $sshDecisionMade): ?><form method="post" onsubmit="return confirm('Permanently remove the Everlomp installer, helper programs, and bundled installation files? This cannot be undone from the installer.');"><input type="hidden" name="action" value="delete_everlomp_installfile"><div class="wizard-actions"><button type="submit">Permanently Remove Everlomp Installer</button></div></form><?php elseif ($primaryApp === ''): ?><div class="wizard-lock">Install a primary application before the installer can be removed.</div><?php else: ?><div class="wizard-lock">Choose whether SSH should be enabled before the installer can be removed.</div><?php endif; ?></div>
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(8)">← SSH</button><button type="button" class="secondary" onclick="showWizardStep(1)">Review from the beginning</button></div>
 </section>
 </main>
@@ -3698,12 +4079,304 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 </aside>
 </div>
 
-
+<div id="hotpocket-config-modal" class="hp-config-modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="hotpocket-config-modal-title" onclick="hotPocketConfigBackdropClick(event)">
+<div class="hp-config-modal" role="document">
+<div class="hp-config-modal-header">
+<div><h3 id="hotpocket-config-modal-title">Edit HotPocket hp.cfg</h3><p>Live configuration from <code>/contract/cfg/hp.cfg</code>. Nothing here is populated from example or dummy values.</p></div>
+<button type="button" class="secondary" data-hp-config-close onclick="closeHotPocketConfigModal()" aria-label="Close HotPocket configuration editor">Close</button>
+</div>
+<div class="hp-config-modal-body">
+<div class="wizard-callout" style="margin-bottom:16px"><div class="wizard-callout-icon">!</div><div><strong>This file can contain private keys.</strong><br>Secret-looking fields are masked in the structured editor. The advanced raw JSON view contains the complete configuration, including secrets.</div></div>
+<div class="hp-config-tabs" role="tablist" aria-label="HotPocket configuration editor mode">
+<button type="button" class="secondary active" data-hp-config-tab="structured" onclick="setHotPocketConfigTab('structured')">Structured fields</button>
+<button type="button" class="secondary" data-hp-config-tab="raw" onclick="setHotPocketConfigTab('raw')">Raw JSON · advanced</button>
+</div>
+<div id="hotpocket-config-loading" class="hp-config-loading"><span class="spinner-inline"></span>Reading the real hp.cfg…</div>
+<div id="hotpocket-config-structured" class="hidden"></div>
+<div id="hotpocket-config-raw-wrap" class="hidden"><label>Complete hp.cfg JSON<textarea id="hotpocket-config-raw" class="hp-config-raw" spellcheck="false" autocomplete="off"></textarea><small>You can add/remove keys here as well as edit existing values. Saving replaces hp.cfg atomically.</small></label></div>
+</div>
+<div class="hp-config-modal-footer">
+<div id="hotpocket-config-status" class="hp-config-status" role="status" aria-live="polite"></div>
+<div class="wizard-actions" style="margin-top:0"><button type="button" class="secondary" onclick="reloadHotPocketConfig()">Reload from disk</button><button type="button" id="hotpocket-config-save" onclick="saveHotPocketConfig()">Save hp.cfg</button></div>
+</div>
+</div>
+</div>
 
 <?php endif; ?>
 </div>
 
 <script>
+let hotPocketConfigValue = null;
+let hotPocketConfigTab = 'structured';
+
+function hotPocketConfigSecretKey(key) {
+    return /(?:private_key|password|secret|token|access_key|session_token)$/i.test(String(key || ''));
+}
+
+function hotPocketConfigSetStatus(message, kind = '') {
+    const node = document.getElementById('hotpocket-config-status');
+    if (!node) return;
+    node.textContent = message || '';
+    node.className = 'hp-config-status' + (kind ? ' ' + kind : '');
+}
+
+function hotPocketConfigPathLabel(path) {
+    return path.join(' › ');
+}
+
+function hotPocketConfigSetAtPath(root, path, value) {
+    let target = root;
+    for (let i = 0; i < path.length - 1; i++) target = target[path[i]];
+    target[path[path.length - 1]] = value;
+}
+
+function hotPocketConfigCreateField(key, value, path) {
+    const wrap = document.createElement('div');
+    wrap.className = 'hp-config-field' + ((Array.isArray(value) || (value && typeof value === 'object')) ? ' full' : '');
+    const label = document.createElement('div');
+    label.className = 'hp-config-field-label';
+    label.textContent = key;
+    wrap.appendChild(label);
+    let input;
+    const pathJson = JSON.stringify(path);
+    if (typeof value === 'boolean') {
+        const checkLabel = document.createElement('label');
+        checkLabel.className = 'terms-check';
+        input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = value;
+        input.dataset.hpConfigPath = pathJson;
+        input.dataset.hpConfigKind = 'boolean';
+        const text = document.createElement('span');
+        text.textContent = value ? 'Enabled / true' : 'Disabled / false';
+        input.addEventListener('change', () => { text.textContent = input.checked ? 'Enabled / true' : 'Disabled / false'; });
+        checkLabel.append(input, text);
+        wrap.appendChild(checkLabel);
+    } else if (typeof value === 'number') {
+        input = document.createElement('input');
+        input.type = 'number';
+        input.step = 'any';
+        input.value = String(value);
+        input.dataset.hpConfigPath = pathJson;
+        input.dataset.hpConfigKind = 'number';
+        wrap.appendChild(input);
+    } else if (typeof value === 'string') {
+        const secret = hotPocketConfigSecretKey(key);
+        input = document.createElement('input');
+        input.type = secret ? 'password' : 'text';
+        input.value = value;
+        input.autocomplete = 'off';
+        input.spellcheck = false;
+        input.dataset.hpConfigPath = pathJson;
+        input.dataset.hpConfigKind = 'string';
+        if (secret) {
+            const row = document.createElement('div');
+            row.className = 'hp-config-secret-row';
+            const reveal = document.createElement('button');
+            reveal.type = 'button';
+            reveal.className = 'secondary';
+            reveal.textContent = 'Reveal';
+            reveal.addEventListener('click', () => {
+                const showing = input.type === 'text';
+                input.type = showing ? 'password' : 'text';
+                reveal.textContent = showing ? 'Reveal' : 'Hide';
+            });
+            row.append(input, reveal);
+            wrap.appendChild(row);
+        } else wrap.appendChild(input);
+    } else {
+        input = document.createElement('textarea');
+        input.className = 'hp-config-json-value';
+        input.value = JSON.stringify(value, null, 2);
+        input.dataset.hpConfigPath = pathJson;
+        input.dataset.hpConfigKind = 'json';
+        input.spellcheck = false;
+        wrap.appendChild(input);
+        const hint = document.createElement('small');
+        hint.textContent = Array.isArray(value) ? 'JSON array — edit every item here.' : 'JSON value — keep valid JSON syntax.';
+        wrap.appendChild(hint);
+    }
+    const pathHint = document.createElement('small');
+    pathHint.textContent = hotPocketConfigPathLabel(path);
+    wrap.appendChild(pathHint);
+    return wrap;
+}
+
+function hotPocketConfigRenderObject(parent, object, path = []) {
+    const fields = document.createElement('div');
+    fields.className = 'hp-config-fields';
+    Object.entries(object).forEach(([key, value]) => {
+        const nextPath = path.concat(key);
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+            const details = document.createElement('details');
+            details.className = 'hp-config-group';
+            details.open = path.length < 1;
+            const summary = document.createElement('summary');
+            summary.textContent = key;
+            details.appendChild(summary);
+            hotPocketConfigRenderObject(details, value, nextPath);
+            fields.appendChild(details);
+        } else {
+            fields.appendChild(hotPocketConfigCreateField(key, value, nextPath));
+        }
+    });
+    parent.appendChild(fields);
+}
+
+function renderHotPocketConfigStructured(config) {
+    const host = document.getElementById('hotpocket-config-structured');
+    if (!host) return;
+    host.innerHTML = '';
+    hotPocketConfigRenderObject(host, config, []);
+}
+
+function collectHotPocketStructuredConfig() {
+    const base = JSON.parse(JSON.stringify(hotPocketConfigValue || {}));
+    document.querySelectorAll('#hotpocket-config-structured [data-hp-config-path]').forEach((input) => {
+        const path = JSON.parse(input.dataset.hpConfigPath || '[]');
+        const kind = input.dataset.hpConfigKind || 'string';
+        let value;
+        if (kind === 'boolean') value = input.checked;
+        else if (kind === 'number') {
+            if (String(input.value).trim() === '') throw new Error(hotPocketConfigPathLabel(path) + ' cannot be blank.');
+            value = Number(input.value);
+            if (!Number.isFinite(value)) throw new Error(hotPocketConfigPathLabel(path) + ' must be a valid number.');
+        } else if (kind === 'json') {
+            try { value = JSON.parse(input.value); }
+            catch (_) { throw new Error(hotPocketConfigPathLabel(path) + ' contains invalid JSON.'); }
+        } else value = input.value;
+        hotPocketConfigSetAtPath(base, path, value);
+    });
+    return base;
+}
+
+function setHotPocketConfigTab(tab) {
+    const structured = document.getElementById('hotpocket-config-structured');
+    const rawWrap = document.getElementById('hotpocket-config-raw-wrap');
+    const raw = document.getElementById('hotpocket-config-raw');
+    if (!structured || !rawWrap || !raw) return;
+    if (tab === 'raw') {
+        try {
+            hotPocketConfigValue = collectHotPocketStructuredConfig();
+            raw.value = JSON.stringify(hotPocketConfigValue, null, 2);
+        } catch (error) {
+            hotPocketConfigSetStatus(error.message || 'Fix the structured configuration first.', 'error');
+            return;
+        }
+    } else if (hotPocketConfigTab === 'raw') {
+        try {
+            const parsed = JSON.parse(raw.value);
+            if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('hp.cfg root must be a JSON object.');
+            hotPocketConfigValue = parsed;
+            renderHotPocketConfigStructured(parsed);
+        } catch (error) {
+            hotPocketConfigSetStatus(error.message || 'Raw JSON is invalid.', 'error');
+            return;
+        }
+    }
+    hotPocketConfigTab = tab === 'raw' ? 'raw' : 'structured';
+    structured.classList.toggle('hidden', hotPocketConfigTab !== 'structured');
+    rawWrap.classList.toggle('hidden', hotPocketConfigTab !== 'raw');
+    document.querySelectorAll('[data-hp-config-tab]').forEach((button) => button.classList.toggle('active', button.dataset.hpConfigTab === hotPocketConfigTab));
+    hotPocketConfigSetStatus('');
+}
+
+async function hotPocketConfigRequest(action, extra = {}) {
+    const body = new FormData();
+    body.set('action', action);
+    body.set('csrf', String(everlompWizardState.hotpocketConfigCsrf || ''));
+    Object.entries(extra).forEach(([key, value]) => body.set(key, value));
+    const response = await fetch(everlompWizardState.panelUrl || window.location.pathname, {method:'POST', body, credentials:'same-origin', cache:'no-store', headers:{'X-Requested-With':'XMLHttpRequest'}});
+    let payload = {};
+    try { payload = await response.json(); } catch (_) {}
+    if (!response.ok || payload.ok === false) throw new Error(payload.message || 'HotPocket configuration request failed.');
+    return payload;
+}
+
+async function reloadHotPocketConfig() {
+    const loading = document.getElementById('hotpocket-config-loading');
+    const structured = document.getElementById('hotpocket-config-structured');
+    const rawWrap = document.getElementById('hotpocket-config-raw-wrap');
+    const raw = document.getElementById('hotpocket-config-raw');
+    const save = document.getElementById('hotpocket-config-save');
+    if (loading) loading.classList.remove('hidden');
+    if (save) save.disabled = true;
+    if (structured) structured.classList.add('hidden');
+    if (rawWrap) rawWrap.classList.add('hidden');
+    hotPocketConfigSetStatus('Reading /contract/cfg/hp.cfg…');
+    try {
+        const payload = await hotPocketConfigRequest('hotpocket_config_read');
+        hotPocketConfigValue = payload.config;
+        renderHotPocketConfigStructured(payload.config);
+        if (raw) raw.value = JSON.stringify(payload.config, null, 2);
+        if (save) {
+            save.disabled = payload.editable === false;
+            save.title = payload.editable === false ? 'HotPocket is already enabled; installer editing is locked.' : '';
+        }
+        hotPocketConfigTab = 'structured';
+        document.querySelectorAll('[data-hp-config-tab]').forEach((button) => button.classList.toggle('active', button.dataset.hpConfigTab === 'structured'));
+        if (structured) structured.classList.remove('hidden');
+        hotPocketConfigSetStatus(payload.editable === false ? 'Loaded read-only because HotPocket is already enabled.' : 'Loaded directly from /contract/cfg/hp.cfg.', payload.editable === false ? '' : 'success');
+    } catch (error) {
+        hotPocketConfigSetStatus(error.message || 'Could not load hp.cfg.', 'error');
+    } finally {
+        if (loading) loading.classList.add('hidden');
+    }
+}
+
+async function openHotPocketConfigModal() {
+    const modal = document.getElementById('hotpocket-config-modal');
+    if (!modal) return;
+    modal.classList.remove('hidden');
+    document.body.classList.add('hp-config-modal-open');
+    const close = modal.querySelector('[data-hp-config-close]');
+    if (close) close.focus();
+    await reloadHotPocketConfig();
+}
+
+function closeHotPocketConfigModal() {
+    const modal = document.getElementById('hotpocket-config-modal');
+    if (!modal) return;
+    modal.classList.add('hidden');
+    document.body.classList.remove('hp-config-modal-open');
+}
+
+function hotPocketConfigBackdropClick(event) {
+    if (event.target === event.currentTarget) closeHotPocketConfigModal();
+}
+
+async function saveHotPocketConfig() {
+    const save = document.getElementById('hotpocket-config-save');
+    const raw = document.getElementById('hotpocket-config-raw');
+    let config;
+    try {
+        if (hotPocketConfigTab === 'raw') {
+            config = JSON.parse(raw ? raw.value : '');
+            if (!config || Array.isArray(config) || typeof config !== 'object') throw new Error('hp.cfg root must be a JSON object.');
+        } else config = collectHotPocketStructuredConfig();
+    } catch (error) {
+        hotPocketConfigSetStatus(error.message || 'Configuration is invalid.', 'error');
+        return;
+    }
+    setButtonBusy(save, true, 'Saving hp.cfg…');
+    hotPocketConfigSetStatus('Saving /contract/cfg/hp.cfg…');
+    try {
+        const payload = await hotPocketConfigRequest('hotpocket_config_write', {config_json: JSON.stringify(config)});
+        hotPocketConfigValue = payload.config || config;
+        if (raw) raw.value = JSON.stringify(hotPocketConfigValue, null, 2);
+        renderHotPocketConfigStructured(hotPocketConfigValue);
+        hotPocketConfigSetStatus(payload.message || 'hp.cfg saved.', 'success');
+    } catch (error) {
+        hotPocketConfigSetStatus(error.message || 'Could not save hp.cfg.', 'error');
+    } finally {
+        setButtonBusy(save, false);
+    }
+}
+
+document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !document.getElementById('hotpocket-config-modal')?.classList.contains('hidden')) closeHotPocketConfigModal();
+});
+
 async function copyLswsPassword(button = null) {
     return copyFieldValue('lsws-generated-password', button);
 }
@@ -4391,7 +5064,7 @@ function renderWizardSummary() {
     lines.push('Real client IP: ' + (everlompWizardState.realIp ? 'Ready' : 'Not ready'));
     lines.push('Domain-only access: ' + (everlompWizardState.domainOnly ? 'Ready' : 'Not ready'));
     lines.push('FileGator: ' + (everlompWizardState.filegator ? 'Installed' : (wizardDecision('filegator-decided') ? 'Skipped / reviewed' : 'Not decided')));
-    lines.push('Primary application: ' + (everlompWizardState.primaryApp || 'Not installed'));
+    lines.push('Primary application: ' + (everlompWizardState.primaryAppDisplay || everlompWizardState.primaryApp || 'Not installed'));
     lines.push('HotPocket: ' + (everlompWizardState.hotpocket ? 'Enabled' : (wizardDecision('hotpocket-decided') ? 'Off / skipped' : 'Not decided')));
     lines.push('SQL backup schedule: ' + (everlompWizardState.backupScheduleConfigured || wizardDecision('backup-schedule-decided') ? 'Saved' : 'Not saved'));
     lines.push('Kopia: ' + (everlompWizardState.kopia ? 'Configured' : (wizardDecision('backup-decided') ? 'Reviewed / skipped' : 'Not configured')));
@@ -4580,7 +5253,9 @@ async function submitWizardForm(event) {
     const action = String(data.get('action') || '');
     const busyText = action === 'enable_ssh'
         ? 'Enabling & verifying SSH…'
-        : (action === 'disable_ssh' ? 'Disabling SSH…' : 'Saving…');
+        : (action === 'disable_ssh'
+            ? 'Disabling SSH…'
+            : (action === 'enable_hotpocket' ? 'Preparing & enabling HotPocket…' : 'Saving…'));
     setButtonBusy(submitter, true, busyText);
     try {
         const response = await fetch(everlompWizardState.panelUrl || window.location.pathname, {method:'POST', body:data, credentials:'same-origin', headers:{'X-Requested-With':'XMLHttpRequest'}});
@@ -4856,7 +5531,171 @@ async function submitBackupForm(event) {
     }
 }
 
+function toggleHotPocketSiteChooser(show) {
+    const chooser = document.getElementById('hotpocket-site-chooser');
+    if (!chooser) return;
+    chooser.classList.toggle('hidden', !show);
+    if (show) {
+        initializeHotPocketSiteDirectoryChoosers(chooser);
+        initializeHotPocketIndexBuilders(chooser);
+        chooser.scrollIntoView({behavior:'smooth', block:'nearest'});
+    }
+}
+
+function hotPocketSiteDirectoryData(form) {
+    const node = form ? form.querySelector('[data-hotpocket-site-directories]') : null;
+    if (!node) return {state:[], seed:[]};
+    try {
+        const parsed = JSON.parse(node.textContent || '{}');
+        return {
+            state: Array.isArray(parsed.state) ? parsed.state : [],
+            seed: Array.isArray(parsed.seed) ? parsed.seed : []
+        };
+    } catch (error) {
+        return {state:[], seed:[]};
+    }
+}
+
+function refreshHotPocketSiteDirectoryChooser(form) {
+    if (!(form instanceof HTMLFormElement)) return;
+    const scope = form.querySelector('input[name="hotpocket_site_scope"]:checked')?.value || 'state';
+    const picker = form.querySelector('[data-hotpocket-site-dir-picker]');
+    const input = form.querySelector('[data-hotpocket-site-subfolder]');
+    const preview = form.querySelector('[data-hotpocket-site-root-preview]');
+    if (!picker || !input) return;
+    const directories = hotPocketSiteDirectoryData(form)[scope] || [];
+    const current = input.value.trim().replace(/^\/+|\/+$/g, '');
+    picker.innerHTML = '';
+    const baseOption = document.createElement('option');
+    baseOption.value = '';
+    baseOption.textContent = 'Use the base folder itself';
+    picker.appendChild(baseOption);
+    directories.forEach((path) => {
+        if (typeof path !== 'string' || !path) return;
+        const option = document.createElement('option');
+        option.value = path;
+        option.textContent = path;
+        picker.appendChild(option);
+    });
+    picker.value = directories.includes(current) ? current : '';
+    const base = scope === 'seed' ? '/contract/contract_fs/seed' : '/contract/contract_fs/seed/state';
+    if (preview) preview.textContent = base + (current ? '/' + current : '');
+}
+
+function initializeHotPocketSiteDirectoryChoosers(root = document) {
+    if (!root.querySelectorAll) return;
+    root.querySelectorAll('form[data-hotpocket-site-form]').forEach((form) => {
+        if (form.dataset.directoryChooserInitialized === '1') {
+            refreshHotPocketSiteDirectoryChooser(form);
+            return;
+        }
+        form.dataset.directoryChooserInitialized = '1';
+        const picker = form.querySelector('[data-hotpocket-site-dir-picker]');
+        const input = form.querySelector('[data-hotpocket-site-subfolder]');
+        form.querySelectorAll('input[name="hotpocket_site_scope"]').forEach((radio) => {
+            radio.addEventListener('change', () => refreshHotPocketSiteDirectoryChooser(form));
+        });
+        if (picker) picker.addEventListener('change', () => {
+            if (input) input.value = picker.value;
+            refreshHotPocketSiteDirectoryChooser(form);
+        });
+        if (input) input.addEventListener('input', () => {
+            input.setCustomValidity('');
+            const value = input.value.trim();
+            const valid = value === '' || (!value.startsWith('/') && !value.includes('\\') && !value.includes('//') && value.split('/').every((part) => part !== '' && part !== '.' && part !== '..' && part.length <= 128 && /^[A-Za-z0-9._-]+$/.test(part)));
+            if (!valid) input.setCustomValidity('Use a relative path such as public or public/html. Do not use / at the start, backslashes, empty segments, . or ...');
+            refreshHotPocketSiteDirectoryChooser(form);
+        });
+        refreshHotPocketSiteDirectoryChooser(form);
+    });
+}
+
+function hotPocketIndexNames(builder) {
+    const hidden = builder ? builder.querySelector('[data-hotpocket-index-hidden]') : null;
+    return (hidden ? hidden.value : '').split(',').map((value) => value.trim()).filter(Boolean);
+}
+
+function renderHotPocketIndexBuilder(builder) {
+    if (!builder) return;
+    const hidden = builder.querySelector('[data-hotpocket-index-hidden]');
+    const list = builder.querySelector('[data-hotpocket-index-list]');
+    if (!hidden || !list) return;
+    const names = Array.from(new Set(hotPocketIndexNames(builder)));
+    hidden.value = names.join(',');
+    list.innerHTML = '';
+    names.forEach((name) => {
+        const pill = document.createElement('span');
+        pill.className = 'wizard-pill';
+        const text = document.createElement('code');
+        text.textContent = name;
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'secondary';
+        remove.style.padding = '2px 7px';
+        remove.style.minHeight = '0';
+        remove.setAttribute('aria-label', 'Remove ' + name);
+        remove.textContent = '×';
+        remove.addEventListener('click', () => {
+            hidden.value = hotPocketIndexNames(builder).filter((item) => item !== name).join(',');
+            renderHotPocketIndexBuilder(builder);
+        });
+        pill.append(text, remove);
+        list.appendChild(pill);
+    });
+}
+
+function addHotPocketSiteIndex(button) {
+    const builder = button && button.closest ? button.closest('[data-hotpocket-index-builder]') : null;
+    if (!builder) return;
+    const input = builder.querySelector('[data-hotpocket-index-input]');
+    const hidden = builder.querySelector('[data-hotpocket-index-hidden]');
+    if (!input || !hidden) return;
+    const name = input.value.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) {
+        input.setCustomValidity('Use a filename such as home.html or app.php. No slashes or spaces.');
+        input.reportValidity();
+        return;
+    }
+    input.setCustomValidity('');
+    const names = hotPocketIndexNames(builder);
+    if (!names.includes(name)) names.push(name);
+    hidden.value = names.join(',');
+    input.value = '';
+    renderHotPocketIndexBuilder(builder);
+    input.focus();
+}
+
+function initializeHotPocketIndexBuilders(root = document) {
+    if (!root.querySelectorAll) return;
+    root.querySelectorAll('[data-hotpocket-index-builder]').forEach((builder) => {
+        if (builder.dataset.initialized === '1') return;
+        builder.dataset.initialized = '1';
+        const input = builder.querySelector('[data-hotpocket-index-input]');
+        if (input) input.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            const button = builder.querySelector('button[onclick*="addHotPocketSiteIndex"]');
+            if (button) addHotPocketSiteIndex(button);
+        });
+        renderHotPocketIndexBuilder(builder);
+    });
+}
+
+function toggleHotPocketContractUpload(form) {
+    if (!(form instanceof HTMLFormElement)) return;
+    const selected = form.querySelector('input[name="hotpocket_contract_choice"]:checked');
+    const wrap = form.querySelector('[data-hotpocket-contract-upload]');
+    const input = form.querySelector('input[name="hotpocket_contract_zip"]');
+    const wantsUpload = !!selected && selected.value === 'yes';
+    if (wrap) wrap.classList.toggle('hidden', !wantsUpload);
+    if (input) {
+        input.required = wantsUpload;
+        if (!wantsUpload) input.value = '';
+    }
+}
+
 function initializeDynamicControls(root = document) {
+    initializeHotPocketSiteDirectoryChoosers(root);
     const repositoryMode = root.querySelector ? root.querySelector('#kopia-repository-mode') : null;
     if (repositoryMode) updateKopiaRepositoryMode(repositoryMode);
     if (root.querySelectorAll) root.querySelectorAll('.schedule-mode-select').forEach(updateScheduleFields);
@@ -4866,6 +5705,8 @@ function initializeDynamicControls(root = document) {
     if (provider) updateOffsiteProvider(provider);
     toggleDrupalSource(root);
     toggleDrupalGitAuth(root);
+    if (root.querySelectorAll) root.querySelectorAll('form[data-hotpocket-enable-form]').forEach(toggleHotPocketContractUpload);
+    initializeHotPocketIndexBuilders(root);
 }
 
 function escapeHtml(value) {
