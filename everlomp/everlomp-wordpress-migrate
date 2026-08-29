@@ -1,0 +1,903 @@
+#!/usr/bin/env python3
+"""Everlomp WordPress migration helper.
+ 
+Actions (JSON on stdin except uninstall):
+  analyze   - inspect staged WordPress ZIP + SQL/SQL.GZ/SQL.ZIP and return candidates
+  migrate   - import one confirmed WordPress database and deploy the ZIP
+  cleanup   - delete one migration staging token
+  uninstall - remove temporary migration uploads plus this helper's sudo rule/self
+ 
+Analysis runs as the PHP worker without sudo. Mutating actions run as root via narrowly-scoped sudoers rules.
+"""
+from __future__ import annotations
+ 
+import gzip
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterable
+ 
+STAGE_BASE = Path('/tmp/everlomp-wordpress-migration')
+WEB_ROOT = Path('/var/www/html')
+PRIMARY_APP = Path('/home/everlomp/primary-app')
+WORDPRESS_INFO = Path('/home/everlomp/wordpress.json')
+SECRET_TOOL = Path('/usr/local/sbin/everlomp-secret')
+SECRET_PATH = Path('/home/everlomp/secrets/wordpress-db-password')
+RUNTIME_SECRET = Path('/run/everlomp/web/wordpress-db-password')
+SUDOERS_FILE = Path('/etc/sudoers.d/everlomp-wordpress-migration')
+SELF_PATH = Path('/usr/local/sbin/everlomp-wordpress-migrate')
+MAX_ZIP_BYTES = 2 * 1024 * 1024 * 1024
+MAX_SQL_BYTES = 4 * 1024 * 1024 * 1024
+MAX_ZIP_EXPANDED = 12 * 1024 * 1024 * 1024
+MAX_ZIP_ENTRIES = 250_000
+ 
+CORE_SUFFIXES = (
+    'options', 'posts', 'postmeta', 'users', 'usermeta', 'terms',
+    'term_taxonomy', 'term_relationships', 'comments', 'commentmeta',
+)
+ 
+TOKEN_RE = re.compile(r'^[a-f0-9]{32}$')
+DB_RE = re.compile(r'^[A-Za-z0-9_]{1,64}$')
+DB_USER_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]{2,31}$')
+PREFIX_RE = re.compile(r'^[A-Za-z0-9_]{1,64}$')
+ 
+ 
+def die(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+ 
+ 
+def emit(data: dict[str, Any]) -> None:
+    print(json.dumps(data, separators=(',', ':'), ensure_ascii=False))
+ 
+ 
+def read_payload() -> dict[str, Any]:
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        die('Invalid migration JSON payload.', 64)
+    if not isinstance(data, dict):
+        die('Migration payload must be a JSON object.', 64)
+    return data
+ 
+ 
+def validate_token(value: Any) -> str:
+    token = str(value or '')
+    if not TOKEN_RE.fullmatch(token):
+        die('Invalid WordPress migration token.', 65)
+    return token
+ 
+ 
+def stage_dir(token: str) -> Path:
+    path = (STAGE_BASE / token).resolve()
+    base = STAGE_BASE.resolve()
+    if path.parent != base:
+        die('Invalid migration staging path.', 65)
+    return path
+ 
+ 
+def stage_files(token: str) -> tuple[Path, Path]:
+    base = stage_dir(token)
+    z = base / 'wordpress-files.zip'
+    sql = base / 'database.sql'
+    sql_gz = base / 'database.sql.gz'
+    sql_zip = base / 'database.sql.zip'
+    if not z.is_file():
+        die('WordPress files ZIP has not finished uploading.', 66)
+    sql_files = [p for p in (sql, sql_gz, sql_zip) if p.is_file()]
+    if len(sql_files) > 1:
+        die('Migration staging contains conflicting SQL files.', 66)
+    if not sql_files:
+        die('Database SQL file has not finished uploading.', 66)
+    s = sql_files[0]
+    if z.stat().st_size < 1 or z.stat().st_size > MAX_ZIP_BYTES:
+        die('WordPress ZIP size is outside the allowed migration range.', 66)
+    if s.stat().st_size < 1 or s.stat().st_size > MAX_SQL_BYTES:
+        die('SQL dump size is outside the allowed migration range.', 66)
+    return z, s
+ 
+ 
+def normalize_zip_name(name: str) -> PurePosixPath:
+    if '\x00' in name:
+        die('ZIP contains an invalid NUL path.', 67)
+    name = name.replace('\\', '/')
+    p = PurePosixPath(name)
+    if p.is_absolute() or any(part in ('..', '') for part in p.parts if part != '.'):
+        die('ZIP contains an unsafe path.', 67)
+    return p
+ 
+ 
+def zip_entry_is_symlink(info: zipfile.ZipInfo) -> bool:
+    mode = (info.external_attr >> 16) & 0xFFFF
+    return stat.S_ISLNK(mode)
+ 
+ 
+def parse_wp_config(text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    m = re.search(r"define\s*\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]([^'\"]*)['\"]\s*\)\s*;", text, re.I)
+    if m:
+        result['db_name_hint'] = m.group(1)
+    m = re.search(r"\$table_prefix\s*=\s*['\"]([^'\"]+)['\"]\s*;", text)
+    if m:
+        result['prefix_hint'] = m.group(1)
+    return result
+ 
+ 
+def analyze_zip(path: Path) -> dict[str, Any]:
+    roots: dict[str, dict[str, Any]] = {}
+    with zipfile.ZipFile(path) as zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_ZIP_ENTRIES:
+            die(f'ZIP has too many entries (maximum {MAX_ZIP_ENTRIES}).', 67)
+        expanded = sum(max(0, int(i.file_size)) for i in infos)
+        if expanded > MAX_ZIP_EXPANDED:
+            die('ZIP expands beyond the 12 GiB migration safety limit.', 67)
+ 
+        normalized: list[tuple[zipfile.ZipInfo, PurePosixPath]] = []
+        all_names: set[str] = set()
+        for info in infos:
+            if zip_entry_is_symlink(info):
+                die(f'ZIP contains a symbolic link, which is not allowed: {info.filename}', 67)
+            p = normalize_zip_name(info.filename)
+            normalized.append((info, p))
+            all_names.add(str(p).rstrip('/'))
+ 
+        possible_roots: set[str] = set()
+        for _, p in normalized:
+            parts = p.parts
+            for idx, part in enumerate(parts):
+                if part == 'wp-admin':
+                    possible_roots.add('/'.join(parts[:idx]))
+ 
+        for root in sorted(possible_roots, key=lambda x: (x.count('/'), len(x), x)):
+            prefix = f'{root}/' if root else ''
+            has_admin = any(n == prefix + 'wp-admin' or n.startswith(prefix + 'wp-admin/') for n in all_names)
+            has_content = any(n == prefix + 'wp-content' or n.startswith(prefix + 'wp-content/') for n in all_names)
+            has_includes = any(n == prefix + 'wp-includes' or n.startswith(prefix + 'wp-includes/') for n in all_names)
+            if not (has_admin and has_content and has_includes):
+                continue
+            cfg_name = prefix + 'wp-config.php'
+            sample_name = prefix + 'wp-config-sample.php'
+            cfg = next((i for i, p in normalized if str(p) == cfg_name), None)
+            sample = next((i for i, p in normalized if str(p) == sample_name), None)
+            item: dict[str, Any] = {
+                'root': root,
+                'display_root': root if root else '/',
+                'wp_config_found': cfg is not None,
+                'wp_config_sample_found': sample is not None,
+            }
+            if cfg is not None and cfg.file_size <= 2 * 1024 * 1024:
+                try:
+                    config_text = zf.read(cfg).decode('utf-8', errors='replace')
+                    item.update(parse_wp_config(config_text))
+                except Exception:
+                    pass
+            roots[root] = item
+ 
+    if not roots:
+        die('No WordPress root was found in the ZIP (wp-admin, wp-content and wp-includes are required).', 67)
+    return {
+        'size': path.stat().st_size,
+        'expanded_size': expanded,
+        'entries': len(infos),
+        'roots': list(roots.values()),
+    }
+ 
+ 
+def sql_zip_member(zf: zipfile.ZipFile) -> zipfile.ZipInfo:
+    members = [
+        info for info in zf.infolist()
+        if not info.is_dir()
+        and (info.filename.lower().endswith('.sql') or info.filename.lower().endswith('.sql.gz'))
+    ]
+    if len(members) != 1:
+        die(
+            'A .sql.zip migration archive must contain exactly one .sql or .sql.gz dump.',
+            68,
+        )
+    info = members[0]
+    if info.flag_bits & 0x1:
+        die('Encrypted SQL ZIP archives are not supported.', 68)
+    # Protect the analyzer from obvious archive bombs. This is the size of the
+    # member stored in the outer ZIP; an inner .sql.gz is still streamed and is
+    # additionally bounded by the analyzer line-count guard.
+    if info.file_size < 1 or info.file_size > 12 * 1024 * 1024 * 1024:
+        die('SQL ZIP expanded member is outside the allowed migration range.', 68)
+    return info
+ 
+ 
+from contextlib import contextmanager
+import io
+ 
+@contextmanager
+def open_sql(path: Path):
+    if path.name.endswith('.sql.zip'):
+        try:
+            with zipfile.ZipFile(path) as zf:
+                info = sql_zip_member(zf)
+                with zf.open(info, 'r') as raw:
+                    if info.filename.lower().endswith('.gz'):
+                        with gzip.GzipFile(fileobj=raw, mode='rb') as gz:
+                            with io.TextIOWrapper(gz, encoding='utf-8', errors='replace', newline='') as text:
+                                yield text
+                    else:
+                        with io.TextIOWrapper(raw, encoding='utf-8', errors='replace', newline='') as text:
+                            yield text
+        except zipfile.BadZipFile as exc:
+            die(f'Could not read SQL ZIP archive: {exc}', 68)
+        return
+    if path.name.endswith('.gz'):
+        with gzip.open(path, 'rt', encoding='utf-8', errors='replace', newline='') as text:
+            yield text
+        return
+    with path.open('rt', encoding='utf-8', errors='replace', newline='') as text:
+        yield text
+ 
+ 
+def unquote_ident(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith('`') and raw.endswith('`'):
+        return raw[1:-1].replace('``', '`')
+    return raw
+ 
+ 
+def analyze_sql(path: Path) -> dict[str, Any]:
+    use_re = re.compile(r'^\s*USE\s+(`(?:``|[^`])+`|[A-Za-z0-9_$.-]+)\s*;', re.I)
+    current_comment_re = re.compile(r'^\s*--\s*Current Database:\s*`([^`]+)`', re.I)
+    table_re = re.compile(
+        r'^\s*CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+'
+        r'(?:(`(?:``|[^`])+`|[A-Za-z0-9_$.-]+)\s*\.\s*)?'
+        r'(`(?:``|[^`])+`|[A-Za-z0-9_$.-]+)',
+        re.I,
+    )
+    tables: dict[str, set[str]] = {}
+    current_db: str | None = None
+    saw_use = False
+    line_count = 0
+ 
+    try:
+        with open_sql(path) as stream:
+            for line in stream:
+                line_count += 1
+                if line_count > 60_000_000:
+                    die('SQL dump is unreasonably large to analyze.', 68)
+                m = current_comment_re.match(line)
+                if m:
+                    current_db = m.group(1)
+                    continue
+                m = use_re.match(line)
+                if m:
+                    current_db = unquote_ident(m.group(1))
+                    saw_use = True
+                    continue
+                m = table_re.match(line)
+                if not m:
+                    continue
+                qdb = unquote_ident(m.group(1)) if m.group(1) else None
+                table = unquote_ident(m.group(2))
+                db = qdb or current_db or '__default__'
+                tables.setdefault(db, set()).add(table)
+    except (OSError, gzip.BadGzipFile, RuntimeError, zipfile.BadZipFile) as exc:
+        die(f'Could not read SQL dump: {exc}', 68)
+ 
+    candidates: list[dict[str, Any]] = []
+    for db, names in tables.items():
+        prefixes: dict[str, set[str]] = {}
+        for table in names:
+            for suffix in CORE_SUFFIXES:
+                if table.endswith(suffix):
+                    prefix = table[:-len(suffix)]
+                    if prefix and PREFIX_RE.fullmatch(prefix):
+                        prefixes.setdefault(prefix, set()).add(suffix)
+        for prefix, found in prefixes.items():
+            required = {'options', 'posts', 'users'}
+            if not required.issubset(found):
+                continue
+            score = len(found)
+            confidence = 'high' if score >= 8 else ('medium' if score >= 5 else 'low')
+            candidates.append({
+                'database': db,
+                'display_database': '(single database dump)' if db == '__default__' else db,
+                'prefix': prefix,
+                'score': score,
+                'confidence': confidence,
+                'matched_tables': sorted(found),
+                'table_count': len(names),
+            })
+ 
+    candidates.sort(key=lambda c: (-int(c['score']), str(c['database']), str(c['prefix'])))
+    if not candidates:
+        die('No WordPress database could be identified in the SQL dump.', 68)
+    return {
+        'size': path.stat().st_size,
+        'gzip': path.name.endswith('.gz'),
+        'zip': path.name.endswith('.sql.zip'),
+        'databases_seen': sorted(tables.keys()),
+        'has_use_statements': saw_use,
+        'candidates': candidates,
+    }
+ 
+ 
+def analyze(token: str) -> dict[str, Any]:
+    zip_path, sql_path = stage_files(token)
+    z = analyze_zip(zip_path)
+    s = analyze_sql(sql_path)
+ 
+    # Add a non-authoritative hint when wp-config.php points to one SQL candidate.
+    zip_hints = {(str(r.get('db_name_hint', '')), str(r.get('prefix_hint', ''))) for r in z['roots']}
+    for cand in s['candidates']:
+        hint_match = (str(cand['database']), str(cand['prefix'])) in zip_hints
+        if cand['database'] == '__default__':
+            hint_match = any(str(cand['prefix']) == p and p for _, p in zip_hints)
+        cand['wp_config_hint_match'] = bool(hint_match)
+    s['candidates'].sort(key=lambda c: (not bool(c.get('wp_config_hint_match')), -int(c['score']), str(c['database'])))
+ 
+    return {'ok': True, 'token': token, 'zip': z, 'sql': s}
+ 
+ 
+def run(cmd: list[str], *, input_bytes: bytes | None = None, env: dict[str, str] | None = None,
+        check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(
+        cmd,
+        input=input_bytes,
+        env=env,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        err = (proc.stderr or b'').decode('utf-8', errors='replace').strip()
+        out = (proc.stdout or b'').decode('utf-8', errors='replace').strip()
+        die(err or out or f'Command failed: {cmd[0]}', 70)
+    return proc
+ 
+ 
+def mariadb_bin() -> str:
+    for name in ('mariadb', 'mysql'):
+        p = shutil.which(name)
+        if p:
+            return p
+    die('MariaDB client is unavailable.', 70)
+    raise AssertionError
+ 
+ 
+def sql_literal(value: str) -> str:
+    # MariaDB string literal with backslash escapes enabled (default Everlomp config).
+    return "'" + value.replace('\\', '\\\\').replace("'", "\\'").replace('\x00', '') + "'"
+ 
+ 
+def db_query(sql: str) -> str:
+    cmd = [mariadb_bin(), '--protocol=socket', '--batch', '--skip-column-names']
+    p = run(cmd, input_bytes=(sql + '\n').encode('utf-8'))
+    return (p.stdout or b'').decode('utf-8', errors='replace').strip()
+ 
+ 
+def validate_destination(payload: dict[str, Any]) -> tuple[str, str, str, str, bool]:
+    site_url = str(payload.get('site_url') or '').strip().rstrip('/')
+    db_name = str(payload.get('database_name') or '').strip()
+    db_user = str(payload.get('database_user') or '').strip()
+    db_pass = str(payload.get('database_password') or '')
+    replace_urls = bool(payload.get('replace_urls', True))
+    if not re.fullmatch(r'https://[A-Za-z0-9.-]+(?::[0-9]+)?(?:/.*)?', site_url) or ':' in site_url.split('://', 1)[1].split('/', 1)[0]:
+        die('Migration site URL must be HTTPS and use a domain without an explicit port.', 69)
+    host = site_url.split('://', 1)[1].split('/', 1)[0]
+    if re.fullmatch(r'[0-9.]+', host):
+        die('Migration site URL must use a domain, not a raw IP address.', 69)
+    if not DB_RE.fullmatch(db_name):
+        die('Destination database name may contain only letters, numbers and underscores.', 69)
+    if not DB_USER_RE.fullmatch(db_user):
+        die('Destination database user must be 3-32 characters, begin with a letter, and use only letters, numbers and underscores.', 69)
+    if len(db_pass) < 12 or '\n' in db_pass or '\r' in db_pass or '\x00' in db_pass:
+        die('Destination database password must be at least 12 characters and contain no line breaks/NUL bytes.', 69)
+    return site_url, db_name, db_user, db_pass, replace_urls
+ 
+ 
+def ensure_candidate(analysis: dict[str, Any], payload: dict[str, Any]) -> tuple[str, str, str]:
+    source_db = str(payload.get('source_database') or '')
+    source_prefix = str(payload.get('source_prefix') or '')
+    source_root = str(payload.get('source_root') or '')
+    if not PREFIX_RE.fullmatch(source_prefix):
+        die('Invalid WordPress table prefix selection.', 69)
+    roots = {str(r['root']) for r in analysis['zip']['roots']}
+    if source_root not in roots:
+        die('Selected WordPress ZIP root is no longer valid. Analyze the migration again.', 69)
+    matches = [c for c in analysis['sql']['candidates'] if str(c['database']) == source_db and str(c['prefix']) == source_prefix]
+    if len(matches) != 1:
+        die('Selected WordPress database is no longer valid. Analyze the migration again.', 69)
+    return source_db, source_prefix, source_root
+ 
+ 
+def extract_selected_zip(zip_path: Path, root: str, dest: Path) -> None:
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, mode=0o700)
+    root_prefix = f'{root}/' if root else ''
+    total = 0
+    count = 0
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            p = normalize_zip_name(info.filename)
+            if zip_entry_is_symlink(info):
+                die(f'ZIP contains a symbolic link: {info.filename}', 67)
+            name = str(p)
+            if root_prefix and not (name == root or name.startswith(root_prefix)):
+                continue
+            rel = name[len(root_prefix):] if root_prefix else name
+            rel = rel.strip('/')
+            if not rel:
+                continue
+            relp = PurePosixPath(rel)
+            if relp.is_absolute() or '..' in relp.parts:
+                die('ZIP contains an unsafe extraction path.', 67)
+            target = dest.joinpath(*relp.parts)
+            resolved = target.resolve()
+            if dest.resolve() not in resolved.parents and resolved != dest.resolve():
+                die('ZIP extraction attempted to leave the staging directory.', 67)
+            count += 1
+            total += int(info.file_size)
+            if count > MAX_ZIP_ENTRIES or total > MAX_ZIP_EXPANDED:
+                die('ZIP exceeded migration extraction safety limits.', 67)
+            if info.is_dir() or name.endswith('/'):
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info, 'r') as src, target.open('wb') as out:
+                shutil.copyfileobj(src, out, length=1024 * 1024)
+ 
+    for required in ('wp-admin', 'wp-content', 'wp-includes'):
+        if not (dest / required).is_dir():
+            die(f'Extracted archive is missing {required}.', 67)
+ 
+ 
+def import_sql(sql_path: Path, source_db: str, dest_db: str) -> None:
+    # Stream a normal mysqldump/all-databases dump, retaining only the selected
+    # USE section. CREATE DATABASE/USE statements are dropped so everything lands
+    # in the explicitly selected destination DB.
+    filter_code = r'''
+import gzip,io,re,sys,zipfile
+path, selected, dest = sys.argv[1:4]
+use_re=re.compile(r'^\s*USE\s+(`(?:``|[^`])+`|[A-Za-z0-9_$.-]+)\s*;',re.I)
+cur_comment=re.compile(r'^\s*--\s*Current Database:\s*`([^`]+)`',re.I)
+create_db=re.compile(r'^\s*CREATE\s+DATABASE\b',re.I)
+ 
+def uq(x):
+    x=x.strip()
+    return x[1:-1].replace('``','`') if x.startswith('`') and x.endswith('`') else x
+ 
+from contextlib import contextmanager
+ 
+@contextmanager
+def op(p):
+    if p.endswith('.sql.zip'):
+        with zipfile.ZipFile(p) as zf:
+            members=[i for i in zf.infolist() if not i.is_dir() and (i.filename.lower().endswith('.sql') or i.filename.lower().endswith('.sql.gz'))]
+            if len(members) != 1:
+                raise RuntimeError('SQL ZIP must contain exactly one .sql or .sql.gz dump')
+            info=members[0]
+            if info.flag_bits & 0x1:
+                raise RuntimeError('Encrypted SQL ZIP archives are not supported')
+            with zf.open(info,'r') as raw:
+                if info.filename.lower().endswith('.gz'):
+                    with gzip.GzipFile(fileobj=raw,mode='rb') as gz:
+                        with io.TextIOWrapper(gz,encoding='utf-8',errors='replace',newline='') as text:
+                            yield text
+                else:
+                    with io.TextIOWrapper(raw,encoding='utf-8',errors='replace',newline='') as text:
+                        yield text
+        return
+    if p.endswith('.gz'):
+        with gzip.open(p,'rt',encoding='utf-8',errors='replace',newline='') as text:
+            yield text
+        return
+    with open(p,'rt',encoding='utf-8',errors='replace',newline='') as text:
+        yield text
+ 
+cur=None
+saw_use=False
+with op(path) as f:
+    for line in f:
+        m=cur_comment.match(line)
+        if m:
+            cur=m.group(1)
+            continue
+        m=use_re.match(line)
+        if m:
+            cur=uq(m.group(1)); saw_use=True
+            continue
+        if create_db.match(line):
+            continue
+        keep = (selected == '__default__' and not saw_use) or (cur is None) or (cur == selected)
+        if not keep:
+            continue
+        if selected != '__default__':
+            line=re.sub(r'`'+re.escape(selected)+r'`\s*\.', '', line)
+        sys.stdout.write(line)
+'''
+    cmd_filter = [sys.executable, '-c', filter_code, str(sql_path), source_db, dest_db]
+    cmd_db = [mariadb_bin(), '--protocol=socket', '--default-character-set=utf8mb4', dest_db]
+    p1 = subprocess.Popen(cmd_filter, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert p1.stdout is not None
+    p2 = subprocess.Popen(cmd_db, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p1.stdout.close()
+    out2, err2 = p2.communicate()
+    err1 = (p1.stderr.read() if p1.stderr else b'')
+    rc1 = p1.wait()
+    if rc1 != 0 or p2.returncode != 0:
+        detail = (err2 or err1 or out2 or b'SQL import failed.').decode('utf-8', errors='replace').strip()
+        die(detail, 71)
+ 
+ 
+def php_quote(value: str) -> str:
+    return "'" + value.replace('\\', '\\\\').replace("'", "\\'") + "'"
+ 
+ 
+def rewrite_wp_config(path: Path, db_name: str, db_user: str, prefix: str) -> None:
+    if not path.is_file():
+        sample = path.with_name('wp-config-sample.php')
+        if sample.is_file():
+            shutil.copy2(sample, path)
+        else:
+            die('Migrated WordPress files contain neither wp-config.php nor wp-config-sample.php.', 72)
+    text = path.read_text(encoding='utf-8', errors='replace')
+ 
+    replacements = {
+        'DB_NAME': php_quote(db_name),
+        'DB_USER': php_quote(db_user),
+        'DB_PASSWORD': "trim((string) @file_get_contents('/run/everlomp/web/wordpress-db-password'))",
+        'DB_HOST': "'localhost'",
+    }
+    missing: list[str] = []
+    for key, value_expr in replacements.items():
+        pattern = re.compile(r"define\s*\(\s*(['\"])" + re.escape(key) + r"\1\s*,.*?\)\s*;", re.I | re.S)
+        repl = f"define('{key}', {value_expr});"
+        text, count = pattern.subn(repl, text, count=1)
+        if count == 0:
+            missing.append(repl)
+ 
+    prefix_re = re.compile(r"\$table_prefix\s*=\s*(['\"])(.*?)\1\s*;", re.S)
+    text, count = prefix_re.subn("$table_prefix = " + php_quote(prefix) + ";", text, count=1)
+    if count == 0:
+        missing.append("$table_prefix = " + php_quote(prefix) + ";")
+ 
+    if missing:
+        marker_re = re.compile(r"/\*\s*That's all, stop editing!.*?\*/", re.I)
+        insert = "\n".join(missing) + "\n\n"
+        m = marker_re.search(text)
+        if m:
+            text = text[:m.start()] + insert + text[m.start():]
+        else:
+            text += "\n" + insert
+    path.write_text(text, encoding='utf-8')
+ 
+ 
+def set_permissions() -> None:
+    try:
+        import pwd, grp
+        uid_nobody = pwd.getpwnam('nobody').pw_uid
+        gid_nogroup = grp.getgrnam('nogroup').gr_gid
+    except Exception:
+        uid_nobody = 65534
+        gid_nogroup = 65534
+ 
+    # Core is read-only to the web worker; wp-content remains web-writable.
+    for root, dirs, files in os.walk(WEB_ROOT):
+        rootp = Path(root)
+        if rootp.name in ('.everlomp', '.everlomp-filegator'):
+            dirs[:] = []
+            continue
+        if rootp == WEB_ROOT:
+            dirs[:] = [d for d in dirs if d not in ('.everlomp', '.everlomp-filegator')]
+        for d in dirs:
+            p = rootp / d
+            try:
+                os.chown(p, 0, gid_nogroup)
+                os.chmod(p, 0o755)
+            except FileNotFoundError:
+                pass
+        for f in files:
+            p = rootp / f
+            if p.name == 'lompinstaller.php':
+                continue
+            try:
+                os.chown(p, 0, gid_nogroup)
+                os.chmod(p, 0o644)
+            except FileNotFoundError:
+                pass
+ 
+    wp_content = WEB_ROOT / 'wp-content'
+    if wp_content.exists():
+        for root, dirs, files in os.walk(wp_content):
+            rootp = Path(root)
+            os.chown(rootp, uid_nobody, gid_nogroup)
+            os.chmod(rootp, 0o755)
+            for d in dirs:
+                p = rootp / d
+                try:
+                    os.chown(p, uid_nobody, gid_nogroup); os.chmod(p, 0o755)
+                except FileNotFoundError:
+                    pass
+            for f in files:
+                p = rootp / f
+                try:
+                    os.chown(p, uid_nobody, gid_nogroup); os.chmod(p, 0o644)
+                except FileNotFoundError:
+                    pass
+    cfg = WEB_ROOT / 'wp-config.php'
+    if cfg.exists():
+        os.chown(cfg, 0, gid_nogroup)
+        os.chmod(cfg, 0o640)
+ 
+ 
+def copy_site(extracted: Path) -> None:
+    protected = {'.everlomp', '.everlomp-filegator', 'lompinstaller.php'}
+    WEB_ROOT.mkdir(parents=True, exist_ok=True)
+    for item in list(WEB_ROOT.iterdir()):
+        if item.name in protected:
+            continue
+        if item.is_dir() and not item.is_symlink():
+            shutil.rmtree(item)
+        else:
+            item.unlink(missing_ok=True)
+    for item in extracted.iterdir():
+        if item.name in protected:
+            continue
+        target = WEB_ROOT / item.name
+        if item.is_dir():
+            shutil.copytree(item, target, symlinks=False, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, target, follow_symlinks=False)
+ 
+ 
+def detect_old_url(db_name: str, prefix: str) -> str:
+    table = f'{db_name}.{prefix}options'
+    q = f"SELECT option_value FROM `{db_name}`.`{prefix}options` WHERE option_name='siteurl' LIMIT 1;"
+    try:
+        return db_query(q).strip()
+    except SystemExit:
+        return ''
+ 
+ 
+def force_home_siteurl(db_name: str, prefix: str, site_url: str) -> None:
+    q = (
+        f"UPDATE `{db_name}`.`{prefix}options` SET option_value={sql_literal(site_url)} "
+        "WHERE option_name IN ('siteurl','home');"
+    )
+    db_query(q)
+ 
+ 
+def serialized_search_replace(db_name: str, db_user: str, prefix: str, old: str, new: str) -> dict[str, Any]:
+    if not old or old == new:
+        return {'changed_cells': 0, 'skipped_tables_without_primary_key': 0}
+    php = '/usr/local/lsws/lsphp85/bin/php'
+    if not Path(php).is_file():
+        php = shutil.which('php') or ''
+    if not php:
+        die('PHP CLI is unavailable for serialized WordPress URL replacement.', 73)
+ 
+    script = r'''<?php
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+$db = getenv('E_DB'); $user = getenv('E_USER'); $prefix = getenv('E_PREFIX');
+$old = getenv('E_OLD'); $new = getenv('E_NEW');
+$pass = trim((string) @file_get_contents('/run/everlomp/web/wordpress-db-password'));
+$mysqli = new mysqli('localhost', $user, $pass, $db);
+$mysqli->set_charset('utf8mb4');
+function ident(string $s): string { return '`' . str_replace('`','``',$s) . '`'; }
+function repl($v, string $old, string $new, bool &$changed) {
+    if (is_string($v)) { $n = str_replace($old,$new,$v); if ($n !== $v) $changed=true; return $n; }
+    if (is_array($v)) { foreach ($v as $k=>$x) $v[$k]=repl($x,$old,$new,$changed); return $v; }
+    // Do not mutate serialized objects from an untrusted dump.
+    return $v;
+}
+function replace_value(string $v, string $old, string $new, bool &$changed): string {
+    $trim = trim($v);
+    $looks = preg_match('/^(?:a|s|i|d|b|N):?/', $trim) === 1;
+    if ($looks) {
+        $u = @unserialize($v, ['allowed_classes'=>false]);
+        if ($u !== false || $v === 'b:0;' || $v === 'N;') {
+            if (is_object($u)) return $v;
+            $local=false; $u2=repl($u,$old,$new,$local);
+            if ($local) { $changed=true; return serialize($u2); }
+            return $v;
+        }
+    }
+    $n=str_replace($old,$new,$v); if ($n !== $v) $changed=true; return $n;
+}
+$escDb=$mysqli->real_escape_string($db); $likePrefix=strtr($prefix,['\\'=>'\\\\','%'=>'\\%','_'=>'\\_']).'%'; $escPrefix=$mysqli->real_escape_string($likePrefix);
+$tables=[];
+$r=$mysqli->query("SELECT table_name FROM information_schema.tables WHERE table_schema='{$escDb}' AND table_name LIKE '{$escPrefix}' ESCAPE '\\\\'");
+while($row=$r->fetch_row()) $tables[]=$row[0];
+$changedCells=0; $skipped=0;
+foreach($tables as $table) {
+    $pk=[];
+    $r=$mysqli->query('SHOW KEYS FROM '.ident($table)." WHERE Key_name='PRIMARY'");
+    while($row=$r->fetch_assoc()) $pk[(int)$row['Seq_in_index']]=$row['Column_name'];
+    ksort($pk); $pk=array_values($pk);
+    if (!$pk) { $skipped++; continue; }
+    $cols=[];
+    $escTable=$mysqli->real_escape_string($table);
+    $r=$mysqli->query("SELECT column_name,data_type FROM information_schema.columns WHERE table_schema='{$escDb}' AND table_name='{$escTable}'");
+    while($row=$r->fetch_assoc()) {
+        if (in_array(strtolower($row['data_type']), ['char','varchar','tinytext','text','mediumtext','longtext'], true) && strtolower($row['column_name']) !== 'guid') $cols[]=$row['column_name'];
+    }
+    foreach($cols as $col) {
+        $select='SELECT '.implode(',',array_map('ident',$pk)).','.ident($col).' FROM '.ident($table).' WHERE '.ident($col).' LIKE ?';
+        $stmt=$mysqli->prepare($select); $like='%'.$old.'%'; $stmt->bind_param('s',$like); $stmt->execute();
+        $res=$stmt->get_result();
+        $rows=[]; while($row=$res->fetch_assoc()) $rows[]=$row; $stmt->close();
+        foreach($rows as $row) {
+            $value=(string)$row[$col]; $changed=false; $newValue=replace_value($value,$old,$new,$changed); if(!$changed) continue;
+            $where=[]; foreach($pk as $k) $where[]=ident($k).'<=>?';
+            $update='UPDATE '.ident($table).' SET '.ident($col).'=? WHERE '.implode(' AND ',$where).' LIMIT 1';
+            $u=$mysqli->prepare($update); $params=[$newValue]; foreach($pk as $k) $params[]=$row[$k];
+            $types=str_repeat('s',count($params)); $refs=[]; foreach($params as $i=>$unused) $refs[$i]=&$params[$i]; $u->bind_param($types,...$refs); $u->execute(); $u->close(); $changedCells++;
+        }
+    }
+}
+echo json_encode(['changed_cells'=>$changedCells,'skipped_tables_without_primary_key'=>$skipped], JSON_UNESCAPED_SLASHES);
+'''
+    env = os.environ.copy()
+    env.update({'E_DB': db_name, 'E_USER': db_user, 'E_PREFIX': prefix, 'E_OLD': old, 'E_NEW': new})
+    p = run([php], input_bytes=script.encode(), env=env)
+    try:
+        return json.loads((p.stdout or b'{}').decode())
+    except Exception:
+        return {'changed_cells': 0, 'skipped_tables_without_primary_key': 0}
+ 
+ 
+def test_wordpress_db(db_name: str, db_user: str) -> None:
+    php = '/usr/local/lsws/lsphp85/bin/php'
+    if not Path(php).is_file():
+        php = shutil.which('php') or ''
+    if not php:
+        die('PHP CLI is unavailable for the final WordPress database test.', 73)
+    code = r'''<?php
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+$p=trim((string)file_get_contents('/run/everlomp/web/wordpress-db-password'));
+$m=new mysqli('localhost',getenv('E_USER'),$p,getenv('E_DB'));
+$r=$m->query('SELECT 1'); echo $r->fetch_row()[0];
+'''
+    env = os.environ.copy(); env.update({'E_DB': db_name, 'E_USER': db_user})
+    p = run([php], input_bytes=code.encode(), env=env)
+    if p.stdout.strip() != b'1':
+        die('WordPress database connectivity test failed.', 73)
+ 
+ 
+def migrate(payload: dict[str, Any]) -> dict[str, Any]:
+    token = validate_token(payload.get('token'))
+    if PRIMARY_APP.exists() and PRIMARY_APP.read_text(errors='ignore').strip():
+        die('A primary application is already registered; migration will not overwrite it.', 69)
+    site_url, db_name, db_user, db_pass, replace_urls = validate_destination(payload)
+    analysis = analyze(token)
+    source_db, source_prefix, source_root = ensure_candidate(analysis, payload)
+    if source_db != '__default__' and not bool(analysis['sql'].get('has_use_statements')) and len(analysis['sql'].get('databases_seen', [])) > 1:
+        die('This multi-database dump has no USE statements, so Everlomp cannot safely isolate one database. Export the WordPress database alone or use a normal mysqldump --all-databases format.', 69)
+    zip_path, sql_path = stage_files(token)
+    work = stage_dir(token) / 'work'
+    extracted = work / 'site'
+    work.mkdir(parents=True, exist_ok=True)
+    extract_selected_zip(zip_path, source_root, extracted)
+ 
+    existing_tables = db_query(
+        f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema={sql_literal(db_name)};"
+    )
+    if existing_tables and int(existing_tables) > 0:
+        die(f'Destination database {db_name} already contains tables; migration refuses to overwrite it.', 74)
+ 
+    # Create destination database/user before importing. Root socket auth is used,
+    # so no MariaDB administrator password is written to disk.
+    setup_sql = (
+        f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        f"CREATE USER IF NOT EXISTS {sql_literal(db_user)}@'localhost' IDENTIFIED BY {sql_literal(db_pass)};"
+        f"ALTER USER {sql_literal(db_user)}@'localhost' IDENTIFIED BY {sql_literal(db_pass)};"
+        f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO {sql_literal(db_user)}@'localhost'; FLUSH PRIVILEGES;"
+    )
+    db_query(setup_sql)
+    import_sql(sql_path, source_db, db_name)
+ 
+    if not SECRET_TOOL.is_file():
+        die(f'Everlomp secret helper is unavailable: {SECRET_TOOL}', 75)
+    run([str(SECRET_TOOL), 'write', str(SECRET_PATH)], input_bytes=db_pass.encode())
+    RUNTIME_SECRET.parent.mkdir(parents=True, exist_ok=True)
+    run([str(SECRET_TOOL), 'materialize-web', str(SECRET_PATH), str(RUNTIME_SECRET)])
+ 
+    copy_site(extracted)
+    rewrite_wp_config(WEB_ROOT / 'wp-config.php', db_name, db_user, source_prefix)
+    set_permissions()
+    test_wordpress_db(db_name, db_user)
+ 
+    old_url = detect_old_url(db_name, source_prefix)
+    replace_result = {'changed_cells': 0, 'skipped_tables_without_primary_key': 0}
+    if replace_urls and old_url and old_url.rstrip('/') != site_url:
+        replace_result = serialized_search_replace(db_name, db_user, source_prefix, old_url.rstrip('/'), site_url)
+    force_home_siteurl(db_name, source_prefix, site_url)
+ 
+    info = {
+        'site_url': site_url,
+        'database_name': db_name,
+        'database_user': db_user,
+        'database_host': 'localhost',
+        'table_prefix': source_prefix,
+        'migrated': True,
+        'source_database': source_db,
+        'source_zip_root': source_root,
+        'old_site_url': old_url,
+        'url_replacement': replace_result,
+    }
+    WORDPRESS_INFO.write_text(json.dumps(info, separators=(',', ':')) + '\n')
+    os.chmod(WORDPRESS_INFO, 0o640)
+    try:
+        import grp
+        os.chown(WORDPRESS_INFO, 0, grp.getgrnam('nogroup').gr_gid)
+    except Exception:
+        pass
+    PRIMARY_APP.write_text('wordpress\n')
+    os.chmod(PRIMARY_APP, 0o644)
+ 
+    # Uploaded backups can contain credentials; remove them immediately after success.
+    shutil.rmtree(stage_dir(token), ignore_errors=True)
+    return {
+        'ok': True,
+        'site_url': site_url,
+        'database_name': db_name,
+        'database_user': db_user,
+        'table_prefix': source_prefix,
+        'old_site_url': old_url,
+        'url_replacement': replace_result,
+    }
+ 
+ 
+def cleanup_token(token: str) -> dict[str, Any]:
+    shutil.rmtree(stage_dir(token), ignore_errors=True)
+    return {'ok': True}
+ 
+ 
+def uninstall_feature() -> dict[str, Any]:
+    shutil.rmtree(STAGE_BASE, ignore_errors=True)
+    try:
+        SUDOERS_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    # Removing the running script is safe on Unix; the current process retains it.
+    try:
+        SELF_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return {'ok': True}
+ 
+ 
+def main() -> None:
+    action = sys.argv[1] if len(sys.argv) > 1 else ''
+ 
+    # Analysis only reads the temporary ZIP/SQL uploads created by the PHP
+    # worker, so it intentionally runs without root/sudo.
+    if action == 'analyze':
+        payload = read_payload()
+        token = validate_token(payload.get('token'))
+        emit(analyze(token))
+        return
+ 
+    # Everything that mutates MariaDB, secrets, the web root, sudoers, or the
+    # helper itself remains root-only.
+    if os.geteuid() != 0:
+        die('This WordPress migration action must run as root.', 77)
+ 
+    if action == 'uninstall':
+        emit(uninstall_feature()); return
+ 
+    payload = read_payload()
+    if action == 'migrate':
+        emit(migrate(payload)); return
+    if action == 'cleanup':
+        token = validate_token(payload.get('token')); emit(cleanup_token(token)); return
+    die('Usage: everlomp-wordpress-migrate {analyze|migrate|cleanup|uninstall}', 64)
+ 
+ 
+if __name__ == '__main__':
+    main()
