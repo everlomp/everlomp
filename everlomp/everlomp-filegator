@@ -225,6 +225,19 @@ if count != 1:
     print('Could not locate FileGator lockout timeout configuration.', file=sys.stderr)
     raise SystemExit(1)
 
+# Raise FileGator's per-file upload limit from the upstream default
+# to 1024 MiB (1 GiB).
+text, count = re.subn(
+    r"('upload_max_size'\s*=>\s*)[^,\r\n]+",
+    r"\g<1>1024 * 1024 * 1024",
+    text,
+    count=1,
+)
+
+if count != 1:
+    print('Could not locate FileGator upload_max_size configuration.', file=sys.stderr)
+    raise SystemExit(1)
+
 path.write_text(text)
 PY
 
