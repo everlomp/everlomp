@@ -102,6 +102,16 @@ RUN apt-get update && \
         lsphp85-redis && \
     rm -rf /var/lib/apt/lists/*
 
+RUN /usr/local/lsws/lsphp85/bin/lsphp -r '\
+$required = ["pdo","dom","SimpleXML","xml","gd","mbstring","openssl","json","zlib"]; \
+foreach ($required as $ext) { \
+    if (!extension_loaded($ext)) { \
+        fwrite(STDERR, "MISSING PHP EXTENSION: $ext\n"); \
+        exit(1); \
+    } \
+    echo "OK: $ext\n"; \
+}'
+
 RUN ln -sf \
     /usr/local/lsws/lsphp85/bin/lsphp \
     /usr/local/lsws/fcgi-bin/lsphp
@@ -155,6 +165,16 @@ RUN mkdir -p \
 
 RUN mkdir -p /var/www/html
 
+COPY everlomp/everlomp-wordpress-migrate /usr/local/sbin/everlomp-wordpress-migrate
+
+RUN chmod 755 /usr/local/sbin/everlomp-wordpress-migrate \
+ && printf '%s\n' \
+      'nobody ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-wordpress-migrate migrate' \
+      'nobody ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-wordpress-migrate cleanup' \
+      'nobody ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-wordpress-migrate uninstall' \
+      > /etc/sudoers.d/everlomp-wordpress-migration \
+ && chmod 0440 /etc/sudoers.d/everlomp-wordpress-migration \
+ && visudo -cf /etc/sudoers.d/everlomp-wordpress-migration
 
 RUN cat > /etc/nginx/conf.d/openlitespeed-admin.conf <<'EOF'
 map $http_upgrade $connection_upgrade {
@@ -614,6 +634,7 @@ RUN useradd -m -s /bin/bash everlomp && \
     chmod 0755 /home/everlomp
 
 
+
 RUN useradd --system --no-create-home --shell /usr/sbin/nologin everlomp-build
 RUN curl -fsSL \
         https://getcomposer.org/download/2.10.3/composer.phar \
@@ -634,7 +655,9 @@ RUN printf '%s\n' \
     chmod 0440 /etc/sudoers.d/everlomp-drupal-git && \
     visudo -cf /etc/sudoers.d/everlomp-drupal-git
 
-    
+
+
+
 RUN curl -fsSL \
         https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
         -o /usr/local/bin/wp-cli.phar && \
@@ -711,7 +734,6 @@ RUN chown everlomp:everlomp \
         /usr/local/sbin/everlomp-backup-scheduler \
         /usr/local/sbin/everlomp-key \
         /usr/local/sbin/everlomp-secret \
-        /usr/local/sbin/everlomp-drupal \
         /usr/local/sbin/everlomp-kopia-priv && \
     chmod 0644 /etc/cron.d/everlomp-backup && \
     install -d -o everlomp -g everlomp -m 0700 /home/everlomp/kopia && \
@@ -734,6 +756,7 @@ RUN chmod 0755 \
         /usr/local/sbin/everlomp-ssh \
         /usr/local/sbin/everlomp-filegator \
         /usr/local/sbin/everlomp-backup \
+        /usr/local/sbin/everlomp-drupal \
         /usr/local/sbin/everlomp-lsws-password && \
     chmod 0644 \
         /var/www/html/index.php \
