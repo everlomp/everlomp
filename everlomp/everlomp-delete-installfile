@@ -282,9 +282,8 @@ rm -rf -- \
 
 echo "[Everlomp] Removing abandoned installer staging files..."
 find "$HOME_DIR" -maxdepth 1 \
-    \( -type f -o -type d -o -type l \) \
     \( -name '.filegator-stage.*' -o -name '.filegator.json.*' \) \
-    -exec rm -rf -- {} + 2>/dev/null || true
+    -print0 2>/dev/null | xargs -0 -r rm -rf --
 
 # The installer actually writes several markers below /var/www/.everlomp. The
 # old cleanup helper targeted /home/everlomp for these names, so they survived.
