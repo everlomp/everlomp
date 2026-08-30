@@ -3,8 +3,14 @@ set -Eeuo pipefail
 
 WEB_ROOT="/var/www/html"
 HOME_DIR="/home/everlomp"
+STATE_DIR="/var/www/.everlomp"
 PRIMARY_APP_FILE="${HOME_DIR}/primary-app"
-SUDOERS_FILE="/etc/sudoers.d/everlomp-web"
+INSTALL_FILE="${WEB_ROOT}/lompinstaller.php"
+BOOTSTRAP_INDEX="${WEB_ROOT}/index.php"
+WEB_SUDOERS="/etc/sudoers.d/everlomp-web"
+DRUPAL_GIT_SUDOERS="/etc/sudoers.d/everlomp-drupal-git"
+HOTPOCKET_HELPER="/usr/local/sbin/everlomp-hotpocket"
+HOTPOCKET_SITE_INFO="${HOME_DIR}/hotpocket-site.json"
 SELF="/usr/local/sbin/everlomp-delete-installfile"
 
 fail() {
@@ -15,19 +21,37 @@ fail() {
 }
 
 if [ "${1:-}" != "delete" ]; then
-    echo "Usage: everlomp-delete delete" >&2
+    echo "Usage: everlomp-delete-installfile delete" >&2
     exit 1
 fi
-
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     fail "This cleanup helper must run as root." 1
 fi
 
-if [ ! -f "$PRIMARY_APP_FILE" ]; then
-    fail "Refusing to remove Everlomp installer files before a primary application is installed." 2
-fi
+read_primary_app() {
+    if [ ! -f "$PRIMARY_APP_FILE" ]; then
+        fail "Refusing to remove Everlomp installer files before a primary application is installed." 2
+    fi
+    tr -d '\r\n' < "$PRIMARY_APP_FILE" 2>/dev/null || true
+}
 
-PRIMARY_APP="$(tr -d '\r\n' < "$PRIMARY_APP_FILE" 2>/dev/null || true)"
+PRIMARY_APP="$(read_primary_app)"
+
+# HotPocket folder/site mode deliberately stages its final OLS document-root switch
+# until the installer is removed. Finalize it BEFORE deleting the helper or UI.
+if [ "$PRIMARY_APP" = "hotpocket-folder" ]; then
+    if [ ! -x "$HOTPOCKET_HELPER" ]; then
+        fail "HotPocket site finalization is pending, but ${HOTPOCKET_HELPER} is missing." 4
+    fi
+    if [ ! -f "$HOTPOCKET_SITE_INFO" ]; then
+        fail "HotPocket site finalization is pending, but ${HOTPOCKET_SITE_INFO} is missing." 4
+    fi
+    echo "[Everlomp] Finalizing the staged HotPocket website root before installer cleanup..."
+    if ! "$HOTPOCKET_HELPER" finalize-site; then
+        fail "HotPocket website finalization failed. Installer files were left in place so the configuration can be repaired." 4
+    fi
+    PRIMARY_APP="$(read_primary_app)"
+fi
 
 case "$PRIMARY_APP" in
     wordpress|drupal|phpbb)
@@ -39,12 +63,9 @@ case "$PRIMARY_APP" in
         fi
         ;;
     *)
-        fail "Refusing cleanup because the primary application marker is invalid." 3
+        fail "Refusing cleanup because the primary application marker is invalid: ${PRIMARY_APP:-<empty>}" 3
         ;;
 esac
-
-INSTALL_FILE="${WEB_ROOT}/lompinstaller.php"
-BOOTSTRAP_INDEX="${WEB_ROOT}/index.php"
 
 echo "[Everlomp] Primary application: $PRIMARY_APP"
 echo "[Everlomp] Installer file: $INSTALL_FILE"
@@ -56,16 +77,13 @@ remove_installer_file() {
     fi
 
     echo "[Everlomp] Removing installer web interface: $INSTALL_FILE"
-
     rm -f -- "$INSTALL_FILE" 2>/dev/null || true
 
     if [ -e "$INSTALL_FILE" ] || [ -L "$INSTALL_FILE" ]; then
         echo "[Everlomp] Installer file still exists; forcing removal..."
-
         if command -v chattr >/dev/null 2>&1; then
             chattr -i -a -- "$INSTALL_FILE" 2>/dev/null || true
         fi
-
         chown root:root -- "$INSTALL_FILE" 2>/dev/null || true
         chmod u+rw -- "$INSTALL_FILE" 2>/dev/null || true
         rm -f -- "$INSTALL_FILE" 2>/dev/null || true
@@ -88,46 +106,415 @@ if [ -f "$BOOTSTRAP_INDEX" ] && [ ! -L "$BOOTSTRAP_INDEX" ]; then
     EXPECTED_BOOTSTRAP="$(cat <<'PHP'
 <?php
 declare(strict_types=1);
-
 header('Location: /lompinstaller.php', true, 302);
 exit;
 PHP
 )"
     CURRENT_BOOTSTRAP="$(cat "$BOOTSTRAP_INDEX" 2>/dev/null || true)"
-
     if [ "$CURRENT_BOOTSTRAP" = "$EXPECTED_BOOTSTRAP" ]; then
         echo "[Everlomp] Removing obsolete bootstrap redirect: $BOOTSTRAP_INDEX"
         rm -f -- "$BOOTSTRAP_INDEX" 2>/dev/null || true
     fi
 fi
 
-echo "[Everlomp] Removing bundled application installer ZIP files..."
+echo "[Everlomp] Removing bundled installer archives and examples..."
 find "$HOME_DIR" -maxdepth 1 \
     \( -type f -o -type l \) \
-    \( -name 'wordpress-*.zip' -o -name 'phpBB-*.zip' -o -name 'phpbb-*.zip' -o -name 'filegator_local.zip' -o -name 'external-installer-example.zip' \) \
+    \( \
+        -name 'wordpress-*.zip' -o \
+        -name 'phpBB-*.zip' -o \
+        -name 'phpbb-*.zip' -o \
+        -name 'drupal-*.tar.gz' -o \
+        -name 'filegator_local.zip' -o \
+        -name 'external-installer-example.zip' \
+    \) \
     -delete
 
-echo "[Everlomp] Removing uploaded external installer packages..."
-rm -rf -- "${HOME_DIR}/external-installs"
+# These directories exist only to feed the installer UI/helpers. Runtime data lives
+# elsewhere (/var/www, /contract, /home/everlomp/kopia, everbackups, secrets, etc.).
+echo "[Everlomp] Removing installer-only package libraries and uploads..."
+rm -rf -- \
+    "${HOME_DIR}/external-installs" \
+    "${HOME_DIR}/wpaddons" \
+    "${HOME_DIR}/hotpocket-contracts"
 
-echo "[Everlomp] Removing abandoned FileGator staging files..."
+echo "[Everlomp] Removing abandoned installer staging files..."
+find "$HOME_DIR" -maxdepth 1 \
+    \( -type f -o -type d -o -type l \) \#!/bin/bash
+set -Eeuo pipefail
+
+WEB_ROOT="/var/www/html"
+HOME_DIR="/home/everlomp"
+STATE_DIR="/var/www/.everlomp"
+PRIMARY_APP_FILE="${HOME_DIR}/primary-app"
+INSTALL_FILE="${WEB_ROOT}/lompinstaller.php"
+BOOTSTRAP_INDEX="${WEB_ROOT}/index.php"
+WEB_SUDOERS="/etc/sudoers.d/everlomp-web"
+DRUPAL_GIT_SUDOERS="/etc/sudoers.d/everlomp-drupal-git"
+HOTPOCKET_HELPER="/usr/local/sbin/everlomp-hotpocket"
+HOTPOCKET_SITE_INFO="${HOME_DIR}/hotpocket-site.json"
+SELF="/usr/local/sbin/everlomp-delete-installfile"
+
+fail() {
+    local message="$1"
+    local code="${2:-1}"
+    echo "[Everlomp] ERROR: ${message}" >&2
+    exit "$code"
+}
+
+if [ "${1:-}" != "delete" ]; then
+    echo "Usage: everlomp-delete-installfile delete" >&2
+    exit 1
+fi
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    fail "This cleanup helper must run as root." 1
+fi
+
+read_primary_app() {
+    if [ ! -f "$PRIMARY_APP_FILE" ]; then
+        fail "Refusing to remove Everlomp installer files before a primary application is installed." 2
+    fi
+    tr -d '\r\n' < "$PRIMARY_APP_FILE" 2>/dev/null || true
+}
+
+PRIMARY_APP="$(read_primary_app)"
+
+# HotPocket folder/site mode deliberately stages its final OLS document-root switch
+# until the installer is removed. Finalize it BEFORE deleting the helper or UI.
+if [ "$PRIMARY_APP" = "hotpocket-folder" ]; then
+    if [ ! -x "$HOTPOCKET_HELPER" ]; then
+        fail "HotPocket site finalization is pending, but ${HOTPOCKET_HELPER} is missing." 4
+    fi
+    if [ ! -f "$HOTPOCKET_SITE_INFO" ]; then
+        fail "HotPocket site finalization is pending, but ${HOTPOCKET_SITE_INFO} is missing." 4
+    fi
+    echo "[Everlomp] Finalizing the staged HotPocket website root before installer cleanup..."
+    if ! "$HOTPOCKET_HELPER" finalize-site; then
+        fail "HotPocket website finalization failed. Installer files were left in place so the configuration can be repaired." 4
+    fi
+    PRIMARY_APP="$(read_primary_app)"
+fi
+
+case "$PRIMARY_APP" in
+    wordpress|drupal|phpbb)
+        ;;
+    external:*)
+        EXTERNAL_ID="${PRIMARY_APP#external:}"
+        if [[ ! "$EXTERNAL_ID" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            fail "Refusing cleanup because the external primary application marker is invalid." 3
+        fi
+        ;;
+    *)
+        fail "Refusing cleanup because the primary application marker is invalid: ${PRIMARY_APP:-<empty>}" 3
+        ;;
+esac
+
+echo "[Everlomp] Primary application: $PRIMARY_APP"
+echo "[Everlomp] Installer file: $INSTALL_FILE"
+
+remove_installer_file() {
+    if [ ! -e "$INSTALL_FILE" ] && [ ! -L "$INSTALL_FILE" ]; then
+        echo "[Everlomp] Installer file is already absent."
+        return 0
+    fi
+
+    echo "[Everlomp] Removing installer web interface: $INSTALL_FILE"
+    rm -f -- "$INSTALL_FILE" 2>/dev/null || true
+
+    if [ -e "$INSTALL_FILE" ] || [ -L "$INSTALL_FILE" ]; then
+        echo "[Everlomp] Installer file still exists; forcing removal..."
+        if command -v chattr >/dev/null 2>&1; then
+            chattr -i -a -- "$INSTALL_FILE" 2>/dev/null || true
+        fi
+        chown root:root -- "$INSTALL_FILE" 2>/dev/null || true
+        chmod u+rw -- "$INSTALL_FILE" 2>/dev/null || true
+        rm -f -- "$INSTALL_FILE" 2>/dev/null || true
+    fi
+
+    if [ -e "$INSTALL_FILE" ] || [ -L "$INSTALL_FILE" ]; then
+        echo "[Everlomp] WARNING: $INSTALL_FILE still exists after removal attempts." >&2
+        return 1
+    fi
+
+    echo "[Everlomp] Verified: $INSTALL_FILE is gone."
+    return 0
+}
+
+if ! remove_installer_file; then
+    echo "[Everlomp] WARNING: continuing cleanup even though $INSTALL_FILE remains." >&2
+fi
+
+if [ -f "$BOOTSTRAP_INDEX" ] && [ ! -L "$BOOTSTRAP_INDEX" ]; then
+    EXPECTED_BOOTSTRAP="$(cat <<'PHP'
+<?php
+declare(strict_types=1);
+header('Location: /lompinstaller.php', true, 302);
+exit;
+PHP
+)"
+    CURRENT_BOOTSTRAP="$(cat "$BOOTSTRAP_INDEX" 2>/dev/null || true)"
+    if [ "$CURRENT_BOOTSTRAP" = "$EXPECTED_BOOTSTRAP" ]; then
+        echo "[Everlomp] Removing obsolete bootstrap redirect: $BOOTSTRAP_INDEX"
+        rm -f -- "$BOOTSTRAP_INDEX" 2>/dev/null || true
+    fi
+fi
+
+echo "[Everlomp] Removing bundled installer archives and examples..."
+find "$HOME_DIR" -maxdepth 1 \
+    \( -type f -o -type l \) \
+    \( \
+        -name 'wordpress-*.zip' -o \
+        -name 'phpBB-*.zip' -o \
+        -name 'phpbb-*.zip' -o \
+        -name 'drupal-*.tar.gz' -o \
+        -name 'filegator_local.zip' -o \
+        -name 'external-installer-example.zip' \
+    \) \
+    -delete
+
+# These directories exist only to feed the installer UI/helpers. Runtime data lives
+# elsewhere (/var/www, /contract, /home/everlomp/kopia, everbackups, secrets, etc.).
+echo "[Everlomp] Removing installer-only package libraries and uploads..."
+rm -rf -- \
+    "${HOME_DIR}/external-installs" \
+    "${HOME_DIR}/wpaddons" \
+    "${HOME_DIR}/hotpocket-contracts"
+
+echo "[Everlomp] Removing abandoned installer staging files..."
 find "$HOME_DIR" -maxdepth 1 \
     \( -type f -o -type d -o -type l \) \
     \( -name '.filegator-stage.*' -o -name '.filegator.json.*' \) \
     -exec rm -rf -- {} + 2>/dev/null || true
 
-echo "[Everlomp] Removing installer metadata..."
+# The installer actually writes several markers below /var/www/.everlomp. The
+# old cleanup helper targeted /home/everlomp for these names, so they survived.
+echo "[Everlomp] Removing installer state markers..."
+rm -f -- \
+    "${STATE_DIR}/database.configured" \
+    "${STATE_DIR}/database-admin-user" \
+    "${STATE_DIR}/lsws-password.configured"
+
+# Also remove old-location copies of installer-only markers left by older images.
 rm -f -- \
     "${HOME_DIR}/database.configured" \
     "${HOME_DIR}/database-admin-user" \
-    "${HOME_DIR}/lsws-password.configured" \
+    "${HOME_DIR}/lsws-password.configured"
+
+# DO NOT remove hotpocket.enabled or ssh.configured from /var/www/.everlomp.
+# start.sh uses those persisted runtime markers on every boot to restore
+# Supervisor autostart/state for HotPocket and SSH. Remove only obsolete legacy
+# home-directory duplicates if the canonical state marker already exists.
+if [ -e "${STATE_DIR}/hotpocket.enabled" ]; then
+    rm -f -- "${HOME_DIR}/hotpocket.enabled"
+fi
+if [ -e "${STATE_DIR}/ssh.configured" ]; then
+    rm -f -- "${HOME_DIR}/ssh.configured"
+fi
+
+echo "[Everlomp] Removing installer metadata..."
+rm -f -- \
     "${HOME_DIR}/wordpress.json" \
+    "${HOME_DIR}/drupal.json" \
     "${HOME_DIR}/phpbb.json" \
     "${HOME_DIR}/filegator.json" \
     "${HOME_DIR}/realip-failed" \
-    "${HOME_DIR}/hotpocket.enabled" \
-    "${HOME_DIR}/ssh.configured" \
+    "${HOME_DIR}/hotpocket-site.json" \
     "${HOME_DIR}/terms.md"
+
+# Remove the state directory only if no runtime/unknown files remain in it.
+rmdir -- "$STATE_DIR" 2>/dev/null || true
+
+echo "[Everlomp] Removing installer helper programs..."
+INSTALLER_HELPERS=(
+    /usr/local/sbin/everlomp-database
+    /usr/local/sbin/everlomp-wordpress
+    /usr/local/sbin/everlomp-phpbb
+    /usr/local/sbin/everlomp-external-installer
+    /usr/local/sbin/everlomp-filegator
+    /usr/local/sbin/everlomp-phpmyadmin
+    /usr/local/sbin/everlomp-realip#!/bin/bash
+set -Eeuo pipefail
+
+WEB_ROOT="/var/www/html"
+HOME_DIR="/home/everlomp"
+STATE_DIR="/var/www/.everlomp"
+PRIMARY_APP_FILE="${HOME_DIR}/primary-app"
+INSTALL_FILE="${WEB_ROOT}/lompinstaller.php"
+BOOTSTRAP_INDEX="${WEB_ROOT}/index.php"
+WEB_SUDOERS="/etc/sudoers.d/everlomp-web"
+DRUPAL_GIT_SUDOERS="/etc/sudoers.d/everlomp-drupal-git"
+HOTPOCKET_HELPER="/usr/local/sbin/everlomp-hotpocket"
+HOTPOCKET_SITE_INFO="${HOME_DIR}/hotpocket-site.json"
+SELF="/usr/local/sbin/everlomp-delete-installfile"
+
+fail() {
+    local message="$1"
+    local code="${2:-1}"
+    echo "[Everlomp] ERROR: ${message}" >&2
+    exit "$code"
+}
+
+if [ "${1:-}" != "delete" ]; then
+    echo "Usage: everlomp-delete-installfile delete" >&2
+    exit 1
+fi
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    fail "This cleanup helper must run as root." 1
+fi
+
+read_primary_app() {
+    if [ ! -f "$PRIMARY_APP_FILE" ]; then
+        fail "Refusing to remove Everlomp installer files before a primary application is installed." 2
+    fi
+    tr -d '\r\n' < "$PRIMARY_APP_FILE" 2>/dev/null || true
+}
+
+PRIMARY_APP="$(read_primary_app)"
+
+# HotPocket folder/site mode deliberately stages its final OLS document-root switch
+# until the installer is removed. Finalize it BEFORE deleting the helper or UI.
+if [ "$PRIMARY_APP" = "hotpocket-folder" ]; then
+    if [ ! -x "$HOTPOCKET_HELPER" ]; then
+        fail "HotPocket site finalization is pending, but ${HOTPOCKET_HELPER} is missing." 4
+    fi
+    if [ ! -f "$HOTPOCKET_SITE_INFO" ]; then
+        fail "HotPocket site finalization is pending, but ${HOTPOCKET_SITE_INFO} is missing." 4
+    fi
+    echo "[Everlomp] Finalizing the staged HotPocket website root before installer cleanup..."
+    if ! "$HOTPOCKET_HELPER" finalize-site; then
+        fail "HotPocket website finalization failed. Installer files were left in place so the configuration can be repaired." 4
+    fi
+    PRIMARY_APP="$(read_primary_app)"
+fi
+
+case "$PRIMARY_APP" in
+    wordpress|drupal|phpbb)
+        ;;
+    external:*)
+        EXTERNAL_ID="${PRIMARY_APP#external:}"
+        if [[ ! "$EXTERNAL_ID" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            fail "Refusing cleanup because the external primary application marker is invalid." 3
+        fi
+        ;;
+    *)
+        fail "Refusing cleanup because the primary application marker is invalid: ${PRIMARY_APP:-<empty>}" 3
+        ;;
+esac
+
+echo "[Everlomp] Primary application: $PRIMARY_APP"
+echo "[Everlomp] Installer file: $INSTALL_FILE"
+
+remove_installer_file() {
+    if [ ! -e "$INSTALL_FILE" ] && [ ! -L "$INSTALL_FILE" ]; then
+        echo "[Everlomp] Installer file is already absent."
+        return 0
+    fi
+
+    echo "[Everlomp] Removing installer web interface: $INSTALL_FILE"
+    rm -f -- "$INSTALL_FILE" 2>/dev/null || true
+
+    if [ -e "$INSTALL_FILE" ] || [ -L "$INSTALL_FILE" ]; then
+        echo "[Everlomp] Installer file still exists; forcing removal..."
+        if command -v chattr >/dev/null 2>&1; then
+            chattr -i -a -- "$INSTALL_FILE" 2>/dev/null || true
+        fi
+        chown root:root -- "$INSTALL_FILE" 2>/dev/null || true
+        chmod u+rw -- "$INSTALL_FILE" 2>/dev/null || true
+        rm -f -- "$INSTALL_FILE" 2>/dev/null || true
+    fi
+
+    if [ -e "$INSTALL_FILE" ] || [ -L "$INSTALL_FILE" ]; then
+        echo "[Everlomp] WARNING: $INSTALL_FILE still exists after removal attempts." >&2
+        return 1
+    fi
+
+    echo "[Everlomp] Verified: $INSTALL_FILE is gone."
+    return 0
+}
+
+if ! remove_installer_file; then
+    echo "[Everlomp] WARNING: continuing cleanup even though $INSTALL_FILE remains." >&2
+fi
+
+if [ -f "$BOOTSTRAP_INDEX" ] && [ ! -L "$BOOTSTRAP_INDEX" ]; then
+    EXPECTED_BOOTSTRAP="$(cat <<'PHP'
+<?php
+declare(strict_types=1);
+header('Location: /lompinstaller.php', true, 302);
+exit;
+PHP
+)"
+    CURRENT_BOOTSTRAP="$(cat "$BOOTSTRAP_INDEX" 2>/dev/null || true)"
+    if [ "$CURRENT_BOOTSTRAP" = "$EXPECTED_BOOTSTRAP" ]; then
+        echo "[Everlomp] Removing obsolete bootstrap redirect: $BOOTSTRAP_INDEX"
+        rm -f -- "$BOOTSTRAP_INDEX" 2>/dev/null || true
+    fi
+fi
+
+echo "[Everlomp] Removing bundled installer archives and examples..."
+find "$HOME_DIR" -maxdepth 1 \
+    \( -type f -o -type l \) \
+    \( \
+        -name 'wordpress-*.zip' -o \
+        -name 'phpBB-*.zip' -o \
+        -name 'phpbb-*.zip' -o \
+        -name 'drupal-*.tar.gz' -o \
+        -name 'filegator_local.zip' -o \
+        -name 'external-installer-example.zip' \
+    \) \
+    -delete
+
+# These directories exist only to feed the installer UI/helpers. Runtime data lives
+# elsewhere (/var/www, /contract, /home/everlomp/kopia, everbackups, secrets, etc.).
+echo "[Everlomp] Removing installer-only package libraries and uploads..."
+rm -rf -- \
+    "${HOME_DIR}/external-installs" \
+    "${HOME_DIR}/wpaddons" \
+    "${HOME_DIR}/hotpocket-contracts"
+
+echo "[Everlomp] Removing abandoned installer staging files..."
+find "$HOME_DIR" -maxdepth 1 \
+    \( -type f -o -type d -o -type l \) \
+    \( -name '.filegator-stage.*' -o -name '.filegator.json.*' \) \
+    -exec rm -rf -- {} + 2>/dev/null || true
+
+# The installer actually writes several markers below /var/www/.everlomp. The
+# old cleanup helper targeted /home/everlomp for these names, so they survived.
+echo "[Everlomp] Removing installer state markers..."
+rm -f -- \
+    "${STATE_DIR}/database.configured" \
+    "${STATE_DIR}/database-admin-user" \
+    "${STATE_DIR}/lsws-password.configured"
+
+# Also remove old-location copies of installer-only markers left by older images.
+rm -f -- \
+    "${HOME_DIR}/database.configured" \
+    "${HOME_DIR}/database-admin-user" \
+    "${HOME_DIR}/lsws-password.configured"
+
+# DO NOT remove hotpocket.enabled or ssh.configured from /var/www/.everlomp.
+# start.sh uses those persisted runtime markers on every boot to restore
+# Supervisor autostart/state for HotPocket and SSH. Remove only obsolete legacy
+# home-directory duplicates if the canonical state marker already exists.
+if [ -e "${STATE_DIR}/hotpocket.enabled" ]; then
+    rm -f -- "${HOME_DIR}/hotpocket.enabled"
+fi
+if [ -e "${STATE_DIR}/ssh.configured" ]; then
+    rm -f -- "${HOME_DIR}/ssh.configured"
+fi
+
+echo "[Everlomp] Removing installer metadata..."
+rm -f -- \
+    "${HOME_DIR}/wordpress.json" \
+    "${HOME_DIR}/drupal.json" \
+    "${HOME_DIR}/phpbb.json" \
+    "${HOME_DIR}/filegator.json" \
+    "${HOME_DIR}/realip-failed" \
+    "${HOME_DIR}/hotpocket-site.json" \
+    "${HOME_DIR}/terms.md"
+
+# Remove the state directory only if no runtime/unknown files remain in it.
+rmdir -- "$STATE_DIR" 2>/dev/null || true
 
 echo "[Everlomp] Removing installer helper programs..."
 INSTALLER_HELPERS=(
@@ -142,15 +529,19 @@ INSTALLER_HELPERS=(
     /usr/local/sbin/everlomp-ssh
     /usr/local/sbin/everlomp-lsws-password
     /usr/local/sbin/everlomp-backup
+    /usr/local/sbin/everlomp-drupal
+    /usr/local/sbin/everlomp-drupal-git
+    /usr/local/lib/everlomp-drupal-runner.php
 )
-
 for helper in "${INSTALLER_HELPERS[@]}"; do
     rm -f -- "$helper"
 done
 
-echo "[Everlomp] Removing installer sudoers rule..."
-rm -f -- "$SUDOERS_FILE"
+echo "[Everlomp] Removing installer sudoers rules..."
+rm -f -- "$WEB_SUDOERS" "$DRUPAL_GIT_SUDOERS"
 
+# primary-app is an installer completion marker; installed applications and their
+# runtime secrets/configuration remain in their dedicated locations.
 rm -f -- "$PRIMARY_APP_FILE"
 
 if [ -e "$INSTALL_FILE" ] || [ -L "$INSTALL_FILE" ]; then
@@ -159,9 +550,127 @@ else
     echo "[Everlomp] Final verification passed: installer file is absent."
 fi
 
+# Keep these deliberately: EverAdmin restart/recovery watcher + sudoers, WordPress
+# migration runtime helper, Kopia/backup services, FileGator runtime, real-IP config,
+# DB/application secrets, OpenLiteSpeed, MariaDB, SSH runtime, and HotPocket itself.
 rm -f -- "$SELF"
 
 echo "[Everlomp] Installer cleanup completed successfully."
-echo "[Everlomp] Removed the dedicated installer file: $INSTALL_FILE"
-echo "[Everlomp] Removed the bootstrap redirect too if it was still unchanged."
-echo "[Everlomp] Kept runtime components and data, including the installed primary application, FileGator, Kopia, SQL backup scheduling/runtime, phpMyAdmin, MariaDB, OpenLiteSpeed, HotPocket, SSH when enabled, application files, real-IP runtime configuration, and the brute-force guard."
+echo "[Everlomp] Removed installer UI, bundled app archives, package libraries, installer metadata, installer-only helpers, and installer sudoers rules."
+echo "[Everlomp] Kept runtime components/data, including the installed primary application, EverAdmin restart/recovery watcher, FileGator, Kopia, SQL backup scheduling/runtime, phpMyAdmin, MariaDB, OpenLiteSpeed, HotPocket, SSH when enabled, application files/secrets, real-IP runtime configuration, and the brute-force guard."
+    /usr/local/sbin/everlomp-hotpocket
+    /usr/local/sbin/everlomp-ssh
+    /usr/local/sbin/everlomp-lsws-password
+    /usr/local/sbin/everlomp-backup
+    /usr/local/sbin/everlomp-drupal
+    /usr/local/sbin/everlomp-drupal-git
+    /usr/local/lib/everlomp-drupal-runner.php
+)
+for helper in "${INSTALLER_HELPERS[@]}"; do
+    rm -f -- "$helper"
+done
+
+echo "[Everlomp] Removing installer sudoers rules..."
+rm -f -- "$WEB_SUDOERS" "$DRUPAL_GIT_SUDOERS"
+
+# primary-app is an installer completion marker; installed applications and their
+# runtime secrets/configuration remain in their dedicated locations.
+rm -f -- "$PRIMARY_APP_FILE"
+
+if [ -e "$INSTALL_FILE" ] || [ -L "$INSTALL_FILE" ]; then
+    echo "[Everlomp] WARNING: Final verification: $INSTALL_FILE still exists." >&2
+else
+    echo "[Everlomp] Final verification passed: installer file is absent."
+fi
+
+# Keep these deliberately: EverAdmin restart/recovery watcher + sudoers, WordPress
+# migration runtime helper, Kopia/backup services, FileGator runtime, real-IP config,
+# DB/application secrets, OpenLiteSpeed, MariaDB, SSH runtime, and HotPocket itself.
+rm -f -- "$SELF"
+
+echo "[Everlomp] Installer cleanup completed successfully."
+echo "[Everlomp] Removed installer UI, bundled app archives, package libraries, installer metadata, installer-only helpers, and installer sudoers rules."
+echo "[Everlomp] Kept runtime components/data, including the installed primary application, EverAdmin restart/recovery watcher, FileGator, Kopia, SQL backup scheduling/runtime, phpMyAdmin, MariaDB, OpenLiteSpeed, HotPocket, SSH when enabled, application files/secrets, real-IP runtime configuration, and the brute-force guard."
+    \( -name '.filegator-stage.*' -o -name '.filegator.json.*' \) \
+    -exec rm -rf -- {} + 2>/dev/null || true
+
+# The installer actually writes several markers below /var/www/.everlomp. The
+# old cleanup helper targeted /home/everlomp for these names, so they survived.
+echo "[Everlomp] Removing installer state markers..."
+rm -f -- \
+    "${STATE_DIR}/database.configured" \
+    "${STATE_DIR}/database-admin-user" \
+    "${STATE_DIR}/lsws-password.configured"
+
+# Also remove old-location copies of installer-only markers left by older images.
+rm -f -- \
+    "${HOME_DIR}/database.configured" \
+    "${HOME_DIR}/database-admin-user" \
+    "${HOME_DIR}/lsws-password.configured"
+
+# DO NOT remove hotpocket.enabled or ssh.configured from /var/www/.everlomp.
+# start.sh uses those persisted runtime markers on every boot to restore
+# Supervisor autostart/state for HotPocket and SSH. Remove only obsolete legacy
+# home-directory duplicates if the canonical state marker already exists.
+if [ -e "${STATE_DIR}/hotpocket.enabled" ]; then
+    rm -f -- "${HOME_DIR}/hotpocket.enabled"
+fi
+if [ -e "${STATE_DIR}/ssh.configured" ]; then
+    rm -f -- "${HOME_DIR}/ssh.configured"
+fi
+
+echo "[Everlomp] Removing installer metadata..."
+rm -f -- \
+    "${HOME_DIR}/wordpress.json" \
+    "${HOME_DIR}/drupal.json" \
+    "${HOME_DIR}/phpbb.json" \
+    "${HOME_DIR}/filegator.json" \
+    "${HOME_DIR}/realip-failed" \
+    "${HOME_DIR}/hotpocket-site.json" \
+    "${HOME_DIR}/terms.md"
+
+# Remove the state directory only if no runtime/unknown files remain in it.
+rmdir -- "$STATE_DIR" 2>/dev/null || true
+
+echo "[Everlomp] Removing installer helper programs..."
+INSTALLER_HELPERS=(
+    /usr/local/sbin/everlomp-database
+    /usr/local/sbin/everlomp-wordpress
+    /usr/local/sbin/everlomp-phpbb
+    /usr/local/sbin/everlomp-external-installer
+    /usr/local/sbin/everlomp-filegator
+    /usr/local/sbin/everlomp-phpmyadmin
+    /usr/local/sbin/everlomp-realip
+    /usr/local/sbin/everlomp-hotpocket
+    /usr/local/sbin/everlomp-ssh
+    /usr/local/sbin/everlomp-lsws-password
+    /usr/local/sbin/everlomp-backup
+    /usr/local/sbin/everlomp-drupal
+    /usr/local/sbin/everlomp-drupal-git
+    /usr/local/lib/everlomp-drupal-runner.php
+)
+for helper in "${INSTALLER_HELPERS[@]}"; do
+    rm -f -- "$helper"
+done
+
+echo "[Everlomp] Removing installer sudoers rules..."
+rm -f -- "$WEB_SUDOERS" "$DRUPAL_GIT_SUDOERS"
+
+# primary-app is an installer completion marker; installed applications and their
+# runtime secrets/configuration remain in their dedicated locations.
+rm -f -- "$PRIMARY_APP_FILE"
+
+if [ -e "$INSTALL_FILE" ] || [ -L "$INSTALL_FILE" ]; then
+    echo "[Everlomp] WARNING: Final verification: $INSTALL_FILE still exists." >&2
+else
+    echo "[Everlomp] Final verification passed: installer file is absent."
+fi
+
+# Keep these deliberately: EverAdmin restart/recovery watcher + sudoers, WordPress
+# migration runtime helper, Kopia/backup services, FileGator runtime, real-IP config,
+# DB/application secrets, OpenLiteSpeed, MariaDB, SSH runtime, and HotPocket itself.
+rm -f -- "$SELF"
+
+echo "[Everlomp] Installer cleanup completed successfully."
+echo "[Everlomp] Removed installer UI, bundled app archives, package libraries, installer metadata, installer-only helpers, and installer sudoers rules."
+echo "[Everlomp] Kept runtime components/data, including the installed primary application, EverAdmin restart/recovery watcher, FileGator, Kopia, SQL backup scheduling/runtime, phpMyAdmin, MariaDB, OpenLiteSpeed, HotPocket, SSH when enabled, application files/secrets, real-IP runtime configuration, and the brute-force guard."
