@@ -166,7 +166,17 @@ RUN mkdir -p \
 RUN mkdir -p /var/www/html
 
 COPY everlomp/everlomp-wordpress-migrate /usr/local/sbin/everlomp-wordpress-migrate
+COPY everlomp/everadmin-restart-watcher-setup \
+    /usr/local/sbin/everadmin-restart-watcher-setup
 
+COPY everlomp/everadmin-restart-watcher.sudoers \
+    /etc/sudoers.d/everadmin-restart-watcher
+
+RUN chown root:root \
+      /usr/local/sbin/everadmin-restart-watcher-setup \
+      /etc/sudoers.d/everadmin-restart-watcher \
+ && chmod 0755 /usr/local/sbin/everadmin-restart-watcher-setup \
+ && chmod 0440 /etc/sudoers.d/everadmin-restart-watcher
 RUN chmod 755 /usr/local/sbin/everlomp-wordpress-migrate \
  && printf '%s\n' \
       'nobody ALL=(root) NOPASSWD: /usr/local/sbin/everlomp-wordpress-migrate migrate' \
