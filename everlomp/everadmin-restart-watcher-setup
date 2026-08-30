@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SUPERVISOR_CONF = Path('/etc/everlomp/supervisord.conf')
+SUPERVISORCTL = Path('/usr/bin/supervisorctl')
+WATCHER_PATH = Path('/home/everlomp/everadmin-hotpocket-watcher.py')
+PROGRAM_NAME = 'everadmin-hotpocket-watcher'
+BEGIN = '# BEGIN EVERADMIN HOTPOCKET WATCHER'
+END = '# END EVERADMIN HOTPOCKET WATCHER'
+
+WATCHER_SOURCE = r'''#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+REQUEST_PATHS = [
+    Path('/contract/contract_fs/seed/restart-hotpocket.request'),
+    Path('/contract/contract_fs/mnt/rw/restart-hotpocket.request'),
+]
+STATUS_PATHS = [
+    Path('/contract/contract_fs/seed/restart-hotpocket.status.json'),
+    Path('/contract/contract_fs/mnt/rw/restart-hotpocket.status.json'),
+]
+SUPERVISORCTL = '/usr/bin/supervisorctl'
+SUPERVISOR_CONF = '/etc/everlomp/supervisord.conf'
+POLL_SECONDS = 0.5
+RESPONSE_GRACE_SECONDS = 3.0
+
+
+def log(message: str) -> None:
+    print(f'[everadmin-hotpocket-watcher] {message}', flush=True)
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+        tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log(f'could not write status {path}: {exc}')
+
+
+def write_status(value: dict) -> None:
+    value = dict(value)
+    value.setdefault('schemaVersion', 1)
+    value['watcherPid'] = os.getpid()
+    for path in STATUS_PATHS:
+        atomic_json(path, value)
+
+
+def find_request() -> Path | None:
+    for path in REQUEST_PATHS:
+        try:
+            if path.is_file() and not path.is_symlink():
+                return path
+        except OSError:
+            pass
+    return None
+
+
+def consume_all_requests() -> None:
+    # Remove both aliases before touching HotPocket so the restart cannot loop.
+    for path in REQUEST_PATHS:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log(f'could not remove request alias {path}: {exc}')
+
+
+def read_request(path: Path) -> dict:
+    raw = path.read_text(encoding='utf-8')
+    if len(raw.encode('utf-8')) > 65536:
+        raise ValueError('restart request is too large')
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError('restart request must be a JSON object')
+    if value.get('action') != 'restart-hotpocket':
+        raise ValueError('unsupported restart action')
+    return value
+
+
+def restart_hotpocket(request: dict) -> None:
+    consumed_at = int(time.time() * 1000)
+    consume_all_requests()
+    write_status({
+        'phase': 'request-consumed',
+        'consumedAt': consumed_at,
+        'request': request,
+        'command': 'supervisorctl -c /etc/everlomp/supervisord.conf restart hotpocket',
+    })
+
+    # Give the current contract request enough time to flush its response before hpcore is restarted.
+    time.sleep(RESPONSE_GRACE_SECONDS)
+
+    write_status({
+        'phase': 'restarting',
+        'startedAt': int(time.time() * 1000),
+        'request': request,
+        'command': 'supervisorctl -c /etc/everlomp/supervisord.conf restart hotpocket',
+    })
+
+    try:
+        result = subprocess.run(
+            [SUPERVISORCTL, '-c', SUPERVISOR_CONF, 'restart', 'hotpocket'],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=120,
+            check=False,
+        )
+        output = (result.stdout or '').strip()[-8000:]
+        if result.returncode == 0:
+            write_status({
+                'phase': 'restart-command-succeeded',
+                'completedAt': int(time.time() * 1000),
+                'request': request,
+                'returnCode': result.returncode,
+                'output': output,
+            })
+            log('HotPocket restart command succeeded.')
+        else:
+            write_status({
+                'phase': 'restart-command-failed',
+                'failedAt': int(time.time() * 1000),
+                'request': request,
+                'returnCode': result.returncode,
+                'output': output,
+            })
+            log(f'HotPocket restart command failed ({result.returncode}): {output}')
+    except Exception as exc:
+        write_status({
+            'phase': 'restart-command-error',
+            'failedAt': int(time.time() * 1000),
+            'request': request,
+            'error': f'{type(exc).__name__}: {exc}',
+        })
+        log(f'HotPocket restart command raised: {type(exc).__name__}: {exc}')
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit('watcher must run as root')
+    log('ready; watching seed restart request')
+    write_status({'phase': 'watching', 'startedAt': int(time.time() * 1000)})
+    while True:
+        request_path = find_request()
+        if request_path is None:
+            time.sleep(POLL_SECONDS)
+            continue
+        try:
+            request = read_request(request_path)
+        except Exception as exc:
+            consume_all_requests()
+            write_status({
+                'phase': 'request-rejected',
+                'rejectedAt': int(time.time() * 1000),
+                'error': f'{type(exc).__name__}: {exc}',
+            })
+            log(f'rejected request: {type(exc).__name__}: {exc}')
+            time.sleep(POLL_SECONDS)
+            continue
+        restart_hotpocket(request)
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == '__main__':
+    main()
+'''
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def atomic_write(path: Path, text: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.chown(tmp, 0, 0)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def supervisor(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(SUPERVISORCTL), '-c', str(SUPERVISOR_CONF), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=120,
+        check=False,
+    )
+
+
+def program_block() -> str:
+    return f'''{BEGIN}\n[program:{PROGRAM_NAME}]\ncommand=/usr/bin/python3 {WATCHER_PATH}\nuser=root\nautostart=true\nautorestart=true\nstartretries=100\nstartsecs=1\nstopsignal=TERM\nstopwaitsecs=5\nredirect_stderr=true\nstdout_logfile=/var/log/supervisor/{PROGRAM_NAME}.log\npriority=19\n{END}\n'''
+
+
+def install() -> None:
+    if os.geteuid() != 0:
+        fail('This setup helper must run as root through sudo.', 77)
+    if not SUPERVISOR_CONF.is_file() or SUPERVISOR_CONF.is_symlink():
+        fail(f'Supervisor configuration is missing or unsafe: {SUPERVISOR_CONF}', 2)
+    if not SUPERVISORCTL.is_file() or not os.access(SUPERVISORCTL, os.X_OK):
+        fail(f'supervisorctl is unavailable: {SUPERVISORCTL}', 3)
+
+    atomic_write(WATCHER_PATH, WATCHER_SOURCE, 0o755)
+
+    original = SUPERVISOR_CONF.read_text(encoding='utf-8')
+    pattern = re.compile(re.escape(BEGIN) + r'.*?' + re.escape(END) + r'\n?', re.S)
+    block = program_block()
+    if pattern.search(original):
+        updated = pattern.sub(block, original, count=1)
+    else:
+        updated = original.rstrip() + '\n\n' + block
+    if updated != original:
+        st = SUPERVISOR_CONF.stat()
+        atomic_write(SUPERVISOR_CONF, updated, stat.S_IMODE(st.st_mode))
+        os.chown(SUPERVISOR_CONF, st.st_uid, st.st_gid)
+
+    for command in ('reread', 'update'):
+        result = supervisor(command)
+        if result.stdout:
+            print(result.stdout.rstrip())
+        if result.returncode != 0:
+            fail(f'Supervisor {command} failed.', 5)
+
+    status = supervisor('status', PROGRAM_NAME)
+    if status.stdout:
+        print(status.stdout.rstrip())
+    if status.returncode != 0 or 'STOPPED' in status.stdout or 'EXITED' in status.stdout or 'FATAL' in status.stdout:
+        started = supervisor('start', PROGRAM_NAME)
+        if started.stdout:
+            print(started.stdout.rstrip())
+        if started.returncode != 0:
+            fail('EverAdmin HotPocket watcher could not be started.', 6)
+
+    print(f'Installed {WATCHER_PATH}')
+    print('Watcher request: /contract/contract_fs/seed/restart-hotpocket.request')
+    print('Watcher action: supervisorctl restart hotpocket')
+
+
+def main() -> None:
+    if len(sys.argv) != 2 or sys.argv[1] != 'install':
+        fail('Usage: everadmin-restart-watcher-setup install', 64)
+    install()
+
+
+if __name__ == '__main__':
+    main()

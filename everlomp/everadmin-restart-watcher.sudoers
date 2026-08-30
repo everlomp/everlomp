@@ -1,0 +1,3 @@
+# Allow the installer web process to perform exactly one fixed, idempotent setup action.
+# The helper accepts no user-controlled command or path arguments.
+ALL ALL=(root) NOPASSWD: /usr/local/sbin/everadmin-restart-watcher-setup install
