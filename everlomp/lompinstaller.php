@@ -923,28 +923,104 @@ $hotpocketContractSource = in_array((string) ($_POST['hotpocket_contract_source'
 $hotpocketContractLibraryFile = trim((string) ($_POST['hotpocket_contract_library_file'] ?? ''));
 $hotpocketContractLibraryDir = '/home/everlomp/hotpocket-contracts';
 $hotpocketContractLibrary = [];
-if (!$hotpocketEnabled) {
-    [$contractLibraryCode, $contractLibraryStdout] = runEverlompHelper('/usr/local/sbin/everlomp-hotpocket', 'list-contract-zips');
-    if ($contractLibraryCode === 0 && $contractLibraryStdout !== '') {
-        $contractLibraryDecoded = json_decode($contractLibraryStdout, true);
-        if (is_array($contractLibraryDecoded)) {
-            $libraryDir = trim((string) ($contractLibraryDecoded['directory'] ?? ''));
-            if ($libraryDir !== '') $hotpocketContractLibraryDir = $libraryDir;
-            $libraryFiles = $contractLibraryDecoded['files'] ?? [];
-            if (is_array($libraryFiles)) {
-                foreach ($libraryFiles as $libraryFile) {
-                    if (!is_array($libraryFile)) continue;
-                    $name = trim((string) ($libraryFile['name'] ?? ''));
-                    $size = (int) ($libraryFile['size'] ?? 0);
-                    $mtime = (int) ($libraryFile['mtime'] ?? 0);
-                    if ($name === '' || $size < 1) continue;
-                    $hotpocketContractLibrary[] = ['name' => $name, 'size' => $size, 'mtime' => $mtime];
+[$contractLibraryCode, $contractLibraryStdout] = runEverlompHelper(
+    '/usr/local/sbin/everlomp-hotpocket',
+    'list-contract-zips'
+);
+if ($contractLibraryCode === 0 && $contractLibraryStdout !== '') {
+    $contractLibraryDecoded = json_decode($contractLibraryStdout, true);
+    if (is_array($contractLibraryDecoded)) {
+        $libraryDir = trim((string) ($contractLibraryDecoded['directory'] ?? ''));
+        if ($libraryDir !== '') {
+            $hotpocketContractLibraryDir = $libraryDir;
+        }
+        $libraryFiles = $contractLibraryDecoded['files'] ?? [];
+        if (is_array($libraryFiles)) {
+            foreach ($libraryFiles as $libraryFile) {
+                if (!is_array($libraryFile)) {
+                    continue;
                 }
+                $name = trim((string) ($libraryFile['name'] ?? ''));
+                $size = (int) ($libraryFile['size'] ?? 0);
+                $mtime = (int) ($libraryFile['mtime'] ?? 0);
+                if ($name === '' || $size < 1) {
+                    continue;
+                }
+                $hotpocketContractLibrary[] = [
+                    'name' => $name,
+                    'size' => $size,
+                    'mtime' => $mtime,
+                ];
             }
         }
     }
 }
+if (
+    $_SERVER['REQUEST_METHOD'] === 'GET'
+    && (string) ($_GET['download'] ?? '') === 'hotpocket-contract'
+) {
+    $name = trim((string) ($_GET['name'] ?? ''));
 
+    // Only allow normal ZIP filenames.
+    if (
+        $name === ''
+        || preg_match('/^[A-Za-z0-9._-]+\.zip$/i', $name) !== 1
+    ) {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Invalid smart contract ZIP.\n";
+        exit;
+    }
+
+    // Only files that actually appeared in the contract library may be downloaded.
+    $allowedNames = array_values(array_map(
+        static fn(array $file): string => (string) ($file['name'] ?? ''),
+        $hotpocketContractLibrary
+    ));
+
+    if (!in_array($name, $allowedNames, true)) {
+        http_response_code(404);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Smart contract ZIP was not found.\n";
+        exit;
+    }
+
+    $libraryReal = realpath($hotpocketContractLibraryDir);
+    $fileReal = realpath($hotpocketContractLibraryDir . '/' . $name);
+
+    // realpath containment also prevents symlinks/path traversal escaping
+    // the approved smart-contract library.
+    if (
+        $libraryReal === false
+        || $fileReal === false
+        || !str_starts_with($fileReal, $libraryReal . DIRECTORY_SEPARATOR)
+        || !is_file($fileReal)
+        || !is_readable($fileReal)
+    ) {
+        http_response_code(404);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Smart contract ZIP was not found or is not readable.\n";
+        exit;
+    }
+
+    $size = filesize($fileReal);
+
+    if ($size === false || $size < 1) {
+        http_response_code(500);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Could not read smart contract ZIP size.\n";
+        exit;
+    }
+
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="' . $name . '"');
+    header('Content-Length: ' . (string) $size);
+    header('X-Content-Type-Options: nosniff');
+    header('Cache-Control: private, no-store, max-age=0');
+
+    readfile($fileReal);
+    exit;
+}
 $hotpocketSiteScope = in_array((string) ($_POST['hotpocket_site_scope'] ?? ''), ['state', 'seed'], true)
     ? (string) $_POST['hotpocket_site_scope']
     : (in_array((string) ($hotpocketSiteInfo['scope'] ?? ''), ['state', 'seed'], true) ? (string) $hotpocketSiteInfo['scope'] : 'state');
@@ -4215,7 +4291,31 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <p class="wizard-lead">Enable HotPocket only if this application will run smart contracts. If you enable it, Everlomp starts HotPocket under Supervisor and the bootstrap contract runs on it so you have a target ready for contract deployment.</p>
 <div class="wizard-card">
 <?php if ($hotpocketEnabled): ?>
-<div class="status good">● HotPocket enabled</div><h3>Smart-contract runtime is active</h3><p>Supervisor is configured to autostart HotPocket and keep it running. Future smart-contract uploads/deployments can be done the normal way with <code>evdevkit</code>.</p>
+<div class="status good">● HotPocket enabled</div>
+<h3>Smart-contract runtime is active</h3>
+<p>Supervisor is configured to autostart HotPocket and keep it running. Future smart-contract uploads/deployments can be done the normal way with <code>evdevkit</code>.</p>
+
+<div class="wizard-divider"></div>
+<h3>Smart Contract Library</h3>
+<p>Download any saved smart-contract ZIP before deploying or sharing it so you can inspect its source code and <code>contract.deploy.json</code>.</p>
+
+<?php if ($hotpocketContractLibrary !== []): ?>
+<label>Saved smart contract
+<select id="hotpocket-contract-inspect-select">
+<option value="">Choose a ZIP…</option>
+<?php foreach ($hotpocketContractLibrary as $libraryFile): ?>
+<option value="<?= h((string) $libraryFile['name']) ?>"><?= h((string) $libraryFile['name']) ?> · <?= h(number_format(((int) $libraryFile['size']) / 1048576, 2)) ?> MiB</option>
+<?php endforeach; ?>
+</select>
+<small>Files are served only from <code><?= h($hotpocketContractLibraryDir) ?></code>. The selected ZIP is downloaded unchanged for local inspection.</small>
+</label>
+<div class="wizard-actions" style="margin-top:10px">
+<button type="button" class="secondary" onclick="downloadHotPocketContractFromSelect('hotpocket-contract-inspect-select')">↓ Download ZIP for inspection</button>
+</div>
+<?php else: ?>
+<div class="warning"><strong>No saved ZIPs found.</strong> Put one or more <code>.zip</code> files in <code><?= h($hotpocketContractLibraryDir) ?></code>, then reload this step.</div>
+<?php endif; ?>
+
 <?php else: ?>
 <div class="wizard-callout"><div class="wizard-callout-icon">i</div><div><strong>This is the one installer opportunity to enable HotPocket.</strong><br>If you do not need smart contracts, leave it off. If you skip it and later remove the installer, the Everlomp installer will no longer be available to enable it for you.</div></div>
 <div class="wizard-choice-grid" style="margin-top:16px">
@@ -4259,9 +4359,15 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <option value="<?= h((string) $libraryFile['name']) ?>" <?= $hotpocketContractLibraryFile === (string) $libraryFile['name'] ? 'selected' : '' ?>><?= h((string) $libraryFile['name']) ?> · <?= h(number_format(((int) $libraryFile['size']) / 1048576, 2)) ?> MiB</option>
 <?php endforeach; ?>
 </select>
-<small>Drop reusable contract ZIPs into <code><?= h($hotpocketContractLibraryDir) ?></code>. Each deployable ZIP must contain <code>contract.deploy.json</code> at the root of the resulting state directory.</small>
+<small>Select a contract to deploy it, or download the original ZIP first to inspect all source files and <code>contract.deploy.json</code>. Saved ZIPs live in <code><?= h($hotpocketContractLibraryDir) ?></code>.</small>
 </label>
-<?php if ($hotpocketContractLibrary === []): ?><div class="warning"><strong>No saved ZIPs found yet.</strong> Put one or more <code>.zip</code> files in <code><?= h($hotpocketContractLibraryDir) ?></code>, then reload this step.</div><?php endif; ?>
+<?php if ($hotpocketContractLibrary !== []): ?>
+<div class="wizard-actions" style="margin-top:10px">
+<button type="button" class="secondary" onclick="downloadSelectedHotPocketContract(this.form)">↓ Download selected ZIP</button>
+</div>
+<?php else: ?>
+<div class="warning"><strong>No saved ZIPs found yet.</strong> Put one or more <code>.zip</code> files in <code><?= h($hotpocketContractLibraryDir) ?></code>, then reload this step.</div>
+<?php endif; ?>
 </div>
 <div class="wizard-callout" style="margin-top:12px"><div class="wizard-callout-icon">{}</div><div><strong>Deployment manifest → hp.cfg</strong><br>After extraction, Everlomp reads <code>/contract/contract_fs/seed/state/contract.deploy.json</code>. Non-empty values update <code>contract.bin_path</code>, <code>contract.bin_args</code>, <code>contract.consensus.roundtime</code>, <code>contract.unl</code>, and <code>mesh.known_peers</code>. Missing or empty values keep the current <code>hp.cfg</code> value.</div></div>
 <div class="warning"><strong>Destructive replacement:</strong> whichever source you choose, existing files in <code>/contract/contract_fs/seed/state</code> are removed and replaced by the selected ZIP.</div>
@@ -6257,6 +6363,48 @@ function toggleHotPocketContractUpload(form) {
         if (!browserActive) uploadInput.value = '';
     }
     if (librarySelect) librarySelect.required = libraryActive;
+}
+
+function startHotPocketContractDownload(name) {
+    name = String(name || '').trim();
+    if (!name) return false;
+
+    const url = new URL(window.location.href);
+    url.search = '';
+    url.hash = '';
+    url.searchParams.set('download', 'hotpocket-contract');
+    url.searchParams.set('name', name);
+
+    window.location.href = url.toString();
+    return true;
+}
+
+function downloadSelectedHotPocketContract(form) {
+    if (!(form instanceof HTMLFormElement)) return;
+
+    const select = form.querySelector('select[name="hotpocket_contract_library_file"]');
+    const name = select?.value || '';
+
+    if (!name) {
+        alert('Choose a saved smart contract ZIP first.');
+        select?.focus();
+        return;
+    }
+
+    startHotPocketContractDownload(name);
+}
+
+function downloadHotPocketContractFromSelect(id) {
+    const select = document.getElementById(id);
+    const name = select?.value || '';
+
+    if (!name) {
+        alert('Choose a smart contract ZIP first.');
+        select?.focus();
+        return;
+    }
+
+    startHotPocketContractDownload(name);
 }
 
 function initializeDynamicControls(root = document) {
