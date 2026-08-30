@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 import os
+import pwd
 import re
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 SUPERVISOR_CONF = Path('/etc/everlomp/supervisord.conf')
@@ -20,50 +21,217 @@ END = '# END EVERADMIN HOTPOCKET WATCHER'
 WATCHER_SOURCE = r'''#!/usr/bin/env python3
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import pwd
+import re
+import stat
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
 REQUEST_PATHS = [
     Path('/contract/contract_fs/seed/restart-hotpocket.request'),
     Path('/contract/contract_fs/mnt/rw/restart-hotpocket.request'),
+    Path('/contract/contract_fs/restart-hotpocket.request'),
 ]
+QUEUE_DIRS = [
+    Path('/contract/contract_fs/seed/restart-hotpocket.queue'),
+    Path('/contract/contract_fs/mnt/rw/restart-hotpocket.queue'),
+]
+QUEUE_NAME_RE = re.compile(r'^[0-9a-f]{32}\.json$')
 STATUS_PATHS = [
     Path('/contract/contract_fs/seed/restart-hotpocket.status.json'),
     Path('/contract/contract_fs/mnt/rw/restart-hotpocket.status.json'),
+    Path('/contract/contract_fs/restart-hotpocket.status.json'),
 ]
+LAST_REQUEST_PATHS = [
+    Path('/contract/contract_fs/seed/restart-hotpocket.last-request.json'),
+    Path('/contract/contract_fs/mnt/rw/restart-hotpocket.last-request.json'),
+    Path('/contract/contract_fs/restart-hotpocket.last-request.json'),
+]
+LAST_CONSUMED_PATHS = [
+    Path('/contract/contract_fs/seed/restart-hotpocket.last-consumed.json'),
+    Path('/contract/contract_fs/mnt/rw/restart-hotpocket.last-consumed.json'),
+    Path('/contract/contract_fs/restart-hotpocket.last-consumed.json'),
+]
+LAST_RESULT_PATHS = [
+    Path('/contract/contract_fs/seed/restart-hotpocket.last-result.json'),
+    Path('/contract/contract_fs/mnt/rw/restart-hotpocket.last-result.json'),
+    Path('/contract/contract_fs/restart-hotpocket.last-result.json'),
+]
+RECOVERY_BACKUP_PATHS = [
+    Path('/contract/contract_fs/seed/everadmin-recovery-hp.cfg.backup.json'),
+    Path('/contract/contract_fs/mnt/rw/everadmin-recovery-hp.cfg.backup.json'),
+]
+HP_CONFIG_FILE = Path('/contract/cfg/hp.cfg')
 SUPERVISORCTL = '/usr/bin/supervisorctl'
 SUPERVISOR_CONF = '/etc/everlomp/supervisord.conf'
 POLL_SECONDS = 0.5
 RESPONSE_GRACE_SECONDS = 3.0
+MAX_JSON_BYTES = 65536
+PROTOCOL_VERSION = 7
+PUBLIC_KEY_RE = re.compile(r'^(?:ed)?([0-9a-fA-F]{64})$')
+GUID_RE = re.compile(r'^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$')
+HOST_RE = re.compile(r'^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
 
 
 def log(message: str) -> None:
     print(f'[everadmin-hotpocket-watcher] {message}', flush=True)
 
 
-def atomic_json(path: Path, value: dict) -> None:
+def atomic_json(path: Path, value: dict, mode: int = 0o644, preserve_owner_from: Path | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    tmp = Path(temp_name)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
-        tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-        os.chmod(tmp, 0o644)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(json.dumps(value, indent=2, sort_keys=True) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        target_mode = mode
+        uid = gid = None
+        source = preserve_owner_from if preserve_owner_from and preserve_owner_from.exists() else (path if path.exists() else None)
+        if source is not None:
+            st = source.stat()
+            target_mode = stat.S_IMODE(st.st_mode) if preserve_owner_from else mode
+            uid, gid = st.st_uid, st.st_gid
+        os.chmod(tmp, target_mode)
+        if uid is not None and gid is not None:
+            os.chown(tmp, uid, gid)
         os.replace(tmp, path)
-    except OSError as exc:
-        log(f'could not write status {path}: {exc}')
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def queue_writer_info() -> list[dict]:
+    out = []
+    seen = set()
+    for path in QUEUE_DIRS:
+        try:
+            if not path.is_dir() or path.is_symlink():
+                continue
+            real = str(path.resolve())
+            if real in seen:
+                continue
+            seen.add(real)
+            st = path.stat()
+            try:
+                owner = pwd.getpwuid(st.st_uid).pw_name
+            except Exception:
+                owner = str(st.st_uid)
+            out.append({'path': str(path), 'owner': owner, 'uid': st.st_uid, 'gid': st.st_gid, 'mode': oct(stat.S_IMODE(st.st_mode))})
+        except OSError:
+            continue
+    return out
 
 
 def write_status(value: dict) -> None:
     value = dict(value)
-    value.setdefault('schemaVersion', 1)
+    value.setdefault('schemaVersion', 2)
+    value['protocolVersion'] = PROTOCOL_VERSION
+    value['capabilities'] = ['restart-hotpocket', 'recover-hotpocket', 'status-heartbeat', 'audit-trail', 'queued-requests', 'web-owned-queue']
     value['watcherPid'] = os.getpid()
+    value['queueWriters'] = queue_writer_info()
     for path in STATUS_PATHS:
-        atomic_json(path, value)
+        try:
+            atomic_json(path, value, 0o644)
+        except OSError as exc:
+            log(f'could not write status {path}: {exc}')
+
+
+def write_alias_json(paths: list[Path], value: dict) -> None:
+    for path in paths:
+        try:
+            atomic_json(path, value, 0o644)
+        except OSError as exc:
+            log(f'could not write audit {path}: {exc}')
+
+
+def write_received_audit(request: dict, request_path: Path) -> None:
+    write_alias_json(LAST_REQUEST_PATHS, {
+        'schemaVersion': 1,
+        'phase': 'request-received',
+        'receivedAt': int(time.time() * 1000),
+        'requestId': request.get('requestId'),
+        'requestPath': str(request_path),
+        'request': request,
+    })
+
+
+def write_consumed_audit(request: dict, request_path: Path) -> None:
+    write_alias_json(LAST_CONSUMED_PATHS, {
+        'schemaVersion': 1,
+        'phase': 'request-consumed',
+        'consumedAt': int(time.time() * 1000),
+        'requestId': request.get('requestId'),
+        'requestPath': str(request_path),
+        'request': request,
+    })
+
+
+def write_result_audit(value: dict) -> None:
+    value = dict(value)
+    value.setdefault('schemaVersion', 1)
+    req = value.get('request') if isinstance(value.get('request'), dict) else {}
+    value.setdefault('requestId', req.get('requestId'))
+    write_alias_json(LAST_RESULT_PATHS, value)
+
+
+def find_queued_request() -> Path | None:
+    candidates: list[tuple[float, str, Path]] = []
+    seen_real: set[str] = set()
+    for directory in QUEUE_DIRS:
+        try:
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            real = str(directory.resolve())
+            if real in seen_real:
+                continue
+            seen_real.add(real)
+            for path in directory.iterdir():
+                try:
+                    if not path.is_file() or path.is_symlink() or not QUEUE_NAME_RE.fullmatch(path.name):
+                        continue
+                    st = path.stat()
+                    candidates.append((st.st_mtime, path.name, path))
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2]
+
+
+def queue_depth() -> int:
+    total = 0
+    seen_real: set[str] = set()
+    for directory in QUEUE_DIRS:
+        try:
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            real = str(directory.resolve())
+            if real in seen_real:
+                continue
+            seen_real.add(real)
+            total += sum(1 for p in directory.iterdir() if p.is_file() and not p.is_symlink() and QUEUE_NAME_RE.fullmatch(p.name))
+        except OSError:
+            continue
+    return total
 
 
 def find_request() -> Path | None:
+    queued = find_queued_request()
+    if queued is not None:
+        return queued
     for path in REQUEST_PATHS:
         try:
             if path.is_file() and not path.is_symlink():
@@ -73,108 +241,414 @@ def find_request() -> Path | None:
     return None
 
 
-def consume_all_requests() -> None:
-    # Remove both aliases before touching HotPocket so the restart cannot loop.
-    for path in REQUEST_PATHS:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:
-            log(f'could not remove request alias {path}: {exc}')
+def consume_request(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log(f'could not remove request {path}: {exc}')
+    # Legacy mailbox aliases represent the same logical request and may be mirrored.
+    if path in REQUEST_PATHS:
+        for alias in REQUEST_PATHS:
+            if alias == path:
+                continue
+            try:
+                alias.unlink(missing_ok=True)
+            except OSError as exc:
+                log(f'could not remove legacy request alias {alias}: {exc}')
 
 
 def read_request(path: Path) -> dict:
     raw = path.read_text(encoding='utf-8')
-    if len(raw.encode('utf-8')) > 65536:
+    if len(raw.encode('utf-8')) > MAX_JSON_BYTES:
         raise ValueError('restart request is too large')
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError('restart request must be a JSON object')
-    if value.get('action') != 'restart-hotpocket':
+    action = value.get('action')
+    if action not in ('restart-hotpocket', 'recover-hotpocket'):
         raise ValueError('unsupported restart action')
+    if action == 'recover-hotpocket' and not isinstance(value.get('recovery'), dict):
+        raise ValueError('recover-hotpocket requires a recovery object')
     return value
 
 
-def restart_hotpocket(request: dict) -> None:
+def normalize_public_key(value: object) -> str:
+    match = PUBLIC_KEY_RE.fullmatch(str(value or '').strip())
+    if not match:
+        raise ValueError('invalid HotPocket public key')
+    return 'ed' + match.group(1).lower()
+
+
+def normalize_contract_id(value: object) -> str:
+    contract_id = str(value or '').strip().lower()
+    if not GUID_RE.fullmatch(contract_id):
+        raise ValueError('invalid HotPocket contract ID')
+    return contract_id
+
+
+def normalize_peer(value: object) -> str:
+    raw = str(value or '').strip()
+    if not raw or len(raw) > 320 or '://' in raw or any(ch.isspace() for ch in raw) or any(ch in raw for ch in '/?#'):
+        raise ValueError('invalid bootstrap peer')
+    if raw.startswith('['):
+        match = re.fullmatch(r'\[([^\]]+)\]:(\d{1,5})', raw)
+        if not match:
+            raise ValueError('invalid IPv6 bootstrap peer')
+        address = ipaddress.ip_address(match.group(1))
+        if address.version != 6:
+            raise ValueError('invalid IPv6 bootstrap peer')
+        port = int(match.group(2))
+        if port < 1 or port > 65535:
+            raise ValueError('invalid bootstrap peer port')
+        return f'[{address.compressed.lower()}]:{port}'
+    if raw.count(':') != 1:
+        raise ValueError('bootstrap peer must be host:meshPort')
+    host, port_text = raw.rsplit(':', 1)
+    host = host.strip().lower()
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise ValueError('invalid bootstrap peer port') from exc
+    if port < 1 or port > 65535:
+        raise ValueError('invalid bootstrap peer port')
+    try:
+        address = ipaddress.ip_address(host)
+        if address.version != 4:
+            raise ValueError('IPv6 bootstrap peers must use brackets')
+        host = str(address)
+    except ValueError:
+        if not HOST_RE.fullmatch(host):
+            raise ValueError('invalid bootstrap peer hostname')
+    return f'{host}:{port}'
+
+
+def load_hp_config() -> dict:
+    if not HP_CONFIG_FILE.is_file() or HP_CONFIG_FILE.is_symlink():
+        raise ValueError(f'HotPocket configuration is missing or unsafe: {HP_CONFIG_FILE}')
+    raw = HP_CONFIG_FILE.read_text(encoding='utf-8')
+    if len(raw.encode('utf-8')) > MAX_JSON_BYTES:
+        raise ValueError('HotPocket configuration is too large')
+    cfg = json.loads(raw)
+    if not isinstance(cfg, dict):
+        raise ValueError('HotPocket configuration root must be a JSON object')
+    return cfg
+
+
+def local_node_public_key(cfg: dict) -> str:
+    node = cfg.get('node') if isinstance(cfg.get('node'), dict) else cfg
+    return normalize_public_key(node.get('public_key') or node.get('publicKey'))
+
+
+def backup_hp_config(cfg: dict, request: dict) -> Path:
+    payload = {
+        'schemaVersion': 1,
+        'createdAt': int(time.time() * 1000),
+        'requestId': request.get('requestId'),
+        'requestedBy': request.get('requestedBy'),
+        'hpConfig': cfg,
+    }
+    last_error: Exception | None = None
+    for path in RECOVERY_BACKUP_PATHS:
+        try:
+            atomic_json(path, payload, 0o600)
+            return path
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f'could not save recovery hp.cfg backup: {last_error}')
+
+
+def save_hp_config(cfg: dict) -> None:
+    encoded = json.dumps(cfg, ensure_ascii=False, indent=2) + '\n'
+    if len(encoded.encode('utf-8')) > MAX_JSON_BYTES:
+        raise ValueError('recovered HotPocket configuration is too large')
+    st = HP_CONFIG_FILE.stat()
+    fd, temp_name = tempfile.mkstemp(prefix='.' + HP_CONFIG_FILE.name + '.everadmin-recovery.', dir=HP_CONFIG_FILE.parent)
+    tmp = Path(temp_name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.replace(tmp, HP_CONFIG_FILE)
+        load_hp_config()
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def apply_recovery(request: dict) -> dict:
+    recovery = request['recovery']
+    mode = str(recovery.get('mode') or '').strip().lower()
+    cfg = load_hp_config()
+    original = json.loads(json.dumps(cfg))
+    contract = cfg.get('contract')
+    if not isinstance(contract, dict):
+        raise ValueError("hp.cfg requires a 'contract' object")
+    mesh = cfg.get('mesh')
+    if not isinstance(mesh, dict):
+        mesh = {}
+        cfg['mesh'] = mesh
+    discovery = mesh.get('peer_discovery')
+    if not isinstance(discovery, dict):
+        discovery = {}
+        mesh['peer_discovery'] = discovery
+
+    backup = backup_hp_config(original, request)
+    if mode == 'self-unl':
+        local_key = local_node_public_key(cfg)
+        requested_key = recovery.get('localNodePublicKey')
+        if requested_key is not None and normalize_public_key(requested_key) != local_key:
+            raise ValueError('requested local node key does not match hp.cfg')
+        contract['unl'] = [local_key]
+        mesh['known_peers'] = []
+        discovery['enabled'] = False
+        summary = {
+            'mode': mode,
+            'contractId': contract.get('id'),
+            'unl': [local_key],
+            'knownPeers': [],
+            'peerDiscoveryEnabled': False,
+        }
+    elif mode == 'invite':
+        contract_id = normalize_contract_id(recovery.get('contractId'))
+        trusted_key = normalize_public_key(recovery.get('trustedValidatorPublicKey'))
+        bootstrap_peer = normalize_peer(recovery.get('bootstrapPeer'))
+        contract['id'] = contract_id
+        contract['unl'] = [trusted_key]
+        mesh['known_peers'] = [bootstrap_peer]
+        discovery['enabled'] = True
+        interval = discovery.get('interval')
+        if not isinstance(interval, int) or interval < 1:
+            discovery['interval'] = 10000
+        summary = {
+            'mode': mode,
+            'contractId': contract_id,
+            'unl': [trusted_key],
+            'knownPeers': [bootstrap_peer],
+            'peerDiscoveryEnabled': True,
+        }
+    else:
+        raise ValueError('recovery mode must be self-unl or invite')
+
+    try:
+        save_hp_config(cfg)
+    except BaseException:
+        # Attempt immediate rollback before propagating the failure.
+        try:
+            save_hp_config(original)
+        except BaseException as rollback_exc:
+            log(f'hp.cfg rollback after failed recovery write also failed: {rollback_exc}')
+        raise
+    summary['backupPath'] = str(backup)
+    return summary
+
+
+def run_supervisor(*args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [SUPERVISORCTL, '-c', SUPERVISOR_CONF, *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def supervisor_status() -> tuple[str, str, int]:
+    result = run_supervisor('status', 'hotpocket', timeout=30)
+    output = (result.stdout or '').strip()[-8000:]
+    state = 'UNKNOWN'
+    match = re.search(r'^hotpocket\s+([A-Z]+)\b', output, re.M)
+    if match:
+        state = match.group(1)
+    return state, output, result.returncode
+
+
+def supervisor_pid() -> int | None:
+    result = run_supervisor('pid', 'hotpocket', timeout=30)
+    text = (result.stdout or '').strip()
+    try:
+        pid = int(text.splitlines()[-1].strip())
+        return pid if pid > 0 else None
+    except Exception:
+        return None
+
+
+def wait_for_state(wanted: set[str], timeout_seconds: float) -> tuple[str, str]:
+    deadline = time.time() + timeout_seconds
+    last_state = 'UNKNOWN'
+    last_output = ''
+    while time.time() < deadline:
+        last_state, last_output, _ = supervisor_status()
+        if last_state in wanted:
+            return last_state, last_output
+        time.sleep(0.5)
+    return last_state, last_output
+
+
+def restart_hotpocket(request: dict, request_path: Path) -> None:
     consumed_at = int(time.time() * 1000)
-    consume_all_requests()
-    write_status({
-        'phase': 'request-consumed',
-        'consumedAt': consumed_at,
-        'request': request,
-        'command': 'supervisorctl -c /etc/everlomp/supervisord.conf restart hotpocket',
-    })
+    write_received_audit(request, request_path)
+    write_consumed_audit(request, request_path)
+    consume_request(request_path)
+    action = request.get('action')
+    recovery_summary = None
+    if action == 'recover-hotpocket':
+        write_status({
+            'phase': 'recovery-preparing',
+            'consumedAt': consumed_at,
+            'request': request,
+        })
+        recovery_summary = apply_recovery(request)
+        write_status({
+            'phase': 'recovery-config-applied',
+            'appliedAt': int(time.time() * 1000),
+            'request': request,
+            'recovery': recovery_summary,
+        })
 
-    # Give the current contract request enough time to flush its response before hpcore is restarted.
-    time.sleep(RESPONSE_GRACE_SECONDS)
-
+    old_state, old_status_output, old_status_rc = supervisor_status()
+    old_pid = supervisor_pid()
     write_status({
-        'phase': 'restarting',
+        'phase': 'restart-stop-start-begin',
         'startedAt': int(time.time() * 1000),
         'request': request,
-        'command': 'supervisorctl -c /etc/everlomp/supervisord.conf restart hotpocket',
+        'recovery': recovery_summary,
+        'oldState': old_state,
+        'oldPid': old_pid,
+        'oldStatusReturnCode': old_status_rc,
+        'oldStatusOutput': old_status_output,
+        'queueDepthAfterConsume': queue_depth(),
+        'commands': [
+            'supervisorctl -c /etc/everlomp/supervisord.conf stop hotpocket',
+            'supervisorctl -c /etc/everlomp/supervisord.conf start hotpocket',
+        ],
     })
 
     try:
-        result = subprocess.run(
-            [SUPERVISORCTL, '-c', SUPERVISOR_CONF, 'restart', 'hotpocket'],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=120,
-            check=False,
-        )
-        output = (result.stdout or '').strip()[-8000:]
-        if result.returncode == 0:
-            write_status({
-                'phase': 'restart-command-succeeded',
+        # Stop is deliberately separate from start. If it is already stopped/fatal/exited,
+        # continue directly to start rather than treating that as a restart failure.
+        stop_result = run_supervisor('stop', 'hotpocket')
+        stop_output = (stop_result.stdout or '').strip()[-8000:]
+        stopped_state, stopped_status_output = wait_for_state({'STOPPED', 'EXITED', 'FATAL', 'UNKNOWN'}, 45.0)
+
+        write_status({
+            'phase': 'hotpocket-stopped',
+            'stoppedAt': int(time.time() * 1000),
+            'request': request,
+            'recovery': recovery_summary,
+            'oldState': old_state,
+            'oldPid': old_pid,
+            'stopReturnCode': stop_result.returncode,
+            'stopOutput': stop_output,
+            'stoppedState': stopped_state,
+            'stoppedStatusOutput': stopped_status_output,
+        })
+
+        start_result = run_supervisor('start', 'hotpocket')
+        start_output = (start_result.stdout or '').strip()[-8000:]
+        final_state, final_status_output = wait_for_state({'RUNNING', 'FATAL'}, 90.0)
+        new_pid = supervisor_pid()
+
+        if final_state == 'RUNNING' and new_pid:
+            pid_changed = old_pid is None or new_pid != old_pid
+            final_status = {
+                'phase': 'restart-verified' if pid_changed else 'restart-running-same-pid',
                 'completedAt': int(time.time() * 1000),
                 'request': request,
-                'returnCode': result.returncode,
-                'output': output,
-            })
-            log('HotPocket restart command succeeded.')
-        else:
-            write_status({
-                'phase': 'restart-command-failed',
-                'failedAt': int(time.time() * 1000),
-                'request': request,
-                'returnCode': result.returncode,
-                'output': output,
-            })
-            log(f'HotPocket restart command failed ({result.returncode}): {output}')
+                'recovery': recovery_summary,
+                'oldState': old_state,
+                'oldPid': old_pid,
+                'stopReturnCode': stop_result.returncode,
+                'stopOutput': stop_output,
+                'stoppedState': stopped_state,
+                'startReturnCode': start_result.returncode,
+                'startOutput': start_output,
+                'finalState': final_state,
+                'newPid': new_pid,
+                'pidChanged': pid_changed,
+                'finalStatusOutput': final_status_output,
+            }
+            write_status(final_status)
+            write_result_audit(final_status)
+            if pid_changed:
+                log(f'HotPocket restart verified: PID {old_pid} -> {new_pid}.')
+            else:
+                log(f'HotPocket is RUNNING but PID did not change ({new_pid}); restart could not be verified.')
+            return
+
+        final_status = {
+            'phase': 'restart-verification-failed',
+            'failedAt': int(time.time() * 1000),
+            'request': request,
+            'recovery': recovery_summary,
+            'oldState': old_state,
+            'oldPid': old_pid,
+            'stopReturnCode': stop_result.returncode,
+            'stopOutput': stop_output,
+            'stoppedState': stopped_state,
+            'startReturnCode': start_result.returncode,
+            'startOutput': start_output,
+            'finalState': final_state,
+            'newPid': new_pid,
+            'finalStatusOutput': final_status_output,
+        }
+        write_status(final_status)
+        write_result_audit(final_status)
+        log(f'HotPocket restart verification failed; final state={final_state}, pid={new_pid}.')
     except Exception as exc:
-        write_status({
+        final_status = {
             'phase': 'restart-command-error',
             'failedAt': int(time.time() * 1000),
             'request': request,
+            'recovery': recovery_summary,
+            'oldState': old_state,
+            'oldPid': old_pid,
             'error': f'{type(exc).__name__}: {exc}',
-        })
-        log(f'HotPocket restart command raised: {type(exc).__name__}: {exc}')
-
+        }
+        write_status(final_status)
+        write_result_audit(final_status)
+        log(f'HotPocket stop/start sequence raised: {type(exc).__name__}: {exc}')
 
 def main() -> None:
     if os.geteuid() != 0:
         raise SystemExit('watcher must run as root')
-    log('ready; watching seed restart request')
-    write_status({'phase': 'watching', 'startedAt': int(time.time() * 1000)})
+    log('ready; watching restart/recovery requests (protocol v7)')
+    started_at = int(time.time() * 1000)
+    last_heartbeat = 0.0
+    write_status({
+        'phase': 'watching',
+        'startedAt': started_at,
+        'heartbeatAt': started_at,
+        'queueDepth': queue_depth(),
+    })
     while True:
+        now = time.time()
+        if now - last_heartbeat >= 5.0:
+            write_status({
+                'phase': 'watching',
+                'startedAt': started_at,
+                'heartbeatAt': int(now * 1000),
+                'queueDepth': queue_depth(),
+            })
+            last_heartbeat = now
         request_path = find_request()
         if request_path is None:
             time.sleep(POLL_SECONDS)
             continue
         try:
             request = read_request(request_path)
+            restart_hotpocket(request, request_path)
         except Exception as exc:
-            consume_all_requests()
-            write_status({
-                'phase': 'request-rejected',
-                'rejectedAt': int(time.time() * 1000),
-                'error': f'{type(exc).__name__}: {exc}',
-            })
+            consume_request(request_path)
+            rejected={'phase':'request-rejected','rejectedAt':int(time.time()*1000),'error':f'{type(exc).__name__}: {exc}'}
+            write_status(rejected); write_result_audit(rejected)
             log(f'rejected request: {type(exc).__name__}: {exc}')
-            time.sleep(POLL_SECONDS)
-            continue
-        restart_hotpocket(request)
         time.sleep(POLL_SECONDS)
 
 
@@ -219,6 +693,87 @@ def supervisor(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def detect_web_identity() -> tuple[int, int, str]:
+    ranked: list[tuple[int, int, int, str]] = []
+    proc_root = Path('/proc')
+    patterns = [
+        (0, ('php-fpm', 'php-cgi', 'php -s', 'php -S')),
+        (1, ('apache2', 'httpd')),
+        (2, ('nginx',)),
+        (3, ('caddy', 'lighttpd')),
+    ]
+    try:
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = (entry / 'cmdline').read_bytes().replace(b'\x00', b' ').decode('utf-8', 'ignore').strip().lower()
+                if not raw:
+                    continue
+                status = (entry / 'status').read_text(encoding='utf-8', errors='ignore')
+                m = re.search(r'^Uid:\s+(\d+)\s+', status, re.M)
+                g = re.search(r'^Gid:\s+(\d+)\s+', status, re.M)
+                if not m or not g:
+                    continue
+                uid, gid = int(m.group(1)), int(g.group(1))
+                if uid == 0:
+                    continue
+                for rank, needles in patterns:
+                    if any(n in raw for n in needles):
+                        try:
+                            name = pwd.getpwuid(uid).pw_name
+                        except KeyError:
+                            name = str(uid)
+                        ranked.append((rank, uid, gid, name))
+                        break
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    if ranked:
+        ranked.sort(key=lambda x: (x[0], x[1]))
+        _, uid, gid, name = ranked[0]
+        return uid, gid, name
+    for name in ('www-data', 'everlomp', 'nginx', 'apache'):
+        try:
+            rec = pwd.getpwnam(name)
+            return rec.pw_uid, rec.pw_gid, rec.pw_name
+        except KeyError:
+            continue
+    raise RuntimeError('Could not determine the web/PHP worker user for the restart queue.')
+
+
+def prepare_web_queue() -> dict:
+    uid, gid, name = detect_web_identity()
+    prepared = []
+    candidates = [
+        Path('/contract/contract_fs/seed/restart-hotpocket.queue'),
+        Path('/contract/contract_fs/mnt/rw/restart-hotpocket.queue'),
+    ]
+    seen = set()
+    for directory in candidates:
+        try:
+            parent = directory.parent
+            if not parent.is_dir() or parent.is_symlink():
+                continue
+            real_parent = str(parent.resolve())
+            key = real_parent + '/restart-hotpocket.queue'
+            if key in seen:
+                continue
+            seen.add(key)
+            if directory.exists() and (not directory.is_dir() or directory.is_symlink()):
+                raise RuntimeError(f'Unsafe restart queue path: {directory}')
+            directory.mkdir(mode=0o700, parents=False, exist_ok=True)
+            os.chown(directory, uid, gid)
+            os.chmod(directory, 0o700)
+            prepared.append(str(directory))
+        except OSError as exc:
+            print(f'Queue preparation skipped for {directory}: {exc}', file=sys.stderr)
+    if not prepared:
+        raise RuntimeError('Could not prepare a writable restart queue under contract_fs.')
+    return {'webUser': name, 'uid': uid, 'gid': gid, 'paths': prepared}
+
+
 def program_block() -> str:
     return f'''{BEGIN}\n[program:{PROGRAM_NAME}]\ncommand=/usr/bin/python3 {WATCHER_PATH}\nuser=root\nautostart=true\nautorestart=true\nstartretries=100\nstartsecs=1\nstopsignal=TERM\nstopwaitsecs=5\nredirect_stderr=true\nstdout_logfile=/var/log/supervisor/{PROGRAM_NAME}.log\npriority=19\n{END}\n'''
 
@@ -231,8 +786,8 @@ def install() -> None:
     if not SUPERVISORCTL.is_file() or not os.access(SUPERVISORCTL, os.X_OK):
         fail(f'supervisorctl is unavailable: {SUPERVISORCTL}', 3)
 
+    queue_info = prepare_web_queue()
     atomic_write(WATCHER_PATH, WATCHER_SOURCE, 0o755)
-
     original = SUPERVISOR_CONF.read_text(encoding='utf-8')
     pattern = re.compile(re.escape(BEGIN) + r'.*?' + re.escape(END) + r'\n?', re.S)
     block = program_block()
@@ -244,27 +799,40 @@ def install() -> None:
         st = SUPERVISOR_CONF.stat()
         atomic_write(SUPERVISOR_CONF, updated, stat.S_IMODE(st.st_mode))
         os.chown(SUPERVISOR_CONF, st.st_uid, st.st_gid)
-
     for command in ('reread', 'update'):
         result = supervisor(command)
         if result.stdout:
             print(result.stdout.rstrip())
         if result.returncode != 0:
             fail(f'Supervisor {command} failed.', 5)
-
-    status = supervisor('status', PROGRAM_NAME)
-    if status.stdout:
-        print(status.stdout.rstrip())
-    if status.returncode != 0 or 'STOPPED' in status.stdout or 'EXITED' in status.stdout or 'FATAL' in status.stdout:
+    # Force a restart so any older watcher is replaced by protocol v6.
+    restarted = supervisor('restart', PROGRAM_NAME)
+    if restarted.stdout:
+        print(restarted.stdout.rstrip())
+    if restarted.returncode != 0:
         started = supervisor('start', PROGRAM_NAME)
         if started.stdout:
             print(started.stdout.rstrip())
         if started.returncode != 0:
             fail('EverAdmin HotPocket watcher could not be started.', 6)
-
+    status_candidates = [
+        Path('/contract/contract_fs/seed/restart-hotpocket.status.json'),
+        Path('/contract/contract_fs/mnt/rw/restart-hotpocket.status.json'),
+    ]
+    deadline = time.time() + 6.0
+    while time.time() < deadline and not any(path.is_file() for path in status_candidates):
+        time.sleep(0.2)
+    if not any(path.is_file() for path in status_candidates):
+        diagnostic = supervisor('status', PROGRAM_NAME)
+        if diagnostic.stdout:
+            print(diagnostic.stdout.rstrip(), file=sys.stderr)
+        fail('Watcher process did not create restart-hotpocket.status.json after startup.', 7)
     print(f'Installed {WATCHER_PATH}')
-    print('Watcher request: /contract/contract_fs/seed/restart-hotpocket.request')
-    print('Watcher action: supervisorctl restart hotpocket')
+    print('Watcher protocol: v7 (web-owned queued requests + verified stop/start + recovery + audit trail)')
+    print(f"Watcher queue writer: {queue_info['webUser']} (uid={queue_info['uid']})")
+    print('Watcher queues: ' + ', '.join(queue_info['paths']))
+    print('Watcher legacy request: /contract/contract_fs/seed/restart-hotpocket.request')
+    print('Recovery backup: /contract/contract_fs/seed/everadmin-recovery-hp.cfg.backup.json')
 
 
 def main() -> None:
