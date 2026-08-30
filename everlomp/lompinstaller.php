@@ -4323,7 +4323,7 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <span class="choice-badge">For smart contracts</span>
 <h3>Enable HotPocket</h3>
 <p>Before HotPocket can start, choose whether you want to upload your smart contract now.</p>
-<form method="post" enctype="multipart/form-data" class="wizard-ajax-form" data-step="6" data-advance="7" data-hotpocket-enable-form>
+<form method="post" enctype="multipart/form-data" class="wizard-ajax-form" data-step="6" data-hotpocket-enable-form>
 <input type="hidden" name="action" value="enable_hotpocket">
 <div class="terms-agreements">
 <label class="terms-check"><input type="checkbox" name="accept_hotpocket_terms" value="1" required><span>I accept the <a target="_blank" rel="noopener noreferrer" href="https://github.com/EvernodeXRPL/hpcore/blob/main/evernode-license.pdf">HotPocket license terms</a>.</span></label>
@@ -4385,7 +4385,7 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <?php endif; ?>
 <div class="wizard-divider"></div>
 
-<h3>Add a listenerURL to your smart contract</h3>
+<h3 id="hotpocket-listener-section">Add a listenerURL to your smart contract</h3>
 
 <p>
     Expose a smart-contract seed directory through either the
@@ -5917,9 +5917,20 @@ async function submitWizardForm(event) {
         if (success) showWizardNotice(success.textContent.trim(), false);
         if (everlompWizardState.filegator) setWizardDecision('filegator-decided');
         if (everlompWizardState.hotpocket) setWizardDecision('hotpocket-decided');
-        const advance = Number(form.dataset.advance || 0);
-        if (advance && advance <= wizardMaxAllowedStep()) showWizardStep(advance);
-        else showWizardStep(step, true);
+        if (action === 'enable_hotpocket') {
+            // HotPocket being enabled is not the end of Step 6. The listenerURL
+            // controls only become available after HotPocket is active, so keep
+            // the user on this step and bring those controls into view.
+            showWizardStep(step, true);
+            requestAnimationFrame(() => {
+                const listenerSection = document.getElementById('hotpocket-listener-section');
+                if (listenerSection) listenerSection.scrollIntoView({behavior:'smooth', block:'start'});
+            });
+        } else {
+            const advance = Number(form.dataset.advance || 0);
+            if (advance && advance <= wizardMaxAllowedStep()) showWizardStep(advance);
+            else showWizardStep(step, true);
+        }
     } catch (error) {
         const action = String(data.get('action') || '');
         const message = action === 'enable_ssh'
