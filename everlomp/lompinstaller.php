@@ -1095,8 +1095,8 @@ if (($_GET['hotpocket_site'] ?? '') === 'configured') {
 
 if (($_GET['hotpocket'] ?? '') === 'enabled') {
     $message = (($_GET['contract'] ?? '') === 'uploaded')
-        ? 'Smart contract deployed to /contract/contract_fs/seed/state, contract.deploy.json merged into hp.cfg, and HotPocket enabled. Supervisor will now autostart it and keep it running.'
-        : 'HotPocket enabled. Supervisor will now autostart it and keep it running.';
+        ? 'Smart contract deployed to /contract/contract_fs/seed/state, contract.deploy.json merged into hp.cfg, HotPocket enabled, and the EverAdmin seed restart watcher installed. Supervisor will autostart HotPocket and keep both runtime services running.'
+        : 'HotPocket enabled and EverAdmin seed restart watcher installed. Supervisor will now autostart HotPocket and keep both runtime services running.';
 }
 
 if (
@@ -2392,10 +2392,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $error = 'Accept the HotPocket license terms before enabling HotPocket.';
         } elseif (!in_array($hotpocketContractChoice, ['yes', 'no'], true)) {
             $error = 'Choose YES or NO for whether you want to deploy a smart contract now. HotPocket will not start until you make this choice.';
-        } elseif ($hotpocketEnabled) {
-            $message = 'HotPocket is already enabled.';
         } else {
-            if ($hotpocketContractChoice === 'yes') {
+            // Install/refresh the completely separate EverAdmin HotPocket restart watcher before enabling HotPocket.
+            // This does not wrap or modify /usr/local/sbin/everlomp-hotpocket. The new root-only setup
+            // helper installs /home/everlomp/everadmin-hotpocket-watcher.py as its own Supervisor program.
+            [$restartHelperCode, $restartHelperStdout, $restartHelperStderr] = runEverlompHelper(
+                '/usr/local/sbin/everadmin-restart-watcher-setup',
+                'install'
+            );
+
+            if ($restartHelperCode !== 0) {
+                $error = $restartHelperStderr !== ''
+                    ? $restartHelperStderr
+                    : ($restartHelperStdout !== '' ? $restartHelperStdout : 'Could not install the EverAdmin HotPocket restart watcher.');
+            } elseif ($hotpocketEnabled) {
+                $message = 'HotPocket is already enabled. EverAdmin restart watcher installed/refreshed.';
+            } else {
+                if ($hotpocketContractChoice === 'yes') {
                 if (!in_array($hotpocketContractSource, ['upload', 'library'], true)) {
                     $error = 'Choose whether the smart contract ZIP should come from your browser or the server ZIP library.';
                 } elseif ($hotpocketContractSource === 'library') {
@@ -2473,6 +2486,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $error = $stderr !== ''
                     ? $stderr
                     : ($stdout !== '' ? $stdout : 'Could not enable HotPocket.');
+                }
             }
         }
     }
@@ -4562,7 +4576,7 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <?php if ($kopiaConfigured): ?><div class="copy-field"><input data-dashboard-label="Kopia" data-dashboard-url id="finish-url-kopia" type="text" readonly value="<?= h($kopiaDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-kopia',this)">Copy</button></div><div class="copy-field"><input data-dashboard-label="Kopia Replication" data-dashboard-url id="finish-url-kopia-replication" type="text" readonly value="<?= h($kopiaReplicationDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-kopia-replication',this)">Copy</button></div><?php endif; ?>
 </div></div>
 </div>
-<div class="finish-warning" style="margin-top:16px"><h3>⚠ Remove the Everlomp installer when you are done.</h3><?php if ($hotpocketSiteSelected): ?><p><strong>HotPocket website handoff:</strong> this final action first switches OpenLiteSpeed to <?= h((string) ($hotpocketSiteInfo['document_root'] ?? '/contract/contract_fs/seed/state')) ?> using your saved index list, then removes the installer.</p><?php endif; ?><p>Leaving <strong>/lompinstaller.php</strong> exposed means leaving an administrative installation surface on the server. Removing it deletes the installer interface, the original redirecting bootstrap index if it is still unchanged, helper programs, installer metadata, bundled WordPress/Drupal/phpBB installation files, uploaded external-installer packages, and the installer’s passwordless web sudo permissions.</p><p><strong>It does not remove</strong> your installed primary application (WordPress, Drupal, phpBB, or external), FileGator, phpMyAdmin, OpenLiteSpeed, MariaDB, HotPocket, Kopia, SSH if you enabled it, or application/database data.</p><?php if ($primaryApp !== '' && $sshDecisionMade): ?><form method="post" onsubmit="return confirm('Permanently remove the Everlomp installer, helper programs, and bundled installation files? This cannot be undone from the installer.');"><input type="hidden" name="action" value="delete_everlomp_installfile"><div class="wizard-actions"><button type="submit">Permanently Remove Everlomp Installer</button></div></form><?php elseif ($primaryApp === ''): ?><div class="wizard-lock">Install a primary application before the installer can be removed.</div><?php else: ?><div class="wizard-lock">Choose whether SSH should be enabled before the installer can be removed.</div><?php endif; ?></div>
+<div class="finish-warning" style="margin-top:16px"><h3>⚠ Remove the Everlomp installer when you are done.</h3><?php if ($hotpocketSiteSelected): ?><p><strong>HotPocket website handoff:</strong> this final action first switches OpenLiteSpeed to <?= h((string) ($hotpocketSiteInfo['document_root'] ?? '/contract/contract_fs/seed/state')) ?> using your saved index list, then removes the installer.</p><?php endif; ?><p>Leaving <strong>/lompinstaller.php</strong> exposed means leaving an administrative installation surface on the server. Removing it deletes the installer interface, the original redirecting bootstrap index if it is still unchanged, installer-only helper programs, installer metadata, bundled WordPress/Drupal/phpBB installation files, uploaded external-installer packages, and the installer’s passwordless web sudo permissions. The root-owned EverAdmin HotPocket restart watcher is runtime infrastructure and remains installed.</p><p><strong>It does not remove</strong> your installed primary application (WordPress, Drupal, phpBB, or external), FileGator, phpMyAdmin, OpenLiteSpeed, MariaDB, HotPocket, Kopia, SSH if you enabled it, or application/database data.</p><?php if ($primaryApp !== '' && $sshDecisionMade): ?><form method="post" onsubmit="return confirm('Permanently remove the Everlomp installer, helper programs, and bundled installation files? This cannot be undone from the installer.');"><input type="hidden" name="action" value="delete_everlomp_installfile"><div class="wizard-actions"><button type="submit">Permanently Remove Everlomp Installer</button></div></form><?php elseif ($primaryApp === ''): ?><div class="wizard-lock">Install a primary application before the installer can be removed.</div><?php else: ?><div class="wizard-lock">Choose whether SSH should be enabled before the installer can be removed.</div><?php endif; ?></div>
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(8)">← SSH</button><button type="button" class="secondary" onclick="showWizardStep(1)">Review from the beginning</button></div>
 </section>
 </main>
