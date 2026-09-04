@@ -585,54 +585,52 @@ def set_permissions() -> None:
     except Exception:
         uid_nobody = 65534
         gid_nogroup = 65534
- 
-    # Core is read-only to the web worker; wp-content remains web-writable.
+
+    # WordPress and FileGator both run through the web/PHP worker.
+    # Keep the complete WordPress tree writable by that worker.
     for root, dirs, files in os.walk(WEB_ROOT):
         rootp = Path(root)
+
         if rootp.name in ('.everlomp', '.everlomp-filegator'):
             dirs[:] = []
             continue
+
         if rootp == WEB_ROOT:
-            dirs[:] = [d for d in dirs if d not in ('.everlomp', '.everlomp-filegator')]
+            dirs[:] = [
+                d for d in dirs
+                if d not in ('.everlomp', '.everlomp-filegator')
+            ]
+
+        try:
+            os.chown(rootp, uid_nobody, gid_nogroup)
+            os.chmod(rootp, 0o755)
+        except FileNotFoundError:
+            pass
+
         for d in dirs:
             p = rootp / d
             try:
-                os.chown(p, 0, gid_nogroup)
+                os.chown(p, uid_nobody, gid_nogroup)
                 os.chmod(p, 0o755)
             except FileNotFoundError:
                 pass
+
         for f in files:
             p = rootp / f
+
             if p.name == 'lompinstaller.php':
                 continue
+
             try:
-                os.chown(p, 0, gid_nogroup)
+                os.chown(p, uid_nobody, gid_nogroup)
                 os.chmod(p, 0o644)
             except FileNotFoundError:
                 pass
- 
-    wp_content = WEB_ROOT / 'wp-content'
-    if wp_content.exists():
-        for root, dirs, files in os.walk(wp_content):
-            rootp = Path(root)
-            os.chown(rootp, uid_nobody, gid_nogroup)
-            os.chmod(rootp, 0o755)
-            for d in dirs:
-                p = rootp / d
-                try:
-                    os.chown(p, uid_nobody, gid_nogroup); os.chmod(p, 0o755)
-                except FileNotFoundError:
-                    pass
-            for f in files:
-                p = rootp / f
-                try:
-                    os.chown(p, uid_nobody, gid_nogroup); os.chmod(p, 0o644)
-                except FileNotFoundError:
-                    pass
+
     cfg = WEB_ROOT / 'wp-config.php'
     if cfg.exists():
-        os.chown(cfg, 0, gid_nogroup)
-        os.chmod(cfg, 0o640)
+        os.chown(cfg, uid_nobody, gid_nogroup)
+        os.chmod(cfg, 0o600)
  
  
 def copy_site(extracted: Path) -> None:
