@@ -238,6 +238,16 @@ if count != 1:
     print('Could not locate FileGator upload_max_size configuration.', file=sys.stderr)
     raise SystemExit(1)
 
+text, count = re.subn(
+    r"('editable'\s*=>\s*)\[[^\]]*\]",
+    r"\g<1>['.txt', '.css', '.js', '.ts', '.html', '.htm', '.php', '.json', '.md', '.htaccess', '.xml', '.yml', '.yaml', '.ini', '.conf']",
+    text,
+    count=1,
+)
+
+if count != 1:
+    print('Could not locate FileGator editable-file configuration.', file=sys.stderr)
+    raise SystemExit(1)
 path.write_text(text)
 PY
 
