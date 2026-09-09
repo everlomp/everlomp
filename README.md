@@ -22,7 +22,7 @@ https://github.com/phpmyadmin
 Openlitespeed is the fastest open source webserver in the world. You have listeners and vhosts here, no customizations has been done here at all.
 https://openlitespeed.org/
 
-Filegator is a wonderful filemanager. It was perfect and required no customizations at all.
+Filegator is a wonderful filemanager. It was perfect and required no customizations at all. However, I added .htaccess as editable and increased the upload_max_size to 1gb and adjusted the bruteforce timeout to 5 minutes per ip.
 https://filegator.io/
 
 Kopia is a wonderful snapshot tool that allow for encrypted and remotely stored backups. Everlomp have added four functions to the webui of kopia.
