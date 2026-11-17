@@ -96,7 +96,7 @@ RUN apt-get update && \
         lsphp85-curl \
         lsphp85-imagick \
         lsphp85-imap \
-        lsphp85-memcached \
+        lsphp85-redis \
         lsphp85-mysql && \
     rm -rf /var/lib/apt/lists/*
 
