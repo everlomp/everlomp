@@ -86,7 +86,6 @@ COPY lib/libcrypto.so.1.1 /usr/lib/x86_64-linux-gnu/
 
 RUN ldconfig && mkdir -p /contract
 
-
 RUN wget -O - https://repo.litespeed.sh | bash
 
 RUN apt-get update && \
@@ -98,8 +97,7 @@ RUN apt-get update && \
         lsphp85-imagick \
         lsphp85-imap \
         lsphp85-memcached \
-        lsphp85-mysql \
-        lsphp85-redis && \
+        lsphp85-mysql && \
     rm -rf /var/lib/apt/lists/*
 
 RUN /usr/local/lsws/lsphp85/bin/lsphp -r '\
