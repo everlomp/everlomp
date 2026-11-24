@@ -1,5 +1,22 @@
 FROM ubuntu:24.04
 
+# Prefer IPv4 for outbound connections without disabling IPv6.
+ENV NODE_OPTIONS=--dns-result-order=ipv4first
+ENV CURL_HOME=/etc/everlomp-network
+
+RUN printf '%s\n' \
+        'precedence ::1/128 50' \
+        'precedence ::/0 40' \
+        'precedence 2002::/16 30' \
+        'precedence ::/96 20' \
+        'precedence ::ffff:0:0/96 100' \
+        >> /etc/gai.conf && \
+    mkdir -p /etc/apt/apt.conf.d /etc/everlomp-network && \
+    printf '%s\n' 'Acquire::ForceIPv4 "true";' \
+        > /etc/apt/apt.conf.d/99force-ipv4 && \
+    printf '%s\n' 'ipv4' > /etc/everlomp-network/.curlrc && \
+    chmod 0644 /etc/everlomp-network/.curlrc
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 ENV GOTOOLCHAIN=auto
@@ -45,7 +62,13 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 
-RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
+# Default curl and wget CLI requests to IPv4, including curl in normal sudo/cron PATHs.
+RUN printf '%s\n' '#!/bin/sh' 'exec /usr/bin/curl -4 "$@"' \
+        > /usr/local/bin/curl && \
+    chmod 0755 /usr/local/bin/curl && \
+    printf '\n%s\n' 'inet4_only = on' >> /etc/wgetrc
+
+RUN curl -4 -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
         gpg --dearmor -o /usr/share/keyrings/nodesource.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
         > /etc/apt/sources.list.d/nodesource.list && \
@@ -86,7 +109,7 @@ COPY lib/libcrypto.so.1.1 /usr/lib/x86_64-linux-gnu/
 
 RUN ldconfig && mkdir -p /contract
 
-RUN wget -O - https://repo.litespeed.sh | bash
+RUN wget -4 -O - https://repo.litespeed.sh | bash
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -130,7 +153,7 @@ RUN PHP_INI=/usr/local/lsws/lsphp85/etc/php/8.5/litespeed/php.ini && \
 
 
 RUN mkdir -p /etc/apt/keyrings && \
-    curl -fsSL \
+    curl -4 -fsSL \
         --retry 5 \
         --retry-delay 3 \
         --retry-all-errors \
@@ -611,7 +634,7 @@ context /kopia/ {
 EOF
 
 RUN cd /tmp && \
-    curl -fsSL \
+    curl -4 -fsSL \
         https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip \
         -o phpMyAdmin-latest-all-languages.zip && \
     unzip -q phpMyAdmin-latest-all-languages.zip && \
@@ -644,7 +667,7 @@ RUN useradd -m -s /bin/bash everlomp && \
 
 
 RUN useradd --system --no-create-home --shell /usr/sbin/nologin everlomp-build
-RUN curl -fsSL \
+RUN curl -4 -fsSL \
         https://getcomposer.org/download/2.10.3/composer.phar \
         -o /usr/local/bin/composer.phar && \
     echo '7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6  /usr/local/bin/composer.phar' | sha256sum -c - && \
@@ -666,7 +689,7 @@ RUN printf '%s\n' \
 
 
 
-RUN curl -fsSL \
+RUN curl -4 -fsSL \
         https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
         -o /usr/local/bin/wp-cli.phar && \
     chmod 0755 /usr/local/bin/wp-cli.phar && \
