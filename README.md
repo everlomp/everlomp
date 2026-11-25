@@ -50,10 +50,30 @@ Github image: ghcr.io/everlomp/everlomp:latest
 
 Example deploy: evdevkit acquire -i ghcr.io/everlomp/everlomp:latest--vol1--var___www--vol2--var___lib___mysql--vol3--usr___local___lsws--sec1--2fa--subdomain--mysubdomain rAddr
 
+A less targeted deployment deploy: evdevkit acquire -i ghcr.io/everlomp/everlomp:latest--vol1--var--vol2--usr--sec1--2fa--subdomain--mysubdomain rAddr
+
 Evernode Smart Contract Panel
 When you enable hotpocket you can deploy smart contracts by uploading them as .zip file (download an example version first to see how to upload them). 
 
 There is one project in there, everadmin control plane, that is a platform where you can work on your smart contract in real time and upload updated versions of it. It also has a login system. All in beta of course, but well worth playing around with. The smart contract has the ability to connect to other clusters and allow others to connect to it. 
+
+ENV labels can be used to make the frontend installer slightly easier
+ENV	Values	Description
+APP	wordpress, drupal, phpbb, none	Preselect application
+ENCRYPTION	0 / 1	Credential encryption
+HOTPOCKET	0 / 1	HotPocket installation
+SSH	0 / 1	SSH access
+FILEGATOR	0 / 1	File manager
+KOPIA	0 / 1	Kopia backup system
+SQLBACKUP	0 / 1	Scheduled database backups
+REPLICATION	0 / 1	Remote backup replication
+MIGRATION	0 / 1	WordPress migration
+EXTERNAL	0 / 1	External installers
+LOCAL	0 / 1	Use bundled installation files
+CLEANUP	0 / 1	Allow installer removal
+
+example:
+--env1--APP-wordpress--env2--ENCRYPTION-0--env3--HOTPOCKET-0
 
 Comment:
 This code has no guarantee, it's just a vision of how everlomp should look like. I hope someone forks this and make it better. For example, the decryption key secret could be loaded with less read permissions. Working on migration between servers could be worth while, it would be interesting to work on easily restoreable database snapshots. Processes should not leak any sensetive data, but I have not had time to review that. There are locally held fallback files for everything except kopia (as it is being rebuilt during installation with the modifications). The build tools were unreasonable large to include in the dockerfile... 
