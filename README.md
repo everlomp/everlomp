@@ -58,18 +58,29 @@ When you enable hotpocket you can deploy smart contracts by uploading them as .z
 There is one project in there, everadmin control plane, that is a platform where you can work on your smart contract in real time and upload updated versions of it. It also has a login system. All in beta of course, but well worth playing around with. The smart contract has the ability to connect to other clusters and allow others to connect to it. 
 
 ENV labels can be used to make the frontend installer slightly easier
-ENV	Values	Description
+
 APP	wordpress, drupal, phpbb, none	Preselect application
+
 ENCRYPTION	0 / 1	Credential encryption
+
 HOTPOCKET	0 / 1	HotPocket installation
+
 SSH	0 / 1	SSH access
+
 FILEGATOR	0 / 1	File manager
+
 KOPIA	0 / 1	Kopia backup system
+
 SQLBACKUP	0 / 1	Scheduled database backups
+
 REPLICATION	0 / 1	Remote backup replication
+
 MIGRATION	0 / 1	WordPress migration
+
 EXTERNAL	0 / 1	External installers
+
 LOCAL	0 / 1	Use bundled installation files
+
 CLEANUP	0 / 1	Allow installer removal
 
 example:
