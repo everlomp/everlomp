@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Export only supported installer choices, not the container environment."""
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+DEST = Path('/run/everlomp/installer-config.json')
+OPTIONS = ('ENCRYPTION', 'HOTPOCKET', 'SSH', 'FILEGATOR', 'KOPIA',
+           'SQLBACKUP', 'REPLICATION', 'MIGRATION', 'EXTERNAL', 'LOCAL', 'CLEANUP')
+
+
+def parse(env):
+    result = {}
+    app = env.get('APP', '').strip().lower()
+    if app:
+        if app not in ('wordpress', 'drupal', 'phpbb', 'none'):
+            raise ValueError('APP must be wordpress, drupal, phpbb or none')
+        result['APP'] = app
+    for name in OPTIONS:
+        value = env.get(name, '').strip()
+        if not value:
+            continue
+        if value not in ('0', '1'):
+            raise ValueError(f'{name} must be 0 or 1')
+        result[name] = int(value)
+    if result.get('KOPIA') == 0 and result.get('REPLICATION') == 1:
+        raise ValueError('REPLICATION=1 requires KOPIA not to be 0')
+    return result
+
+
+def write_config(path, config):
+    fd, temp = tempfile.mkstemp(prefix='.installer-config-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            json.dump(config, out, indent=2, sort_keys=True)
+            out.write('\n')
+            out.flush()
+            os.fchmod(out.fileno(), 0o644)
+            os.fsync(out.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+if __name__ == '__main__':
+    try:
+        write_config(DEST, parse(os.environ))
+    except (ValueError, OSError) as exc:
+        print(f'[Everlomp installer] {exc}', file=sys.stderr)
+        sys.exit(1)
