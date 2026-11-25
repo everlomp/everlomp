@@ -706,6 +706,9 @@ RUN mkdir -p \
 
 COPY everlomp/index.php /var/www/html/index.php
 COPY everlomp/lompinstaller.php /var/www/html/lompinstaller.php
+COPY everlomp/everlomp-installer-env /usr/local/sbin/everlomp-installer-env
+COPY everlomp/everlomp-installer-config.php /usr/local/lib/everlomp-installer-config.php
+RUN chmod 0755 /usr/local/sbin/everlomp-installer-env && chmod 0644 /usr/local/lib/everlomp-installer-config.php
 
 COPY everlomp/terms.md /home/everlomp/terms.md
 COPY everlomp/everlomp-drupal /usr/local/sbin/everlomp-drupal
@@ -717,6 +720,24 @@ COPY everlomp/everlomp-phpbb /usr/local/sbin/everlomp-phpbb
 COPY everlomp/everlomp-external-installer /usr/local/sbin/everlomp-external-installer
 COPY everlomp/everlomp-bruteforce-guard /usr/local/sbin/everlomp-bruteforce-guard
 COPY everlomp/everlomp-delete-installfile /usr/local/sbin/everlomp-delete-installfile
+# APP=none permits normal installer cleanup without a primary app marker.
+# Fail the build if the upstream cleanup helper's expected structure changes.
+RUN python3 - <<'PYINSTALLERCLEANUP'
+from pathlib import Path
+p = Path('/usr/local/sbin/everlomp-delete-installfile')
+s = p.read_text()
+a = '    if [ ! -f "$PRIMARY_APP_FILE" ]; then'
+b = '    wordpress|drupal|phpbb)'
+assert s.count(a) == 1 and s.count(b) == 1, 'Unexpected cleanup helper version'
+s = s.replace(a, a + """
+        if [ -f "$STATE_DIR/database.configured" ] && [ -f "$STATE_DIR/lsws-password.configured" ] &&
+            python3 -c 'import json; import sys; sys.exit(json.load(open("/run/everlomp/installer-config.json")).get("APP") != "none")'; then
+            printf 'none\\n'
+            return 0
+        fi""", 1)
+s = s.replace(b, '    wordpress|drupal|phpbb|none)', 1)
+p.write_text(s)
+PYINSTALLERCLEANUP
 COPY everlomp/everlomp-realip /usr/local/sbin/everlomp-realip
 COPY everlomp/everlomp-hotpocket /usr/local/sbin/everlomp-hotpocket
 COPY everlomp/everlomp-ssh /usr/local/sbin/everlomp-ssh
