@@ -1,13 +1,15 @@
 #!/bin/bash
 # folders that need to persist: /home /var/www /var/lib/mysql /usr/local/lsws secrets used: key and 2fa
-# --vol1--var___www--vol2--var___lib___mysql--vol3--usr___local___lsws--sec1--2fa
+# everlomp/everlomp:latest--vol1--var___www--vol2--var___lib___mysql--vol3--usr___local___lsws--sec1--2fa
 # support https://discord.gg/DAQszjKEBV (Evernode Community Discord)
+# example how to read password Kopia sudo /usr/local/sbin/everlomp-secret read   /home/everlomp/secrets/kopia/webui.password
 
 set -e
-
 source /contract/env.vars
+export APP ENCRYPTION HOTPOCKET SSH FILEGATOR KOPIA SQLBACKUP REPLICATION MIGRATION EXTERNAL LOCAL CLEANUP
 
 install -d -o root -g nogroup -m 0750 /run/everlomp
+/usr/local/sbin/everlomp-installer-env
 install -d -o root -g nogroup -m 0750 /var/www/.everlomp
 openssl rand -hex 16 > /run/everlomp/instance-id
 chmod 0600 /run/everlomp/instance-id
@@ -564,6 +566,43 @@ echo "[OpenLiteSpeed] Site:         https://ANY-DOMAIN:${EXTERNAL_GPTCP1_PORT}/"
 echo "[OpenLiteSpeed] Everlomp:     https://ANY-DOMAIN:${EXTERNAL_GPTCP1_PORT}/install.php"
 echo "[OpenLiteSpeed] phpMyAdmin:   https://ANY-DOMAIN:${EXTERNAL_GPTCP1_PORT}/phpmyadmin/"
 echo "[OpenLiteSpeed] WebAdmin:     https://ANY-DOMAIN:${EXTERNAL_GPTCP1_PORT}/openlitespeed/"
+
+# OpenLiteSpeed 1.9.4+ requires explicit WebAdmin enablement.
+# The existing Nginx adapter connects to 127.0.0.1:7080. Bind the
+# admin listener there before enabling it, rather than exposing port 7080.
+# This runs on every boot because /usr/local/lsws may be a persistent volume.
+if python3 - /usr/local/lsws/admin/conf <<'PYWEBADMIN'
+from pathlib import Path
+import os
+import re
+import sys
+
+admin = Path(sys.argv[1])
+conf = admin / 'admin_config.conf'
+flag = admin / 'enable_webadmin'
+text = conf.read_text()
+# The packaged plain-text admin config has one listener address directive.
+# Do not guess at custom/multiple listener configurations.
+pattern = re.compile(r'(?m)^([ \t]*address[ \t]+)([^\s#]+)([ \t]*(?:#[^\r\n]*)?)(?=\r?$)', re.IGNORECASE)
+matches = list(pattern.finditer(text))
+if len(matches) != 1 or not matches[0].group(2).endswith(':7080'):
+    raise SystemExit('Unexpected WebAdmin listener configuration; refusing automatic enablement.')
+match = matches[0]
+updated = text[:match.start(2)] + '127.0.0.1:7080' + text[match.end(2):]
+if updated != text:
+    # Keep the existing config's ownership and permissions.
+    conf.write_text(updated)
+# Keep any administrator-supplied ACL. New installations need no IP ACL
+# here: the socket is loopback-only, and forwarded visitor IPs may be used.
+if not flag.exists():
+    fd = os.open(flag, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    os.close(fd)
+PYWEBADMIN
+then
+    echo "[OpenLiteSpeed] WebAdmin enabled via the local reverse proxy."
+else
+    echo "[OpenLiteSpeed] WARNING: could not automatically enable WebAdmin; check admin listener configuration." >&2
+fi
 
 exec /usr/bin/supervisord \
     -c "$SUPERVISOR_CONF"
