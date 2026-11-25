@@ -5,6 +5,32 @@ if (session_status() !== PHP_SESSION_ACTIVE) {
     session_start();
 }
 
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET' && isset($_GET['_realip_check'])) {
+    header('Cache-Control: private, no-store, max-age=0');
+}
+
+require_once '/usr/local/lib/everlomp-installer-config.php';
+try {
+    $deployment = everlompInstallerConfig();
+} catch (Throwable $e) {
+    http_response_code(503);
+    exit('Installer deployment configuration is unavailable. Check container startup logs.');
+}
+function deploymentChoice(string $name): ?int {
+    global $deployment;
+    return everlompInstallerChoice($deployment, $name);
+}
+function deploymentAllowsApp(string $app): bool {
+    global $deployment;
+    return everlompInstallerAllowsApp($deployment, $app);
+}
+function deploymentReject(string $message): never {
+    http_response_code(403);
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo json_encode(['ok'=>false, 'message'=>$message]);
+    exit;
+}
 $databaseConfiguredFile = '/var/www/.everlomp/database.configured';
 $databaseAdminUserFile  = '/var/www/.everlomp/database-admin-user';
 $lswsPasswordConfiguredFile = '/var/www/.everlomp/lsws-password.configured';
@@ -619,6 +645,55 @@ function readEverlompKeyStatus(): array
     ];
 }
 
+// Deployment policy is enforced on the server, including direct POSTs.
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $requestedAction = (string) ($_POST['action'] ?? '');
+    $appActions = ['install_wordpress'=>'wordpress', 'migrate_wordpress'=>'wordpress',
+        'wordpress_migration_upload_chunk'=>'wordpress', 'wordpress_migration_analyze'=>'wordpress',
+        'install_drupal'=>'drupal', 'install_phpbb'=>'phpbb',
+        'configure_hotpocket_site'=>'hotpocket-folder', 'install_external'=>'external:' . (string) ($_POST['external_package_id'] ?? '')];
+    if ($requestedAction === 'install_wordpress' && deploymentChoice('MIGRATION') === 1) deploymentReject('Migration is required by deployment configuration.');
+    if (isset($appActions[$requestedAction]) && !deploymentAllowsApp($appActions[$requestedAction])) {
+        deploymentReject('This application is not available in this deployment.');
+    }
+    $groups = [
+        'HOTPOCKET'=>['enable_hotpocket','add_listenerurl','hotpocket_config_read','hotpocket_config_write','configure_hotpocket_site'],
+        'SSH'=>['enable_ssh'], 'FILEGATOR'=>['install_filegator'],
+        'KOPIA'=>['configure_kopia','prepare_kopia_build','save_kopia_update_settings','save_kopia_offsite_settings','sync_kopia_offsite_now','test_kopia_offsite_connection','fetch_kopia_sftp_host_key','setup_kopia_sftp_access'],
+        'SQLBACKUP'=>['save_sql_backup_settings','run_sql_backup'],
+        'REPLICATION'=>['save_kopia_offsite_settings','sync_kopia_offsite_now','test_kopia_offsite_connection','fetch_kopia_sftp_host_key','setup_kopia_sftp_access'],
+        'MIGRATION'=>['migrate_wordpress','wordpress_migration_upload_chunk','wordpress_migration_analyze'],
+        'EXTERNAL'=>['import_external_installer','remove_external_installer','install_external'],
+    ];
+    foreach ($groups as $option=>$actions) {
+        if (deploymentChoice($option) === 0 && in_array($requestedAction,$actions,true)) deploymentReject($option . ' is disabled by deployment configuration.');
+    }
+    if (isset($deployment['APP']) && in_array($requestedAction,['import_external_installer','remove_external_installer'],true)) deploymentReject('Application is predefined.');
+    if ($requestedAction === 'disable_ssh' && deploymentChoice('SSH') !== null) deploymentReject('SSH is predefined.');
+    if ($requestedAction === 'key_set_mode' && deploymentChoice('ENCRYPTION') !== null) {
+        $desired = deploymentChoice('ENCRYPTION');
+        $mode = (string) ($_POST['mode'] ?? '');
+        $existingKey = readEverlompKeyStatus();
+        $existingMode = (string) ($existingKey['mode'] ?? 'undecided');
+        if (in_array($existingMode,['enabled','disabled'],true) && $mode !== $existingMode) deploymentReject('Existing encryption mode is preserved.');
+        if (($desired === 0 && $mode !== 'disabled' && !($existingMode === 'pending' && $mode === 'enabled') && !($existingMode === 'enabled' && $mode === 'enabled')) || ($desired === 1 && !in_array($mode,['enabled','pending'],true))) deploymentReject('Encryption is predefined.');
+    }
+    if ($requestedAction === 'key_replace_task' && deploymentChoice('ENCRYPTION') === 0 && !in_array((string)(readEverlompKeyStatus()['mode'] ?? ''),['enabled','pending'],true)) deploymentReject('Encryption setup is disabled.');
+    if ($requestedAction === 'configure_kopia' && deploymentChoice('REPLICATION') !== null) $_POST['kopia_offsite_enabled'] = (string) deploymentChoice('REPLICATION');
+    if ($requestedAction === 'save_sql_backup_settings' && deploymentChoice('SQLBACKUP') === 1) $_POST['sql_enabled'] = '1';
+    if (deploymentChoice('LOCAL') !== null) {
+        $local = deploymentChoice('LOCAL') === 1;
+        if (in_array($requestedAction,['install_wordpress','install_phpbb'],true)) $_POST['local_file_only'] = $local ? '1' : '0';
+        if ($requestedAction === 'install_wordpress' && $local) {
+            $_POST['wp_theme_install_local'] = $_POST['wp_themes'] ?? [];
+            $_POST['wp_plugin_install_local'] = $_POST['wp_plugins'] ?? [];
+        }
+        if ($requestedAction === 'install_drupal') $_POST['drupal_installer_source'] = $local ? 'local' : 'standard';
+        if ($requestedAction === 'install_filegator') $_POST['filegator_source'] = $local ? 'local' : 'remote';
+        if ($requestedAction === 'configure_kopia') $_POST['kopia_install_local_version'] = $local ? '1' : '0';
+    }
+    if ($requestedAction === 'delete_everlomp_installfile' && deploymentChoice('CLEANUP') === 0) deploymentReject('Installer cleanup is disabled.');
+}
 if ($_SERVER['REQUEST_METHOD'] === 'GET' && (string) ($_GET['key_status'] ?? '') === '1') {
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store, max-age=0');
@@ -725,7 +800,7 @@ $keyValid = (($keyStatus['key_valid'] ?? false) === true);
 // browser marker is a fallback for deployments where that state directory is
 // task-local. A browser that never entered the wait flow still gets the normal
 // "Use mounted key" choice.
-$keyWaitCompletedByBrowser = ((string) ($_COOKIE['everlomp_key_wait'] ?? '')) === '1';
+$keyWaitCompletedByBrowser = deploymentChoice('ENCRYPTION') !== 0 && ((string) ($_COOKIE['everlomp_key_wait'] ?? '')) === '1';
 if ($keyWaitCompletedByBrowser && $keyValid && in_array($keyMode, ['undecided', 'pending'], true)) {
     [$autoEnableCode] = runEverlompHelper(
         '/usr/local/sbin/everlomp-key',
@@ -748,10 +823,22 @@ if ($keyWaitCompletedByBrowser && $keyMode === 'enabled' && $keyValid) {
     ]);
 }
 
+// Apply an explicit choice only to a fresh, undecided encryption state.
+if ($keyMode === 'undecided' && ($keyStatus['ok'] ?? false) === true && !is_file($databaseConfiguredFile) && !is_file($lswsPasswordConfiguredFile) && !is_file($primaryAppFile) && !is_file('/home/everlomp/kopia/enabled')) {
+    $desiredMode = deploymentChoice('ENCRYPTION') === 0 ? 'disabled'
+        : (deploymentChoice('ENCRYPTION') === 1 && $keyValid ? 'enabled' : null);
+    if ($desiredMode !== null) {
+        [$deploymentKeyCode] = runEverlompHelper('/usr/local/sbin/everlomp-key','set-mode',$desiredMode . "\n");
+        $keyStatus = readEverlompKeyStatus();
+        $keyMode = (string) ($keyStatus['mode'] ?? 'undecided');
+        $keyValid = (($keyStatus['key_valid'] ?? false) === true);
+    }
+}
 $keyReadyForInstaller = $keyMode === 'disabled' || ($keyMode === 'enabled' && $keyValid);
 $keyGateRequired = !$keyReadyForInstaller;
 
 if ((string) ($_GET['download'] ?? '') === 'external-installer-example') {
+    if (deploymentChoice('EXTERNAL') === 0 || isset($deployment['APP'])) deploymentReject('External installers are unavailable.');
     if (!is_readable($externalInstallerExampleFile) || !is_file($externalInstallerExampleFile)) {
         http_response_code(404);
         header('Content-Type: text/plain; charset=utf-8');
@@ -837,8 +924,9 @@ $filegatorInstalled = is_file($filegatorIndexFile);
 $filegatorInfo = readJsonFile($filegatorInfoFile);
 $backupInfo = readJsonFile($backupInfoFile);
 $sshDecision = readTextFile($sshConfiguredFile);
-$sshDecisionMade = in_array($sshDecision, ['enabled', 'disabled'], true);
+$sshDecisionMade = in_array($sshDecision, ['enabled', 'disabled'], true) || deploymentChoice('SSH') === 0;
 $sshEnabled = $sshDecision === 'enabled';
+if (deploymentChoice('SSH') === 1 && !$sshEnabled) $sshDecisionMade = false;
 $sshPublicPort = readContractPort($contractEnvFile, 'EXTERNAL_GPTCP2_PORT');
 $sshHostDomain = readContractValue($contractEnvFile, 'HOST_DOMAIN_ADDRESS');
 $sshMappingReady = $sshPublicPort !== '' && $sshHostDomain !== '';
@@ -858,9 +946,11 @@ $realIpFailedProxy = readTextFile($realIpFailedFile);
 $requestPeerIp = trim((string) ($_SERVER['REMOTE_ADDR'] ?? ''));
 $forwardedClientIp = firstForwardedIp();
 
+// Do not restart OpenLiteSpeed repeatedly if forwarding still fails after
+// the first automatic attempt (including when its HTTP response was lost).
 $realIpAutoFailed = (
-    $realIpFailedProxy !== ''
-    && hash_equals($realIpFailedProxy, $requestPeerIp)
+    ($realIpFailedProxy !== '' && hash_equals($realIpFailedProxy, $requestPeerIp))
+    || ($requestPeerIp !== '' && (($_SESSION['everlomp_realip_attempt_peer'] ?? '') === $requestPeerIp))
 );
 
 $realIpReady = (
@@ -959,6 +1049,7 @@ if (
     $_SERVER['REQUEST_METHOD'] === 'GET'
     && (string) ($_GET['download'] ?? '') === 'hotpocket-contract'
 ) {
+    if (deploymentChoice('HOTPOCKET') === 0) deploymentReject('HotPocket is disabled.');
     $name = trim((string) ($_GET['name'] ?? ''));
 
     // Only allow normal ZIP filenames.
@@ -1028,7 +1119,7 @@ $hotpocketSiteSubfolder = $_SERVER['REQUEST_METHOD'] === 'POST' && (string) ($_P
     ? trim((string) ($_POST['hotpocket_site_subfolder'] ?? ''))
     : trim((string) ($hotpocketSiteInfo['subfolder'] ?? ''));
 $hotpocketSiteDirectories = ['state' => [], 'seed' => []];
-if ($primaryApp === '' || $hotpocketSiteSelected) {
+if (deploymentAllowsApp('hotpocket-folder') && ($primaryApp === '' || $hotpocketSiteSelected)) {
     [$siteDirsCode, $siteDirsStdout] = runEverlompHelper('/usr/local/sbin/everlomp-hotpocket', 'list-site-dirs');
     if ($siteDirsCode === 0 && $siteDirsStdout !== '') {
         $siteDirsDecoded = json_decode($siteDirsStdout, true);
@@ -1085,8 +1176,8 @@ if (($_GET['external'] ?? '') === 'installed') {
     $message = 'External application installed successfully.';
 }
 
-if (($_GET['realip'] ?? '') === 'configured') {
-    $message = 'Real client IP forwarding configured successfully.';
+if (($_GET['realip'] ?? '') === 'configured' && $realIpReady) {
+    $message = 'Real client IP forwarding verified successfully.';
 }
 
 if (($_GET['hotpocket_site'] ?? '') === 'configured') {
@@ -1102,11 +1193,18 @@ if (($_GET['hotpocket'] ?? '') === 'enabled') {
 if (
     $_SERVER['REQUEST_METHOD'] === 'GET'
     && $termsAccepted
+    && $keyReadyForInstaller
+    && $domainOnlyReady
     && !$realIpReady
     && !$realIpAutoFailed
     && $realIpCanConfigure
+    && !isset($_GET['install']) && !isset($_GET['view'])
     && (($_GET['realip'] ?? '') !== 'configured')
 ) {
+    // Commit the attempt before restarting the server. A dropped HTTP
+    // connection must not cause the next GET to restart it again.
+    $_SESSION['everlomp_realip_attempt_peer'] = $requestPeerIp;
+    session_write_close();
     [$code, $stdout, $stderr] = runEverlompHelper(
         '/usr/local/sbin/everlomp-realip',
         'configure',
@@ -1122,7 +1220,7 @@ if (
         ? $stderr
         : ($stdout !== '' ? $stdout : 'Automatic real-IP configuration failed.');
 
-    $error .= "\nEverlomp will not automatically retry this same proxy peer. Use Retry Real IP below after fixing the problem.";
+    $error .= "\nEverlomp will not automatically retry this same proxy peer. Use Retry Real IP in the web server step after fixing the problem.";
     $realIpAutoFailed = true;
 }
 
@@ -1595,9 +1693,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'configure_real_ip') {
-        if (!$realIpCanConfigure) {
-            $error = 'Could not safely detect both an internal proxy peer and a public forwarded client IP.';
+        if ($realIpReady) {
+            $message = 'Real client IP forwarding is already active.';
+        } elseif (!$domainOnlyReady || !$realIpCanConfigure) {
+            $error = 'Open the final HTTPS domain and ensure the proxy supplies a usable forwarded client IP.';
         } else {
+            $_SESSION['everlomp_realip_attempt_peer'] = $requestPeerIp;
+            session_write_close();
             [$code, $stdout, $stderr] = runEverlompHelper(
                 '/usr/local/sbin/everlomp-realip',
                 'configure',
@@ -2290,7 +2392,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'enable_ssh') {
-        if ($primaryApp === '') {
+        if ($primaryApp === '' && ($deployment['APP'] ?? '') !== 'none') {
             $error = 'Install a primary application before enabling SSH.';
         } else {
             [$code, $stdout, $stderr] = runEverlompHelper(
@@ -2313,7 +2415,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'disable_ssh') {
-        if ($primaryApp === '') {
+        if ($primaryApp === '' && ($deployment['APP'] ?? '') !== 'none') {
             $error = 'Install a primary application before completing the SSH choice.';
         } else {
             [$code, $stdout, $stderr] = runEverlompHelper(
@@ -2332,10 +2434,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'delete_everlomp_installfile') {
-        if ($primaryApp === '') {
+        if ($primaryApp === '' && ($deployment['APP'] ?? '') !== 'none') {
             $error = 'Install a primary application before deleting the Everlomp install page.';
         } elseif (!$sshDecisionMade) {
             $error = 'Choose whether SSH should be enabled before removing the Everlomp installer.';
+        } elseif ($deployment !== [] && (!$databaseConfigured || !$lswsPasswordConfigured || !$realIpReady || !$domainOnlyReady ||
+            (deploymentChoice('FILEGATOR') === 1 && !$filegatorInstalled) ||
+            (deploymentChoice('HOTPOCKET') === 1 && !$hotpocketEnabled) ||
+            ((deploymentChoice('KOPIA') === 1 || deploymentChoice('REPLICATION') === 1) && !$kopiaConfigured) ||
+            (deploymentChoice('SQLBACKUP') === 1 && empty($backupInfo['sql_enabled'])))) {
+            $error = 'Complete all required deployment settings before removing the installer.';
         } else {
             // A HotPocket-folder website must stay on the normal Everlomp document
             // root until this exact final step, otherwise /lompinstaller.php becomes
@@ -3089,8 +3197,9 @@ $filegatorInstalled = is_file($filegatorIndexFile);
 $filegatorInfo = readJsonFile($filegatorInfoFile);
 $backupInfo = readJsonFile($backupInfoFile);
 $sshDecision = readTextFile($sshConfiguredFile);
-$sshDecisionMade = in_array($sshDecision, ['enabled', 'disabled'], true);
+$sshDecisionMade = in_array($sshDecision, ['enabled', 'disabled'], true) || deploymentChoice('SSH') === 0;
 $sshEnabled = $sshDecision === 'enabled';
+if (deploymentChoice('SSH') === 1 && !$sshEnabled) $sshDecisionMade = false;
 $sshPublicPort = readContractPort($contractEnvFile, 'EXTERNAL_GPTCP2_PORT');
 $sshHostDomain = readContractValue($contractEnvFile, 'HOST_DOMAIN_ADDRESS');
 $sshMappingReady = $sshPublicPort !== '' && $sshHostDomain !== '';
@@ -3101,16 +3210,18 @@ $sshMappingReady = $sshPublicPort !== '' && $sshHostDomain !== '';
 );
 $kopiaBuildToolsReady = kopiaBuildToolsReady();
 $kopiaUrl = '/kopia/';
-$primaryAppDisplay = $hotpocketSiteSelected ? 'HotPocket folder website' : $primaryApp;
+$primaryAppDisplay = $hotpocketSiteSelected ? 'HotPocket folder website' : ($primaryApp === '' && ($deployment['APP'] ?? '') === 'none' ? 'No application (web hosting)' : $primaryApp);
 
 $realIpTrustedProxy = readTextFile($realIpProxyFile);
 $realIpFailedProxy = readTextFile($realIpFailedFile);
 $requestPeerIp = trim((string) ($_SERVER['REMOTE_ADDR'] ?? ''));
 $forwardedClientIp = firstForwardedIp();
 
+// Do not restart OpenLiteSpeed repeatedly if forwarding still fails after
+// the first automatic attempt (including when its HTTP response was lost).
 $realIpAutoFailed = (
-    $realIpFailedProxy !== ''
-    && hash_equals($realIpFailedProxy, $requestPeerIp)
+    ($realIpFailedProxy !== '' && hash_equals($realIpFailedProxy, $requestPeerIp))
+    || ($requestPeerIp !== '' && (($_SESSION['everlomp_realip_attempt_peer'] ?? '') === $requestPeerIp))
 );
 
 $realIpReady = (
@@ -3124,6 +3235,7 @@ $realIpCanConfigure = (
 );
 
 $view = (string) ($_GET['install'] ?? '');
+if ($view !== '' && !deploymentAllowsApp($view)) deploymentReject('This application is not available in this deployment.');
 $showBackupManager = (string) ($_GET['view'] ?? '') === 'backup';
 $showWordPressInstaller = (
     $view === 'wordpress'
@@ -3157,6 +3269,15 @@ $showExternalInstaller = (
     && $primaryApp === ''
 );
 
+$wizardSteps = [1=>'Terms',2=>'Database',3=>'OpenLiteSpeed',4=>'File manager',5=>'Applications',6=>'HotPocket',7=>'Backups',8=>'SSH',9=>'Finish'];
+if (deploymentChoice('FILEGATOR') === 0) unset($wizardSteps[4]);
+if (($deployment['APP'] ?? '') === 'none' && $primaryApp === '') unset($wizardSteps[5]);
+elseif (isset($deployment['APP']) && $deployment['APP'] !== 'none') $wizardSteps[5] = $deployment['APP'] === 'phpbb' ? 'phpBB' : ucfirst($deployment['APP']);
+if (deploymentChoice('HOTPOCKET') === 0) unset($wizardSteps[6]);
+if (deploymentChoice('KOPIA') === 0 && deploymentChoice('SQLBACKUP') === 0) unset($wizardSteps[7]);
+if (deploymentChoice('SSH') === 0) unset($wizardSteps[8]);
+$wizardStepIds = array_keys($wizardSteps);
+$wizardStepNumbers = array_flip($wizardStepIds);
 $wizardSuggestedStep = 1;
 if ($termsAccepted) $wizardSuggestedStep = 2;
 if ($termsAccepted && $databaseConfigured) $wizardSuggestedStep = 3;
@@ -3164,7 +3285,7 @@ if ($termsAccepted && $databaseConfigured && $lswsPasswordConfigured && $realIpR
 if ($filegatorInstalled) $wizardSuggestedStep = max($wizardSuggestedStep, 5);
 if ($primaryApp !== '') $wizardSuggestedStep = max($wizardSuggestedStep, 6);
 if ($hotpocketEnabled) $wizardSuggestedStep = max($wizardSuggestedStep, 7);
-if ($sshDecisionMade) $wizardSuggestedStep = max($wizardSuggestedStep, 9);
+if ($sshDecisionMade && (deploymentChoice('SSH') !== 0 || $sshDecision !== '')) $wizardSuggestedStep = max($wizardSuggestedStep, 9);
 ?>
 <!doctype html>
 <html lang="en">
@@ -3220,18 +3341,18 @@ form{display:grid;gap:14px;margin-top:20px}label{display:grid;gap:7px;font-size:
 <div id="key-wait-ready" class="key-wait-item"><span>○</span><span>Waiting for Everlomp services</span></div>
 </div>
 <div id="key-gate-runtime-error" class="key-gate-error hidden"></div>
-<div class="wizard-actions"><button type="button" class="secondary" onclick="disableEverlompKeyMode()">Continue without encryption instead</button></div>
+<div class="wizard-actions"><button type="button" class="secondary" <?= deploymentChoice('ENCRYPTION') === 1 ? 'style="display:none"' : '' ?> onclick="disableEverlompKeyMode()">Continue without encryption instead</button></div>
 
 <?php else: ?>
 <p>Everlomp can keep recoverable credentials encrypted on persistent storage. The encryption key itself stays in Docker Swarm at <code>/run/secrets/key</code> and is never stored by Everlomp.</p>
 <p class="meta">After a Swarm task replacement, Everlomp reconstructs task-local service state such as the SSH password hash/port and runtime-built Kopia executable from persistent state.</p>
 <?php if ($keyValid): ?>
 <div class="wizard-callout good"><div class="wizard-callout-icon">✓</div><div><strong>A valid key is already mounted.</strong><br>Fingerprint: <span class="key-fingerprint"><?= h((string) ($keyStatus['key_fingerprint'] ?? '')) ?></span>. You can enable encryption immediately without another restart.</div></div>
-<div class="wizard-actions"><button type="button" onclick="enableMountedEverlompKey()">Use mounted key</button><button type="button" class="secondary" onclick="disableEverlompKeyMode()">Continue without encryption</button></div>
+<div class="wizard-actions"><button type="button" onclick="enableMountedEverlompKey()">Use mounted key</button><button type="button" class="secondary" <?= deploymentChoice('ENCRYPTION') === 1 ? 'style="display:none"' : '' ?> onclick="disableEverlompKeyMode()">Continue without encryption</button></div>
 <?php else: ?>
 <div class="key-gate-choice">
 <div class="key-gate-option recommended"><span class="choice-badge">Recommended</span><h3>Use encryption key</h3><p>Generate a fresh 256-bit key or paste the key from an existing Everlomp installation. You will copy it and set the <code>key</code> secret in Evernode yourself.</p><button type="button" onclick="prepareEverlompKeyMode()">Use encryption</button></div>
-<div class="key-gate-option"><span class="choice-badge">Plaintext compatibility</span><h3>Continue without key</h3><p>Passwords that must remain recoverable may be stored as root-only plaintext files. Login passwords that can be hashed remain hash-only.</p><button type="button" class="secondary" onclick="disableEverlompKeyMode()">No encryption key</button></div>
+<div class="key-gate-option"><span class="choice-badge">Plaintext compatibility</span><h3>Continue without key</h3><p>Passwords that must remain recoverable may be stored as root-only plaintext files. Login passwords that can be hashed remain hash-only.</p><button type="button" class="secondary" <?= deploymentChoice('ENCRYPTION') === 1 ? 'style="display:none"' : '' ?> onclick="disableEverlompKeyMode()">No encryption key</button></div>
 </div>
 <div id="key-entry-panel" class="hidden" style="margin-top:22px">
 <div class="wizard-divider"></div>
@@ -3241,7 +3362,7 @@ form{display:grid;gap:14px;margin-top:20px}label{display:grid;gap:7px;font-size:
 <div class="wizard-actions"><button type="button" onclick="generateEverlompKey()">Generate new 256-bit key</button><button id="everlomp-key-toggle" type="button" class="secondary" onclick="toggleEverlompKeyVisibility()">Show key</button></div>
 <div id="key-entry-error" class="key-gate-error hidden"></div>
 <div class="key-gate-note" style="margin-top:14px"><strong>Restoring?</strong> Paste the same key used by the original installation. A different key cannot decrypt its saved credentials.</div>
-<div class="wizard-actions"><button type="button" onclick="beginEverlompRestartWait()">I copied it — start waiting</button><button type="button" class="secondary" onclick="disableEverlompKeyMode()">Cancel and continue without encryption</button></div>
+<div class="wizard-actions"><button type="button" onclick="beginEverlompRestartWait()">I copied it — start waiting</button><button type="button" class="secondary" <?= deploymentChoice('ENCRYPTION') === 1 ? 'style="display:none"' : '' ?> onclick="disableEverlompKeyMode()">Cancel and continue without encryption</button></div>
 </div>
 <?php endif; ?>
 <?php endif; ?>
@@ -3259,6 +3380,7 @@ form{display:grid;gap:14px;margin-top:20px}label{display:grid;gap:7px;font-size:
 <?php if ($error !== ''): ?><div class="notice error"><?= h($error) ?></div><?php endif; ?>
 
 <div class="grid">
+<?php if (deploymentChoice('KOPIA') !== 0): ?>
 <section class="card full">
 <?php if ($kopiaConfigured): ?>
 <div class="status good">● Kopia configured</div>
@@ -3339,8 +3461,9 @@ form{display:grid;gap:14px;margin-top:20px}label{display:grid;gap:7px;font-size:
 
 <div class="warning"><strong>Using Kopia UI for the primary?</strong> Everlomp starts Kopia disconnected. Create/connect the repository from <strong>Kopia → Repository</strong>; the custom UI automatically stores the encryption password <?= $keyMode === 'enabled' ? 'encrypted at rest with /run/secrets/key' : 'root-only' ?> for service restarts and scheduled replication. Default snapshot bootstrap above is available only when the local primary repository is created during installation.</div>
 
+<?php if (deploymentChoice('REPLICATION') !== 0): ?>
 <h3>Optional initial replica</h3>
-<label class="inline-check"><input id="kopia-offsite-enabled" type="checkbox" name="kopia_offsite_enabled" value="1" onchange="toggleKopiaOffsite()"><span><strong>Add the first secondary repository replica during installation</strong><br><small>This is saved into the new <strong>Kopia → Replication</strong> tab. You can add, edit, test, sync, or remove replicas there later even after the Everlomp installer is deleted.</small></span></label>
+<label class="inline-check"><input id="kopia-offsite-enabled" type="checkbox" name="kopia_offsite_enabled" value="1" <?= deploymentChoice('REPLICATION') === 1 ? 'checked' : '' ?> onchange="toggleKopiaOffsite()"><span><strong>Add the first secondary repository replica during installation</strong><br><small>This is saved into the new <strong>Kopia → Replication</strong> tab. You can add, edit, test, sync, or remove replicas there later even after the Everlomp installer is deleted.</small></span></label>
 <div id="kopia-offsite-fields" class="hidden">
 <div class="backup-grid">
 <label>Destination type
@@ -3437,6 +3560,7 @@ Use the backup account's current password once. Everlomp can change that remote 
 <div class="warning"><strong><?= $keyMode === 'enabled' ? 'Secrets are encrypted at rest.' : 'Secrets are stored root-only.' ?></strong> Replica credentials are kept under <code>/home/everlomp/secrets/kopia/replication/</code><?= $keyMode === 'enabled' ? ' as AES-256-GCM ciphertext protected by /run/secrets/key' : ' as root-only compatibility files' ?>. After installation, manage this destination from <strong>Kopia → Replication</strong>. Synchronization intentionally does not use Kopia's <code>--delete</code> option.</div>
 </div>
 
+<?php endif; ?>
 <div class="terms-agreements">
 <label class="terms-check"><input type="checkbox" name="accept_kopia_terms" value="1" required><span>I have read and agreed to the <a target="_blank" rel="noopener noreferrer" href="https://github.com/kopia/kopia/blob/master/LICENSE">terms and conditions of Kopia</a>.</span></label>
 <label class="terms-check"><input type="checkbox" name="accept_everlomp_terms" value="1" required><span>I have read and agreed to the <a target="_blank" rel="noopener noreferrer" href="#everlomp-installation-terms">terms and conditions for this app, visible on this installation page</a>.</span></label>
@@ -3459,7 +3583,7 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 <?php endif; ?>
 </section>
 
-<?php if ($kopiaConfigured): ?>
+<?php if ($kopiaConfigured && deploymentChoice('REPLICATION') !== 0): ?>
 <section class="card full">
 <div class="status good">● Kopia owns repository replication</div>
 <h3>Repository replication</h3>
@@ -3468,6 +3592,8 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 </section>
 <?php endif; ?>
 
+<?php endif; ?>
+<?php if (deploymentChoice('SQLBACKUP') !== 0): ?>
 <section class="card full">
 <div class="status <?= !empty($backupInfo['sql_enabled']) ? 'good' : 'warn' ?>">● SQL dump schedule <?= !empty($backupInfo['sql_enabled']) ? 'enabled' : 'disabled' ?></div>
 <h3>MariaDB logical backups</h3>
@@ -3479,7 +3605,7 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 </div>
 <form method="post">
 <input type="hidden" name="action" value="save_sql_backup_settings">
-<label class="inline-check"><input type="checkbox" name="sql_enabled" value="1" <?= !empty($backupInfo['sql_enabled']) ? 'checked' : '' ?>><span>Enable automatic SQL backup generation</span></label>
+<label class="inline-check"><input type="checkbox" name="sql_enabled" value="1" <?= deploymentChoice('SQLBACKUP') === 1 || !empty($backupInfo['sql_enabled']) ? 'checked' : '' ?>><span>Enable automatic SQL backup generation</span></label>
 <div class="backup-grid">
 <label>Schedule<select class="schedule-mode-select" name="sql_schedule" onchange="updateScheduleFields(this)">
 <?php $sqlSchedule = (string) ($backupInfo['sql_schedule'] ?? 'daily'); foreach (['hourly'=>'Hourly','every6h'=>'Every 6 hours','every12h'=>'Every 12 hours','daily'=>'Daily (every day)','weekly'=>'Weekly'] as $value=>$label): ?>
@@ -3495,8 +3621,9 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 </form>
 <form method="post"><input type="hidden" name="action" value="run_sql_backup"><div class="actions"><button type="submit" class="secondary">Run SQL Backup Now</button></div></form>
 </section>
+<?php endif; ?>
 
-<?php if ($kopiaConfigured): ?>
+<?php if ($kopiaConfigured && deploymentChoice('KOPIA') !== 0): ?>
 <section class="card full">
 <div class="status <?= !empty($backupInfo['kopia_auto_update']) ? 'good' : 'warn' ?>">● Automatic Kopia updates <?= !empty($backupInfo['kopia_auto_update']) ? 'enabled' : 'disabled' ?></div>
 <h3>Kopia source updates</h3>
@@ -3533,6 +3660,7 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 <?php if ($error !== ''): ?><div class="notice error"><?= h($error) ?></div><?php endif; ?>
 
 <div id="wordpress-installer-fragment">
+<?php if (deploymentChoice('MIGRATION') === null): ?>
 <section class="card full">
 <h3>What do you want to do?</h3>
 <div class="db-choice">
@@ -3547,7 +3675,8 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 </div>
 </section>
 
-<div id="wordpress-fresh-panel" class="<?= ((string) ($_POST['action'] ?? '')) === 'migrate_wordpress' ? 'hidden' : '' ?>">
+<?php endif; ?>
+<div id="wordpress-fresh-panel" class="<?= (deploymentChoice('MIGRATION') === 1 || ((string) ($_POST['action'] ?? '')) === 'migrate_wordpress') ? 'hidden' : '' ?>">
 <section class="card full">
 <form method="post" autocomplete="off">
 <input type="hidden" name="action" value="install_wordpress">
@@ -3628,7 +3757,8 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 </section>
 </div>
 
-<div id="wordpress-migration-panel" class="<?= ((string) ($_POST['action'] ?? '')) === 'migrate_wordpress' ? '' : 'hidden' ?>">
+<?php if (deploymentChoice('MIGRATION') !== 0): ?>
+<div id="wordpress-migration-panel" class="<?= (deploymentChoice('MIGRATION') === 1 || ((string) ($_POST['action'] ?? '')) === 'migrate_wordpress') ? '' : 'hidden' ?>">
 <section class="card full">
 <h3>Migrate an existing WordPress</h3>
 <p>The browser uploader sends <strong>8 MiB chunks</strong>, so a large backup does not require a 1 GiB PHP POST request. WordPress ZIP uploads are limited to 2 GiB compressed; SQL, SQL.GZ, or SQL.ZIP uploads are limited to 4 GiB.</p>
@@ -3680,6 +3810,7 @@ Primary repository: <code><?= h($kopiaGeneratedRepository !== '' ? $kopiaGenerat
 </form>
 </section>
 </div>
+<?php endif; ?>
 </div>
 
 <section class="card full terms-card" id="everlomp-installation-terms">
@@ -4017,6 +4148,9 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
 
 <div id="wizard-root" class="wizard-shell" data-wizard-root>
 <script id="wizard-state-json" type="application/json"><?= json_encode([
+    'deployment' => (object) $deployment,
+    'steps' => $wizardStepIds,
+    'sqlEnabled' => !empty($backupInfo['sql_enabled']),
     'terms' => $termsAccepted,
     'database' => $databaseConfigured,
     'openlitespeed' => $lswsPasswordConfigured,
@@ -4030,7 +4164,7 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
     'hotpocketConfigCsrf' => $hotpocketConfigCsrf,
     'kopia' => $kopiaConfigured,
     'publicKopiaUrl' => $kopiaDashboardUrl,
-    'backupScheduleConfigured' => array_key_exists('sql_schedule', $backupInfo),
+    'backupScheduleConfigured' => deploymentChoice('SQLBACKUP') === 0 || array_key_exists('sql_schedule', $backupInfo),
     'sshDecisionMade' => $sshDecisionMade,
     'sshEnabled' => $sshEnabled,
     'sshPort' => $sshPublicPort,
@@ -4050,22 +4184,22 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
         'External application' => $externalInstalledId !== '' ? $externalSiteUrl : '',
         'HotPocket folder website' => $hotpocketSiteSelected ? ($publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . '/' : '/') : '',
         'Kopia' => $kopiaConfigured ? $kopiaDashboardUrl : '',
-        'Kopia Replication' => $kopiaConfigured ? $kopiaReplicationDashboardUrl : '',
+        'Kopia Replication' => $kopiaConfigured && deploymentChoice('REPLICATION') !== 0 ? $kopiaReplicationDashboardUrl : '',
     ], static fn($value) => $value !== ''),
 ], JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?></script>
 
 <aside class="wizard-sidebar" aria-label="Installation steps">
 <div class="wizard-progress"><span id="wizard-progress-bar"></span></div>
 <nav class="wizard-nav" id="wizard-nav">
-<?php foreach ([1=>'Terms',2=>'Database',3=>'OpenLiteSpeed',4=>'File manager',5=>'Applications',6=>'HotPocket',7=>'Backups',8=>'SSH',9=>'Finish'] as $stepNo=>$stepLabel): ?>
-<button type="button" data-step="<?= $stepNo ?>" onclick="showWizardStep(<?= $stepNo ?>)"><span class="wizard-step-no"><?= $stepNo ?></span><span><?= h($stepLabel) ?></span><span class="wizard-check">✓</span></button>
+<?php foreach ($wizardSteps as $stepNo=>$stepLabel): ?>
+<button type="button" data-step="<?= $stepNo ?>" onclick="showWizardStep(<?= $stepNo ?>)"><span class="wizard-step-no"><?= $wizardStepNumbers[$stepNo]+1 ?></span><span><?= h($stepLabel) ?></span><span class="wizard-check">✓</span></button>
 <?php endforeach; ?>
 </nav>
 </aside>
 
 <main class="wizard-content">
 <section id="wizard-step-1" class="wizard-panel" data-step="1">
-<div class="wizard-kicker">Step 1 of 9 · Required</div>
+<div class="wizard-kicker">Step <?= ($wizardStepNumbers[1] ?? -1)+1 ?> of <?= count($wizardSteps) ?> · Required</div>
 <h2 class="wizard-title">Terms before anything else.</h2>
 <p class="wizard-lead">Read the installation terms in full. Until they are accepted, the server rejects setup and installation POST actions — this is enforced by PHP, not only by the wizard interface.</p>
 <div class="wizard-card">
@@ -4088,7 +4222,7 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
 </section>
 
 <section id="wizard-step-2" class="wizard-panel" data-step="2">
-<div class="wizard-kicker">Step 2 of 9 · Foundation</div>
+<div class="wizard-kicker">Step <?= ($wizardStepNumbers[2] ?? -1)+1 ?> of <?= count($wizardSteps) ?> · Foundation</div>
 <h2 class="wizard-title">Set up the database administrator.</h2>
 <p class="wizard-lead">WordPress and phpBB depend on this step. Everlomp saves the configured account state, while deliberately never writing the plaintext administrator password to its state files.</p>
 <div class="wizard-card">
@@ -4114,20 +4248,31 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
 </section>
 
 <section id="wizard-step-3" class="wizard-panel" data-step="3">
-<div class="wizard-kicker">Step 3 of 9 · Web server &amp; network identity</div>
+<div class="wizard-kicker">Step <?= ($wizardStepNumbers[3] ?? -1)+1 ?> of <?= count($wizardSteps) ?> · Web server &amp; network identity</div>
 <h2 class="wizard-title">Secure OpenLiteSpeed — and verify the real visitor IP.</h2>
 <p class="wizard-lead">This step has two mandatory checks: a saved OpenLiteSpeed WebAdmin credential and trustworthy real-client-IP forwarding from your proxy.</p>
 <div class="wizard-card">
-<div class="wizard-callout danger"><div class="wizard-callout-icon">!</div><div><strong>Real client IP must work.</strong><br>The anti-bruteforce system and other IP-based protections need the actual visitor IP. If OpenLiteSpeed only sees the reverse proxy/container address, those protections cannot reliably identify or block the attacking client.</div></div>
-<div class="wizard-callout" style="margin-top:12px"><div class="wizard-callout-icon">↗</div><div class="host-rule"><strong>Domain-only access rule:</strong><br>Run this website through <code>https://your-domain.tld</code>. Never use <code>your-domain.tld:PORT</code>, a raw IP address, or a port-qualified public URL for Everlomp.</div></div>
-<div class="wizard-status-row"><span class="wizard-pill <?= $domainOnlyReady ? 'good' : 'warn' ?>">Domain host: <?= $domainOnlyReady ? 'valid' : 'fix required' ?></span><span class="wizard-pill <?= $realIpReady ? 'good' : 'warn' ?>">Real client IP: <?= $realIpReady ? 'active' : 'not ready' ?></span><span class="wizard-pill <?= $lswsPasswordConfigured ? 'good' : 'warn' ?>">WebAdmin: <?= $lswsPasswordConfigured ? 'secured' : 'password required' ?></span></div>
-<div class="meta"><div>Current Host header: <strong><?= h($host !== '' ? $host : 'missing') ?></strong></div><div>Direct/request peer: <strong><?= h($requestPeerIp !== '' ? $requestPeerIp : 'unknown') ?></strong></div><div>Forwarded client header: <strong><?= h($forwardedClientIp !== '' ? $forwardedClientIp : 'missing') ?></strong></div><?php if ($realIpTrustedProxy !== ''): ?><div>Trusted proxy peer: <strong><?= h($realIpTrustedProxy) ?></strong></div><?php endif; ?></div>
-<?php if (!$domainOnlyReady): ?><div class="warning"><strong>Do not continue on this URL.</strong> Open Everlomp through its final HTTPS domain without an explicit port. Example: <code>https://example.com/lompinstaller.php</code>, not <code>https://example.com:8443/lompinstaller.php</code>.</div><?php endif; ?>
-<?php if (!$realIpReady): ?>
-<div class="wizard-divider"></div>
-<h3>Real client IP forwarding</h3>
-<?php if ($realIpCanConfigure): ?><p>Everlomp can see both the internal proxy peer and a public forwarded visitor IP. Apply the detected proxy now.</p><form method="post" class="wizard-ajax-form" data-step="3"><input type="hidden" name="action" value="configure_real_ip"><div class="wizard-actions"><button type="submit">Configure Real Client IP</button></div></form><?php else: ?><p>Your proxy is not currently supplying a usable public <code>X-Forwarded-For</code> or <code>X-Real-IP</code> value. Configure NPMplus/reverse proxy forwarding first, then recheck this step.</p><div class="wizard-actions"><button type="button" class="secondary" onclick="refreshWizardStep(3)">Recheck Network State</button></div><?php endif; ?>
+<div id="wizard-network-state" aria-live="polite">
+<?php if ($realIpReady): ?>
+<div class="wizard-callout good"><div class="wizard-callout-icon">✓</div><div><strong>Real client IP verified.</strong><br>Visitor IP forwarding is working.</div></div>
+<?php else: ?>
+<div id="wizard-realip-pending" class="wizard-lock"><span class="spinner-inline"></span>Automatically checking real client IP forwarding…</div>
+<div id="wizard-realip-failure" style="display:none">
+<div class="wizard-callout danger"><div class="wizard-callout-icon">!</div><div><strong>Real client IP is not verified.</strong><br>Installation cannot continue until the server sees the actual visitor IP. Check the reverse proxy settings and retry.</div></div>
+<?php if (!$realIpReady || !$domainOnlyReady): ?><div class="meta"><div>Current Host header: <strong><?= h($host !== '' ? $host : 'missing') ?></strong></div><div>Direct/request peer: <strong><?= h($requestPeerIp !== '' ? $requestPeerIp : 'unknown') ?></strong></div><div>Forwarded client header: <strong><?= h($forwardedClientIp !== '' ? $forwardedClientIp : 'missing') ?></strong></div><?php if ($realIpTrustedProxy !== ''): ?><div>Trusted proxy peer: <strong><?= h($realIpTrustedProxy) ?></strong></div><?php endif; ?></div><?php endif; ?>
+<?php if ($realIpCanConfigure && $domainOnlyReady && $realIpAutoFailed): ?>
+<p>Check that the reverse proxy overwrites incoming forwarded headers with the actual client IP, then retry.</p>
+<form method="post" class="wizard-ajax-form" data-step="3"><input type="hidden" name="action" value="configure_real_ip"><div class="wizard-actions"><button type="submit">Retry Real IP</button></div></form>
+<?php else: ?>
+<p>Ensure the final HTTPS domain and its reverse proxy supply a usable public client IP in <code>X-Forwarded-For</code> or <code>X-Real-IP</code>.</p>
+<div class="wizard-actions"><button type="button" class="secondary" onclick="startWizardRealIpCheck(true)">Retry Network Check</button></div>
 <?php endif; ?>
+</div>
+<?php endif; ?>
+<div class="wizard-callout" style="margin-top:12px"><div class="wizard-callout-icon">↗</div><div class="host-rule"><strong>Domain-only access rule:</strong><br>Run this website through <code>https://your-domain.tld</code>. Never use <code>your-domain.tld:PORT</code>, a raw IP address, or a port-qualified public URL for Everlomp.</div></div>
+<div class="wizard-status-row"><span class="wizard-pill <?= $domainOnlyReady ? 'good' : 'warn' ?>">Domain host: <?= $domainOnlyReady ? 'valid' : 'fix required' ?></span><span id="wizard-realip-pill" class="wizard-pill <?= $realIpReady ? 'good' : 'warn' ?>">Real client IP: <?= $realIpReady ? 'active' : 'checking…' ?></span><span class="wizard-pill <?= $lswsPasswordConfigured ? 'good' : 'warn' ?>">WebAdmin: <?= $lswsPasswordConfigured ? 'secured' : 'password required' ?></span></div>
+<?php if (!$domainOnlyReady): ?><div class="warning"><strong>Do not continue on this URL.</strong> Open Everlomp through its final HTTPS domain without an explicit port. Example: <code>https://example.com/lompinstaller.php</code>, not <code>https://example.com:8443/lompinstaller.php</code>.</div><?php endif; ?>
+</div>
 <div class="wizard-divider"></div>
 <?php if ($lswsPasswordConfigured): ?>
 <div class="status good">● WebAdmin password saved/applied</div><h3>OpenLiteSpeed WebAdmin is secured</h3><p>Username: <strong>admin</strong>. Everlomp remembers that setup is complete but does not store the plaintext WebAdmin password.</p>
@@ -4138,16 +4283,17 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
 <?php if ($lswsGeneratedPassword !== ''): ?><div class="warning" style="margin-top:14px"><strong>Save this OpenLiteSpeed password now.</strong><br>Username: <code id="lsws-generated-username"><?= h($lswsGeneratedUsername) ?></code><br>Password: <code id="lsws-generated-password"><?= h($lswsGeneratedPassword) ?></code><div class="wizard-actions"><button type="button" class="secondary" onclick="copyLswsPassword(this)">Copy Password</button></div>It will not be displayed again after this response is gone.</div><?php endif; ?>
 <div class="access-box"><div class="access-box-title"><strong>OpenLiteSpeed WebAdmin dashboard</strong><a class="button secondary" target="_blank" rel="noopener noreferrer" href="<?= h($openLiteSpeedDashboardUrl) ?>">Open</a></div><div class="copy-field"><input id="url-openlitespeed" type="text" readonly value="<?= h($openLiteSpeedDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('url-openlitespeed',this)">Copy URL</button></div></div>
 </div>
-<div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(2)">← Database</button><button type="button" onclick="showWizardStep(4)" <?= ($lswsPasswordConfigured && $realIpReady && $domainOnlyReady) ? '' : 'disabled' ?>>I’ve saved it — Continue →</button></div>
+<div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(2)">← Database</button><button id="wizard-network-continue" type="button" onclick="showWizardStep(4)" <?= ($lswsPasswordConfigured && $realIpReady && $domainOnlyReady) ? '' : 'disabled' ?>>I’ve saved it — Continue →</button></div>
 </section>
 
+<?php if (isset($wizardSteps[4])): ?>
 <section id="wizard-step-4" class="wizard-panel" data-step="4">
-<div class="wizard-kicker">Step 4 of 9 · Recommended tool</div>
-<h2 class="wizard-title">Do you want browser-based file management?</h2>
+<div class="wizard-kicker">Step <?= ($wizardStepNumbers[4] ?? -1)+1 ?> of <?= count($wizardSteps) ?> · Recommended tool</div>
+<h2 class="wizard-title"><?= deploymentChoice('FILEGATOR') === 1 ? 'Configure FileGator.' : 'Do you want browser-based file management?' ?></h2>
 <p class="wizard-lead">FileGator is optional, but recommended: it gives you a clean browser interface for inspecting and managing the web files under the repository root you choose.</p>
 <div class="wizard-choice-grid">
 <div class="choice-card recommended"><span class="choice-badge">Recommended</span><h3>Install FileGator</h3><p>Useful when you want to inspect uploaded files, themes, application files, logs you expose under the managed tree, or make quick file changes without SSH.</p></div>
-<div class="choice-card"><span class="choice-badge">Optional</span><h3>Skip FileGator</h3><p>Your applications still work normally. You can continue without a browser file manager, but once the installer is removed you should not expect this installer to offer FileGator later.</p></div>
+<div class="choice-card" <?= deploymentChoice('FILEGATOR') === 1 ? 'style="display:none"' : '' ?>><span class="choice-badge">Optional</span><h3>Skip FileGator</h3><p>Your applications still work normally. You can continue without a browser file manager, but once the installer is removed you should not expect this installer to offer FileGator later.</p></div>
 </div>
 <div class="wizard-card" style="margin-top:16px">
 <?php if ($filegatorInstalled): ?>
@@ -4164,30 +4310,39 @@ $fieldValue = $postedExternalFields[$fieldName] ?? ($field['default'] ?? '');
 <?php if ($filegatorGeneratedPassword !== ''): ?><div class="warning"><strong>Save this FileGator password now.</strong><br>Username: <code id="filegator-generated-username"><?= h($filegatorGeneratedUsername) ?></code><br>Password: <code id="filegator-generated-password"><?= h($filegatorGeneratedPassword) ?></code><br>Root: <code id="filegator-generated-root"><?= h($filegatorGeneratedRoot) ?></code><div class="wizard-actions"><button type="button" class="secondary" onclick="copyFilegatorPassword(this)">Copy Password</button></div></div><?php endif; ?>
 <?php if ($filegatorInstalled): ?><div class="access-box"><div class="access-box-title"><strong>FileGator dashboard</strong><a class="button secondary" target="_blank" rel="noopener noreferrer" href="<?= h($fileGatorDashboardUrl) ?>">Open</a></div><div class="copy-field"><input id="url-filegator" type="text" readonly value="<?= h($fileGatorDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('url-filegator',this)">Copy URL</button></div></div><?php endif; ?>
 </div>
-<div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(3)">← OpenLiteSpeed</button><div class="wizard-actions" style="margin-top:0"><button type="button" class="secondary" onclick="skipFileGator()">Skip for now</button><button type="button" onclick="completeFileGatorStep()" <?= $filegatorInstalled ? '' : 'disabled data-filegator-continue' ?>>Continue to Apps →</button></div></div>
+<div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(3)">← OpenLiteSpeed</button><div class="wizard-actions" style="margin-top:0"><?php if (deploymentChoice('FILEGATOR') !== 1): ?><button type="button" class="secondary" onclick="skipFileGator()">Skip for now</button><?php endif; ?><button type="button" onclick="completeFileGatorStep()" <?= $filegatorInstalled ? '' : 'disabled data-filegator-continue' ?>>Continue to Apps →</button></div></div>
 </section>
 
+<?php endif; ?>
+<?php if (isset($wizardSteps[5])): ?>
 <section id="wizard-step-5" class="wizard-panel" data-step="5">
-<div class="wizard-kicker">Step 5 of 9 · Primary application</div>
-<h2 class="wizard-title">Choose what this server will run.</h2>
-<p class="wizard-lead">Availability is calculated from the server state. You can install one primary application, or skip application installation and point the website directly at a HotPocket contract folder.</p>
-<div id="wizard-apps-content" class="wizard-choice-grid">
+<div class="wizard-kicker">Step <?= ($wizardStepNumbers[5] ?? -1)+1 ?> of <?= count($wizardSteps) ?> · Primary application</div>
+<h2 class="wizard-title"><?= isset($deployment['APP']) ? h('Configure ' . ($deployment['APP'] === 'phpbb' ? 'phpBB' : ucfirst($deployment['APP']))) : 'Choose what this server will run.' ?></h2>
+<?php if (!isset($deployment['APP'])): ?><p class="wizard-lead">Availability is calculated from the server state. You can install one primary application<?php if (deploymentChoice('HOTPOCKET') !== 0): ?>, or skip application installation and point the website directly at a HotPocket contract folder<?php endif; ?>.</p><?php else: ?><p class="wizard-lead">Enter the required settings for your selected application.</p><?php endif; ?>
+<div id="wizard-apps-content" class="wizard-choice-grid" <?= isset($deployment['APP']) && $primaryApp === '' ? 'hidden style="display:none"' : '' ?>>
+<?php if ($wordpressInstalled || deploymentAllowsApp('wordpress')): ?>
 <section class="choice-card <?= $wordpressInstalled ? 'recommended' : '' ?>">
 <span class="choice-badge"><?= $wordpressInstalled ? 'Installed' : ($primaryApp === '' ? 'Available' : 'Unavailable') ?></span><h3>WordPress</h3><p>CMS, blog, and website platform. The installer can auto-create a restricted local database or use an existing MySQL/MariaDB database. Outbound email requires an external SMTP/mail provider; WP Mail SMTP is available as an optional install add-on.</p>
 <div class="wizard-actions"><?php if ($wordpressInstalled): ?><a class="button" target="_blank" rel="noopener noreferrer" href="<?= h($wordpressBaseUrl !== '' ? $wordpressBaseUrl . '/' : '/') ?>">Open Site</a><a class="button secondary" target="_blank" rel="noopener noreferrer" href="<?= h($wordpressAdminDashboardUrl) ?>">Admin</a><?php elseif ($primaryApp === ''): ?><button type="button" onclick="openAppInstaller('wordpress')">Configure &amp; Install</button><?php else: ?><button type="button" disabled>Another primary app is installed</button><?php endif; ?></div>
 <?php if ($wordpressInstalled): ?><div class="access-box"><div class="access-box-title"><strong>WordPress wp-admin</strong></div><div class="copy-field"><input id="url-wordpress-admin" type="text" readonly value="<?= h($wordpressAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('url-wordpress-admin',this)">Copy URL</button></div></div><?php endif; ?>
 </section>
+<?php endif; ?>
+<?php if ($drupalInstalled || deploymentAllowsApp('drupal')): ?>
 <section class="choice-card <?= $drupalInstalled ? 'recommended' : '' ?>">
 <span class="choice-badge"><?= $drupalInstalled ? 'Installed' : ($primaryApp === '' ? 'Available' : 'Unavailable') ?></span><h3>Drupal</h3><p>Drupal 11 CMS with a pinned, SHA-256-verified core archive. Everlomp can auto-create a restricted MariaDB database, use existing credentials, and fall back to the bundled Drupal tarball when Drupal.org is unavailable.</p>
 <div class="wizard-actions"><?php if ($drupalInstalled): ?><a class="button" target="_blank" rel="noopener noreferrer" href="<?= h($drupalBaseUrl !== '' ? $drupalBaseUrl . '/' : '/') ?>">Open Site</a><a class="button secondary" target="_blank" rel="noopener noreferrer" href="<?= h($drupalAdminDashboardUrl) ?>">Admin</a><?php elseif ($primaryApp === ''): ?><button type="button" onclick="openAppInstaller('drupal')">Configure &amp; Install</button><?php else: ?><button type="button" disabled>Another primary app is installed</button><?php endif; ?></div>
 <?php if ($drupalInstalled): ?><div class="access-box"><div class="access-box-title"><strong>Drupal administration</strong></div><div class="copy-field"><input id="url-drupal-admin" type="text" readonly value="<?= h($drupalAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('url-drupal-admin',this)">Copy URL</button></div></div><?php endif; ?>
 </section>
+<?php endif; ?>
+<?php if ($phpbbInstalled || deploymentAllowsApp('phpbb')): ?>
 <section class="choice-card <?= $phpbbInstalled ? 'recommended' : '' ?>">
 <span class="choice-badge"><?= $phpbbInstalled ? 'Installed' : ($primaryApp === '' ? 'Available' : 'Unavailable') ?></span><h3>phpBB</h3><p>Community forum software. Like WordPress, it supports either an automatically created restricted database or existing database credentials. Outbound email requires an external SMTP server, which can be configured during installation.</p>
 <div class="wizard-actions"><?php if ($phpbbInstalled): ?><a class="button" target="_blank" rel="noopener noreferrer" href="<?= h($phpbbBaseUrl !== '' ? $phpbbBaseUrl . '/' : '/') ?>">Open Forum</a><a class="button secondary" target="_blank" rel="noopener noreferrer" href="<?= h($phpbbAdminDashboardUrl) ?>">Admin</a><?php elseif ($primaryApp === ''): ?><button type="button" onclick="openAppInstaller('phpbb')">Configure &amp; Install</button><?php else: ?><button type="button" disabled>Another primary app is installed</button><?php endif; ?></div>
 <?php if ($phpbbInstalled): ?><div class="access-box"><div class="access-box-title"><strong>phpBB administration</strong></div><div class="copy-field"><input id="url-phpbb-admin" type="text" readonly value="<?= h($phpbbAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('url-phpbb-admin',this)">Copy URL</button></div></div><?php endif; ?>
 <?php if ($phpbbInstalled && (($phpbbInfo['smtp_configured'] ?? false) !== true)): ?><div class="warning">phpBB SMTP was not configured during installation. Configure an external SMTP server in phpBB administration before relying on registration, notification, or password-reset email.</div><?php endif; ?>
 </section>
+<?php endif; ?>
+<?php if (deploymentChoice('EXTERNAL') !== 0 && !isset($deployment['APP'])): ?>
 <?php foreach ($externalInstallers as $externalId => $externalManifest): ?>
 <?php
 $externalIsInstalled = $externalInstalledId === $externalId;
@@ -4217,6 +4372,8 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 </div>
 </section>
 <?php endforeach; ?>
+<?php endif; ?>
+<?php if ($hotpocketSiteSelected || deploymentAllowsApp('hotpocket-folder')): ?>
 <section class="choice-card <?= $hotpocketSiteSelected ? 'recommended' : '' ?>" style="grid-column:1/-1">
 <span class="choice-badge"><?= $hotpocketSiteSelected ? 'Selected' : ($primaryApp === '' ? 'No app required' : 'Unavailable') ?></span>
 <h3>Use my HotPocket folder as the website</h3>
@@ -4283,6 +4440,8 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 </div>
 <?php endif; ?>
 </section>
+<?php endif; ?>
+<?php if (deploymentChoice('EXTERNAL') !== 0 && !isset($deployment['APP'])): ?>
 <section class="choice-card">
 <span class="choice-badge">External installers</span><h3>Upload installer ZIP</h3>
 <p>Add a package containing <code>manifest.json</code> and <code>install.sh</code>. Valid packages are stored under <code>/home/everlomp/external-installs/&lt;id&gt;/</code> and automatically appear here.</p>
@@ -4293,14 +4452,17 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <div class="wizard-actions"><button type="submit">Upload Package</button><a class="button secondary" href="<?= h($panelUrl) ?>?download=external-installer-example">Download Example ZIP</a></div>
 </form>
 </section>
+<?php endif; ?>
 <section class="choice-card"><span class="choice-badge"><?= $phpmyadminInstalled ? 'Built in' : 'Missing from image' ?></span><h3>phpMyAdmin</h3><p>Database administration tool. It is part of the image rather than a selectable primary app and uses your MariaDB account for normal cookie login.</p><?php if ($phpmyadminInstalled): ?><div class="wizard-actions"><a class="button secondary" target="_blank" rel="noopener noreferrer" href="<?= h($phpMyAdminDashboardUrl) ?>">Open phpMyAdmin</a></div><div class="access-box"><div class="access-box-title"><strong>phpMyAdmin URL</strong></div><div class="copy-field"><input id="url-phpmyadmin-apps" type="text" readonly value="<?= h($phpMyAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('url-phpmyadmin-apps',this)">Copy URL</button></div></div><?php endif; ?></section>
 </div>
 <div id="app-installer-drawer" class="app-installer-drawer"></div>
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(4)">← File Manager</button><button type="button" onclick="showWizardStep(6)" <?= $primaryApp !== '' ? '' : 'disabled' ?>>Continue to HotPocket →</button></div>
 </section>
 
+<?php endif; ?>
+<?php if (isset($wizardSteps[6])): ?>
 <section id="wizard-step-6" class="wizard-panel" data-step="6">
-<div class="wizard-kicker">Step 6 of 9 · Optional smart-contract runtime</div>
+<div class="wizard-kicker">Step <?= ($wizardStepNumbers[6] ?? -1)+1 ?> of <?= count($wizardSteps) ?> · Optional smart-contract runtime</div>
 <h2 class="wizard-title">Do you need HotPocket?</h2>
 <p class="wizard-lead">Enable HotPocket only if this application will run smart contracts. If you enable it, Everlomp starts HotPocket under Supervisor and the bootstrap contract runs on it so you have a target ready for contract deployment.</p>
 <div class="wizard-card">
@@ -4389,7 +4551,7 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <div class="wizard-actions"><button type="submit">Enable HotPocket</button></div>
 </form>
 </div>
-<div class="choice-card">
+<div class="choice-card" <?= deploymentChoice('HOTPOCKET') === 1 ? 'style="display:none"' : '' ?>>
 <span class="choice-badge">Normal web apps</span>
 <h3>Keep it off</h3>
 <p>Recommended if you only need WordPress, Drupal, phpBB, PHP/web files, or other non-smart-contract workloads.</p>
@@ -4522,18 +4684,23 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(5)">← Applications</button><button type="button" onclick="completeHotPocketStep()" <?= $hotpocketEnabled ? '' : 'disabled data-hotpocket-continue' ?>>Continue to Backups →</button></div>
 </section>
 
+<?php endif; ?>
+<?php if (isset($wizardSteps[7])): ?>
 <section id="wizard-step-7" class="wizard-panel" data-step="7">
-<div class="wizard-kicker">Step 7 of 9 · Backup installation</div>
-<h2 class="wizard-title">Schedule backups first. Then install Kopia.</h2>
-<p class="wizard-lead">This step deliberately starts with MariaDB logical-backup scheduling and retention. After the schedule is saved, configure Kopia for encrypted snapshots, policies, repository storage, and optional replication.</p>
+<div class="wizard-kicker">Step <?= ($wizardStepNumbers[7] ?? -1)+1 ?> of <?= count($wizardSteps) ?> · Backup installation</div>
+<h2 class="wizard-title"><?= deploymentChoice('SQLBACKUP') === 0 ? 'Configure Kopia.' : (deploymentChoice('KOPIA') === 0 ? 'Configure database backups.' : 'Schedule backups first. Then install Kopia.') ?></h2>
+<?php if (deploymentChoice('SQLBACKUP') !== 0 && deploymentChoice('KOPIA') !== 0): ?><p class="wizard-lead">This step deliberately starts with MariaDB logical-backup scheduling and retention. After the schedule is saved, configure Kopia for encrypted snapshots, policies, repository storage, and optional replication.</p>
 <div class="wizard-callout good"><div class="wizard-callout-icon">1</div><div><strong>First: backup schedule.</strong><br>Choose when SQL dumps happen and how many are kept. These dumps become a source Kopia can snapshot.</div></div>
+<?php endif; ?>
 <div id="backup-fragment" class="backup-fragment"><div class="wizard-card" style="margin-top:16px"><div class="wizard-lock"><span class="spinner-inline"></span>Loading backup controls…</div></div></div>
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(6)">← HotPocket</button><button type="button" onclick="completeBackupStep()">Backup setup reviewed — Continue →</button></div>
 </section>
 
+<?php endif; ?>
+<?php if (isset($wizardSteps[8])): ?>
 <section id="wizard-step-8" class="wizard-panel" data-step="8">
-<div class="wizard-kicker">Step 8 of 9 · Remote access</div>
-<h2 class="wizard-title">Do you want to enable SSH?</h2>
+<div class="wizard-kicker">Step <?= ($wizardStepNumbers[8] ?? -1)+1 ?> of <?= count($wizardSteps) ?> · Remote access</div>
+<h2 class="wizard-title"><?= deploymentChoice('SSH') === 1 ? 'Configure SSH.' : 'Do you want to enable SSH?' ?></h2>
 <p class="wizard-lead">SSH is disabled by default. If you enable it, Everlomp generates a fresh password for the non-root <strong>everlomp</strong> account, configures OpenSSH to listen on <code>EXTERNAL_GPTCP2_PORT</code>, reloads Supervisor, and starts OpenSSH.</p>
 <div class="wizard-card">
 <div class="wizard-callout danger"><div class="wizard-callout-icon">!</div><div><strong>SSH is administrative access.</strong><br>The existing <code>everlomp</code> account has passwordless <code>sudo</code> in this image, so anyone with this SSH password can obtain root privileges. Enable it only if you need remote shell access. Everlomp generates a fresh SSH password when you enable or re-apply SSH.</div></div>
@@ -4551,19 +4718,20 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <?php endif; ?>
 <div class="wizard-choice-grid" style="margin-top:16px">
 <div class="choice-card recommended"><span class="choice-badge">Optional</span><h3><?= $sshEnabled ? 'Re-apply SSH Settings' : 'Enable SSH' ?></h3><p><?= $sshEnabled ? 'Generate a new everlomp SSH password, configure sshd for the current GPTCP2 external port, reload Supervisor, and verify it is listening.' : 'Generate a fresh password, unlock the everlomp account, configure sshd to listen on EXTERNAL_GPTCP2_PORT, enable autostart, start sshd, and verify that port is listening.' ?></p><?php if (!$sshMappingReady): ?><div class="notice error" style="margin-top:12px"><?php if ($sshHostDomain === ''): ?>HOST_DOMAIN_ADDRESS is missing. <?php endif; ?><?php if ($sshPublicPort === ''): ?>EXTERNAL_GPTCP2_PORT is missing or invalid. <?php endif; ?></div><?php endif; ?><form method="post" class="wizard-ajax-form" data-step="8" style="margin-top:14px"><input type="hidden" name="action" value="enable_ssh"><button type="submit" <?= !$sshMappingReady ? 'disabled' : '' ?>><?= $sshEnabled ? 'Re-apply & Verify SSH' : 'Enable & Verify SSH' ?></button></form></div>
-<div class="choice-card"><span class="choice-badge">Closed by default</span><h3>Keep SSH disabled</h3><p>Stop sshd if it is running, keep Supervisor autostart off, and lock the everlomp password login.</p><form method="post" class="wizard-ajax-form" data-step="8" data-advance="9" style="margin-top:14px"><input type="hidden" name="action" value="disable_ssh"><button type="submit" class="secondary">Keep SSH Disabled</button></form></div>
+<div class="choice-card" <?= deploymentChoice('SSH') === 1 ? 'style="display:none"' : '' ?>><span class="choice-badge">Closed by default</span><h3>Keep SSH disabled</h3><p>Stop sshd if it is running, keep Supervisor autostart off, and lock the everlomp password login.</p><form method="post" class="wizard-ajax-form" data-step="8" data-advance="9" style="margin-top:14px"><input type="hidden" name="action" value="disable_ssh"><button type="submit" class="secondary">Keep SSH Disabled</button></form></div>
 </div>
 </div>
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(7)">← Backups</button><?php if ($sshDecisionMade): ?><button type="button" onclick="showWizardStep(9)"><?= $sshEnabled && $sshGeneratedPassword !== '' ? 'SSH verified — Continue to Finish →' : 'Continue to Finish →' ?></button><?php else: ?><button type="button" disabled>Choose SSH setting to continue</button><?php endif; ?></div>
 </section>
 
+<?php endif; ?>
 <section id="wizard-step-9" class="wizard-panel" data-step="9">
-<div class="wizard-kicker">Step 9 of 9 · Security cleanup</div>
+<div class="wizard-kicker">Step <?= ($wizardStepNumbers[9] ?? -1)+1 ?> of <?= count($wizardSteps) ?> · Security cleanup</div>
 <h2 class="wizard-title">Review everything — then remove the installer.</h2>
 <p class="wizard-lead">You can use the navigator on the left to revisit any previous step instantly without reloading the page. Do that now if you want to check a credential, optional component, SSH choice, or backup setting.</p>
 <div class="wizard-card">
 <h3>Installation review</h3>
-<div class="review-grid"><div class="review-item"><small>Terms</small><strong><?= $termsAccepted ? 'Accepted' : 'Incomplete' ?></strong></div><div class="review-item"><small>MariaDB</small><strong><?= $databaseConfigured ? 'Configured' : 'Incomplete' ?></strong></div><div class="review-item"><small>OpenLiteSpeed / Real IP</small><strong><?= ($lswsPasswordConfigured && $realIpReady && $domainOnlyReady) ? 'Ready' : 'Needs attention' ?></strong></div><div class="review-item"><small>FileGator</small><strong><?= $filegatorInstalled ? 'Installed' : 'Skipped / not installed' ?></strong></div><div class="review-item"><small>Primary app</small><strong><?= $primaryApp !== '' ? h($primaryAppDisplay) : 'None' ?></strong></div><div class="review-item"><small>HotPocket</small><strong><?= $hotpocketEnabled ? 'Enabled' : 'Off' ?></strong></div><div class="review-item"><small>Kopia</small><strong><?= $kopiaConfigured ? 'Configured' : 'Review backup step' ?></strong></div><div class="review-item"><small>SSH / GPTCP2</small><strong><?= $sshDecisionMade ? ($sshEnabled ? 'Enabled · port ' . h($sshPublicPort) : 'Disabled') : 'Not decided' ?></strong></div><div class="review-item"><small>Installer</small><strong>Still present</strong></div></div>
+<div class="review-grid"><div class="review-item"><small>Terms</small><strong><?= $termsAccepted ? 'Accepted' : 'Incomplete' ?></strong></div><div class="review-item"><small>MariaDB</small><strong><?= $databaseConfigured ? 'Configured' : 'Incomplete' ?></strong></div><div class="review-item"><small>OpenLiteSpeed / Real IP</small><strong id="wizard-network-review"><?= ($lswsPasswordConfigured && $realIpReady && $domainOnlyReady) ? 'Ready' : 'Needs attention' ?></strong></div><div class="review-item"><small>FileGator</small><strong><?= $filegatorInstalled ? 'Installed' : 'Skipped / not installed' ?></strong></div><div class="review-item"><small>Primary app</small><strong><?= $primaryApp !== '' ? h($primaryAppDisplay) : 'None' ?></strong></div><div class="review-item"><small>HotPocket</small><strong><?= $hotpocketEnabled ? 'Enabled' : 'Off' ?></strong></div><div class="review-item"><small>Kopia</small><strong><?= $kopiaConfigured ? 'Configured' : 'Review backup step' ?></strong></div><div class="review-item"><small>SSH / GPTCP2</small><strong><?= $sshDecisionMade ? ($sshEnabled ? 'Enabled · port ' . h($sshPublicPort) : 'Disabled') : 'Not decided' ?></strong></div><div class="review-item"><small>Installer</small><strong>Still present</strong></div></div>
 <div class="wizard-divider"></div><div class="access-box"><div class="access-box-title"><strong>Quick access · dashboard URLs</strong><button type="button" class="secondary" onclick="copyAllDashboardUrls(this)">Copy all URLs</button></div><div style="display:grid;gap:10px">
 <?php if ($phpmyadminInstalled): ?><div class="copy-field"><input data-dashboard-label="phpMyAdmin" data-dashboard-url id="finish-url-phpmyadmin" type="text" readonly value="<?= h($phpMyAdminDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-phpmyadmin',this)">Copy</button></div><?php endif; ?>
 <?php if ($lswsPasswordConfigured): ?><div class="copy-field"><input data-dashboard-label="OpenLiteSpeed WebAdmin" data-dashboard-url id="finish-url-openlitespeed" type="text" readonly value="<?= h($openLiteSpeedDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-openlitespeed',this)">Copy</button></div><?php endif; ?>
@@ -4576,7 +4744,7 @@ $externalCardSiteUrl = $publicBaseUrl !== '' ? rtrim($publicBaseUrl, '/') . $ext
 <?php if ($kopiaConfigured): ?><div class="copy-field"><input data-dashboard-label="Kopia" data-dashboard-url id="finish-url-kopia" type="text" readonly value="<?= h($kopiaDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-kopia',this)">Copy</button></div><div class="copy-field"><input data-dashboard-label="Kopia Replication" data-dashboard-url id="finish-url-kopia-replication" type="text" readonly value="<?= h($kopiaReplicationDashboardUrl) ?>"><button type="button" class="secondary" onclick="copyFieldValue('finish-url-kopia-replication',this)">Copy</button></div><?php endif; ?>
 </div></div>
 </div>
-<div class="finish-warning" style="margin-top:16px"><h3>⚠ Remove the Everlomp installer when you are done.</h3><?php if ($hotpocketSiteSelected): ?><p><strong>HotPocket website handoff:</strong> this final action first switches OpenLiteSpeed to <?= h((string) ($hotpocketSiteInfo['document_root'] ?? '/contract/contract_fs/seed/state')) ?> using your saved index list, then removes the installer.</p><?php endif; ?><p>Leaving <strong>/lompinstaller.php</strong> exposed means leaving an administrative installation surface on the server. Removing it deletes the installer interface, the original redirecting bootstrap index if it is still unchanged, installer-only helper programs, installer metadata, bundled WordPress/Drupal/phpBB installation files, uploaded external-installer packages, and the installer’s passwordless web sudo permissions. The root-owned EverAdmin HotPocket restart watcher is runtime infrastructure and remains installed.</p><p><strong>It does not remove</strong> your installed primary application (WordPress, Drupal, phpBB, or external), FileGator, phpMyAdmin, OpenLiteSpeed, MariaDB, HotPocket, Kopia, SSH if you enabled it, or application/database data.</p><?php if ($primaryApp !== '' && $sshDecisionMade): ?><form method="post" onsubmit="return confirm('Permanently remove the Everlomp installer, helper programs, and bundled installation files? This cannot be undone from the installer.');"><input type="hidden" name="action" value="delete_everlomp_installfile"><div class="wizard-actions"><button type="submit">Permanently Remove Everlomp Installer</button></div></form><?php elseif ($primaryApp === ''): ?><div class="wizard-lock">Install a primary application before the installer can be removed.</div><?php else: ?><div class="wizard-lock">Choose whether SSH should be enabled before the installer can be removed.</div><?php endif; ?></div>
+<div class="finish-warning" style="margin-top:16px"><h3>⚠ Remove the Everlomp installer when you are done.</h3><?php if ($hotpocketSiteSelected): ?><p><strong>HotPocket website handoff:</strong> this final action first switches OpenLiteSpeed to <?= h((string) ($hotpocketSiteInfo['document_root'] ?? '/contract/contract_fs/seed/state')) ?> using your saved index list, then removes the installer.</p><?php endif; ?><p>Leaving <strong>/lompinstaller.php</strong> exposed means leaving an administrative installation surface on the server. Removing it deletes the installer interface, the original redirecting bootstrap index if it is still unchanged, installer-only helper programs, installer metadata, bundled WordPress/Drupal/phpBB installation files, uploaded external-installer packages, and the installer’s passwordless web sudo permissions. The root-owned EverAdmin HotPocket restart watcher is runtime infrastructure and remains installed.</p><p><strong>It does not remove</strong> your installed primary application (WordPress, Drupal, phpBB, or external), FileGator, phpMyAdmin, OpenLiteSpeed, MariaDB, HotPocket, Kopia, SSH if you enabled it, or application/database data.</p><?php if (deploymentChoice('CLEANUP') === 0): ?><div class="warning">Installer cleanup is disabled by deployment configuration. Restrict access to this administrative page.</div><?php elseif (($primaryApp !== '' || ($deployment['APP'] ?? '') === 'none') && $sshDecisionMade): ?><form method="post" onsubmit="return confirm('Permanently remove the Everlomp installer, helper programs, and bundled installation files? This cannot be undone from the installer.');"><input type="hidden" name="action" value="delete_everlomp_installfile"><div class="wizard-actions"><button type="submit">Permanently Remove Everlomp Installer</button></div></form><?php elseif ($primaryApp === '' && ($deployment['APP'] ?? '') !== 'none'): ?><div class="wizard-lock">Install a primary application before the installer can be removed.</div><?php else: ?><div class="wizard-lock">Choose whether SSH should be enabled before the installer can be removed.</div><?php endif; ?></div>
 <div class="wizard-actions end"><button type="button" class="secondary" onclick="showWizardStep(8)">← SSH</button><button type="button" class="secondary" onclick="showWizardStep(1)">Review from the beginning</button></div>
 </section>
 </main>
@@ -5723,9 +5891,9 @@ function renderWizardSummary() {
     lines.push('OpenLiteSpeed WebAdmin: ' + (everlompWizardState.openlitespeed ? 'Configured' : 'Not configured'));
     lines.push('Real client IP: ' + (everlompWizardState.realIp ? 'Ready' : 'Not ready'));
     lines.push('Domain-only access: ' + (everlompWizardState.domainOnly ? 'Ready' : 'Not ready'));
-    lines.push('FileGator: ' + (everlompWizardState.filegator ? 'Installed' : (wizardDecision('filegator-decided') ? 'Skipped / reviewed' : 'Not decided')));
+    lines.push('FileGator: ' + (everlompWizardState.filegator ? 'Installed' : ((deploymentOption('FILEGATOR') === 0 || wizardDecision('filegator-decided')) ? 'Skipped / reviewed' : 'Not decided')));
     lines.push('Primary application: ' + (everlompWizardState.primaryAppDisplay || everlompWizardState.primaryApp || 'Not installed'));
-    lines.push('HotPocket: ' + (everlompWizardState.hotpocket ? 'Enabled' : (wizardDecision('hotpocket-decided') ? 'Off / skipped' : 'Not decided')));
+    lines.push('HotPocket: ' + (everlompWizardState.hotpocket ? 'Enabled' : ((deploymentOption('HOTPOCKET') === 0 || wizardDecision('hotpocket-decided')) ? 'Off / skipped' : 'Not decided')));
     lines.push('SQL backup schedule: ' + (everlompWizardState.backupScheduleConfigured || wizardDecision('backup-schedule-decided') ? 'Saved' : 'Not saved'));
     lines.push('Kopia: ' + (everlompWizardState.kopia ? 'Configured' : (wizardDecision('backup-decided') ? 'Reviewed / skipped' : 'Not configured')));
     lines.push('SSH / GPTCP2: ' + (everlompWizardState.sshDecisionMade ? (everlompWizardState.sshEnabled ? 'Enabled on port ' + (everlompWizardState.sshPort || '?') : 'Disabled') : 'Not decided'));
@@ -5762,6 +5930,10 @@ let everlompWizardStep = 1;
 let backupFragmentLoaded = false;
 let kopiaInstallInProgress = false;
 let everlompWizardTransitionLocked = false;
+let wizardRealIpCheck = null;
+let wizardRealIpCheckFailed = false;
+let wizardRealIpStepChecked = false;
+let wizardFormRequests = 0;
 
 function readWizardStateFrom(root = document) {
     const node = root.querySelector ? root.querySelector('#wizard-state-json') : null;
@@ -5776,15 +5948,22 @@ function setWizardDecision(name) {
     localStorage.setItem('everlomp-wizard-' + name, '1');
 }
 
+function deploymentOption(name) { return everlompWizardState.deployment?.[name]; }
+function visibleWizardSteps() { return everlompWizardState.steps || [1,2,3,4,5,6,7,8,9]; }
+function requiredBackupsReady() {
+    return (deploymentOption('SQLBACKUP') !== 1 || everlompWizardState.sqlEnabled)
+        && ((deploymentOption('KOPIA') !== 1 && deploymentOption('REPLICATION') !== 1) || everlompWizardState.kopia);
+}
 function wizardMaxAllowedStep() {
-    if (!everlompWizardState.terms) return 1;
-    if (!everlompWizardState.database) return 2;
-    if (!(everlompWizardState.openlitespeed && everlompWizardState.realIp && everlompWizardState.domainOnly)) return 3;
-    if (!(everlompWizardState.filegator || wizardDecision('filegator-decided'))) return 4;
-    if (!everlompWizardState.primaryApp) return 5;
-    if (!(everlompWizardState.hotpocket || wizardDecision('hotpocket-decided'))) return 6;
-    if (!(everlompWizardState.kopia || wizardDecision('backup-decided'))) return 7;
-    if (!everlompWizardState.sshDecisionMade) return 8;
+    const s = everlompWizardState;
+    if (!s.terms) return 1;
+    if (!s.database) return 2;
+    if (!(s.openlitespeed && s.realIp && s.domainOnly)) return 3;
+    if (deploymentOption('FILEGATOR') !== 0 && !(s.filegator || (deploymentOption('FILEGATOR') !== 1 && wizardDecision('filegator-decided')))) return 4;
+    if (!s.primaryApp && deploymentOption('APP') !== 'none') return 5;
+    if (deploymentOption('HOTPOCKET') !== 0 && !(s.hotpocket || (deploymentOption('HOTPOCKET') !== 1 && wizardDecision('hotpocket-decided')))) return 6;
+    if (visibleWizardSteps().includes(7) && (!requiredBackupsReady() || !(s.kopia || wizardDecision('backup-decided')))) return 7;
+    if (deploymentOption('SSH') !== 0 && !s.sshDecisionMade) return 8;
     return 9;
 }
 
@@ -5825,7 +6004,7 @@ function refreshWizardNav() {
         if (check) check.style.visibility = step < everlompWizardStep && step <= maxAllowed ? 'visible' : 'hidden';
     });
     const bar = document.getElementById('wizard-progress-bar');
-    if (bar) bar.style.width = Math.max(100 / 9, everlompWizardStep * (100 / 9)) + '%';
+    if (bar) bar.style.width = ((visibleWizardSteps().indexOf(everlompWizardStep)+1) / visibleWizardSteps().length * 100) + '%';
 }
 
 function showWizardStep(step, force = false) {
@@ -5833,13 +6012,33 @@ function showWizardStep(step, force = false) {
     if (!root) return;
     if (everlompWizardTransitionLocked && Number(step) > everlompWizardStep) return;
     const maxAllowed = wizardMaxAllowedStep();
-    const next = force ? Math.max(1, Math.min(9, step)) : Math.max(1, Math.min(maxAllowed, step));
+    const steps = visibleWizardSteps();
+    const target = Math.max(1, Math.min(force && Object.keys(everlompWizardState.deployment || {}).length === 0 ? 9 : maxAllowed, Number(step)));
+    const next = steps.includes(target) ? target : (target < everlompWizardStep
+        ? (steps.filter(n=>n<target).pop() || steps[0])
+        : (steps.find(n=>n>target && n<=maxAllowed) || steps.filter(n=>n<=maxAllowed).pop()));
     everlompWizardStep = next;
     localStorage.setItem('everlomp-wizard-step', String(next));
     root.querySelectorAll('.wizard-panel').forEach((panel) => panel.classList.toggle('active', Number(panel.dataset.step) === next));
     refreshWizardNav();
     refreshWizardTransitionButtons();
+    document.querySelectorAll('.wizard-panel .wizard-actions.end button[onclick*="showWizardStep("]').forEach(button => {
+        const target = Number((button.getAttribute('onclick').match(/showWizardStep\((\d+)/)||[])[1]);
+        const from = Number(button.closest('.wizard-panel').dataset.step);
+        if (!target || steps.includes(target)) return;
+        const dest = target < from ? steps.filter(n=>n<from).pop() : steps.find(n=>n>from);
+        if (dest) button.textContent = target < from ? '← Back' : 'Continue →';
+    });
+    if (next === 5 && deploymentOption('APP') && deploymentOption('APP') !== 'none' && !everlompWizardState.primaryApp) {
+        const drawer = document.getElementById('app-installer-drawer');
+        if (drawer && !drawer.innerHTML.trim()) openAppInstaller(deploymentOption('APP'));
+    }
     if (next === 7) loadBackupFragment();
+    if (next === 3 && !everlompWizardState.realIp && !wizardRealIpStepChecked) {
+        wizardRealIpStepChecked = true;
+        if (!wizardFormRequests) startWizardRealIpCheck(true);
+        else wizardRealIpStepChecked = false;
+    }
     if (window.matchMedia('(max-width: 900px)').matches) {
         const content = root.querySelector('.wizard-content');
         if (content) content.scrollIntoView({behavior:'smooth', block:'start'});
@@ -5866,10 +6065,98 @@ function setButtonBusy(button, busy, text = 'Saving…') {
     }
 }
 
+// A successful HTTP response is not proof of working IP forwarding. The
+// old OpenLiteSpeed worker may still answer while the new worker starts.
+// Keep checking until PHP verifies the public peer, or a bounded deadline.
+async function fetchWizardAfterRealIpRestart() {
+    const url = new URL(everlompWizardState.panelUrl || window.location.pathname, window.location.href);
+    const deadline = Date.now() + 45000;
+    let latest = null;
+    for (let attempt = 0; attempt < 15 && Date.now() < deadline; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), Math.min(12000, Math.max(1, deadline - Date.now())));
+        try {
+            url.searchParams.set('_realip_check', String(Date.now()));
+            const response = await fetch(url.toString(), {credentials:'same-origin', cache:'no-store', signal:controller.signal, headers:{'X-Requested-With':'XMLHttpRequest'}});
+            if (!response.ok) throw new Error('Wizard temporarily unavailable');
+            const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+            const state = readWizardStateFrom(doc);
+            if (!state || !state.terms || !doc.getElementById('wizard-network-state')) throw new Error('Wizard session not available');
+            latest = doc;
+            if (state.realIp && state.domainOnly) return doc;
+            // Invalid domain cannot be corrected by polling this same URL.
+            if (!state.domainOnly) return doc;
+        } catch (_) {
+            // Transient HTTP failures during the restart are expected.
+        } finally {
+            clearTimeout(timer);
+        }
+        if (attempt < 14 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, Math.min(2000, Math.max(0, deadline - Date.now()))));
+    }
+    return latest;
+}
+
+function renderWizardNetworkStatus() {
+    const s = everlompWizardState;
+    const ready = !!(s.realIp && s.domainOnly);
+    const pending = document.getElementById('wizard-realip-pending');
+    const failure = document.getElementById('wizard-realip-failure');
+    const pill = document.getElementById('wizard-realip-pill');
+    if (pending) pending.style.display = wizardRealIpCheckFailed ? 'none' : '';
+    if (failure) failure.style.display = wizardRealIpCheckFailed ? '' : 'none';
+    if (pill) {
+        pill.textContent = 'Real client IP: ' + (s.realIp ? 'active' : (wizardRealIpCheckFailed ? 'not ready' : 'checking…'));
+        pill.classList.toggle('good', !!s.realIp);
+        pill.classList.toggle('warn', !s.realIp);
+    }
+    const next = document.getElementById('wizard-network-continue');
+    if (next) {
+        const disabled = !(ready && s.openlitespeed);
+        if (next.hasAttribute('data-everlomp-prelock-disabled')) next.setAttribute('data-everlomp-prelock-disabled', disabled ? '1' : '0');
+        next.disabled = disabled || everlompWizardTransitionLocked;
+    }
+    const review = document.getElementById('wizard-network-review');
+    if (review) review.textContent = ready && s.openlitespeed ? 'Ready' : 'Needs attention';
+}
+
+function syncWizardNetworkFromResponse(doc) {
+    const current = document.getElementById('wizard-network-state');
+    const replacement = doc.getElementById('wizard-network-state');
+    if (current && replacement) current.innerHTML = replacement.innerHTML;
+    if (everlompWizardState.realIp && everlompWizardState.domainOnly) wizardRealIpCheckFailed = false;
+    renderWizardNetworkStatus();
+}
+
+function startWizardRealIpCheck(force = false) {
+    if (wizardRealIpCheck) return wizardRealIpCheck;
+    if (!everlompWizardState.terms || (everlompWizardState.realIp && everlompWizardState.domainOnly) || (wizardRealIpCheckFailed && !force)) return Promise.resolve(null);
+    wizardRealIpCheckFailed = false;
+    renderWizardNetworkStatus();
+    wizardRealIpCheck = (async () => {
+        const doc = await fetchWizardAfterRealIpRestart();
+        const state = doc && readWizardStateFrom(doc);
+        if (state) {
+            // Only network state belongs to a network poll. Never replace a
+            // password response, application form or other wizard step.
+            everlompWizardState.realIp = !!state.realIp;
+            everlompWizardState.domainOnly = !!state.domainOnly;
+            syncWizardNetworkFromResponse(doc);
+        }
+        wizardRealIpCheckFailed = !(everlompWizardState.realIp && everlompWizardState.domainOnly);
+        renderWizardNetworkStatus();
+        refreshWizardNav();
+        refreshWizardTransitionButtons();
+        renderWizardSummary();
+        return doc;
+    })().finally(() => { wizardRealIpCheck = null; });
+    return wizardRealIpCheck;
+}
+
 async function refreshWizardStep(step) {
     const url = everlompWizardState.panelUrl || window.location.pathname;
     try {
-        const response = await fetch(url, {credentials:'same-origin', headers:{'X-Requested-With':'XMLHttpRequest'}});
+        const response = await fetch(url, {credentials:'same-origin', cache:'no-store', headers:{'X-Requested-With':'XMLHttpRequest'}});
+        if (!response.ok) throw new Error('Wizard refresh failed');
         const html = await response.text();
         const doc = new DOMParser().parseFromString(html, 'text/html');
         updateWizardFromResponse(doc, step);
@@ -5894,7 +6181,9 @@ function updateWizardFromResponse(doc, step) {
     const appsCurrent = document.getElementById('wizard-apps-content');
     const appsReplacement = doc.getElementById('wizard-apps-content');
     if (appsCurrent && appsReplacement) appsCurrent.innerHTML = appsReplacement.innerHTML;
+    syncWizardNetworkFromResponse(doc);
     refreshWizardNav();
+    refreshWizardTransitionButtons();
     initializeDynamicControls(document);
     captureVisibleWizardDetails(document);
 }
@@ -5911,19 +6200,53 @@ async function submitWizardForm(event) {
     if (submitter && submitter.name) data.set(submitter.name, submitter.value);
     const step = Number(form.dataset.step || form.closest('.wizard-panel')?.dataset.step || everlompWizardStep);
     const action = String(data.get('action') || '');
-    const busyText = action === 'enable_ssh'
+    const busyText = action === 'accept_terms' ? 'Preparing setup…'
+        : action === 'configure_real_ip' ? 'Retrying & verifying Real IP…'
+        : action === 'enable_ssh'
         ? 'Enabling & verifying SSH…'
         : (action === 'disable_ssh'
             ? 'Disabling SSH…'
             : (action === 'enable_hotpocket' ? 'Preparing & enabling HotPocket…' : 'Saving…'));
     setButtonBusy(submitter, true, busyText);
+    wizardFormRequests++;
     try {
+        // Do not submit another configuration request while OLS is restarting.
+        if (wizardRealIpCheck) await wizardRealIpCheck;
         const response = await fetch(everlompWizardState.panelUrl || window.location.pathname, {method:'POST', body:data, credentials:'same-origin', headers:{'X-Requested-With':'XMLHttpRequest'}});
+        if (!response.ok && action === 'configure_real_ip' && response.status >= 500) throw new Error('Web server temporarily unavailable');
+        if (!response.ok) { const denial = await response.json().catch(()=>({})); showWizardNotice(denial.message || 'Request rejected.', true); return; }
         const html = await response.text();
         const doc = new DOMParser().parseFromString(html, 'text/html');
+        const responseState = readWizardStateFrom(doc);
+        if (action === 'accept_terms' && responseState?.terms && !doc.querySelector('.wizard-server-notice.error')) {
+            updateWizardFromResponse(doc, 1);
+            // Terms are the only prerequisite for opening Database. Do not
+            // hold navigation while the reverse proxy is being verified.
+            showWizardNotice('Installation terms accepted. Continue with database setup.');
+            showWizardStep(2);
+            if (!everlompWizardState.realIp || !everlompWizardState.domainOnly) {
+                // Keep checking in the background. The database POST still
+                // waits for an in-flight check before contacting the server.
+                void startWizardRealIpCheck(true).catch(() => {
+                    wizardRealIpCheckFailed = !(everlompWizardState.realIp && everlompWizardState.domainOnly);
+                    renderWizardNetworkStatus();
+                    refreshWizardNav();
+                    refreshWizardTransitionButtons();
+                    renderWizardSummary();
+                });
+            }
+            return;
+        }
         const error = doc.querySelector('.wizard-server-notice.error, .notice.error');
         const success = doc.querySelector('.wizard-server-notice.success, .notice.success');
         updateWizardFromResponse(doc, step);
+        if (action === 'configure_real_ip' && (!everlompWizardState.realIp || !everlompWizardState.domainOnly)) {
+            await startWizardRealIpCheck(true);
+            if (everlompWizardState.realIp && everlompWizardState.domainOnly) {
+                showWizardNotice('Real client IP forwarding is active.');
+                return;
+            }
+        }
         if (error) {
             showWizardNotice(error.textContent.trim(), true);
             return;
@@ -5946,7 +6269,12 @@ async function submitWizardForm(event) {
             else showWizardStep(step, true);
         }
     } catch (error) {
-        const action = String(data.get('action') || '');
+        if (action === 'configure_real_ip') {
+            await startWizardRealIpCheck(true);
+            const ready = everlompWizardState.realIp && everlompWizardState.domainOnly;
+            showWizardNotice(ready ? 'Real client IP forwarding is active.' : 'Real client IP is not yet verified. Check the network details below.', !ready);
+            return;
+        }
         const message = action === 'enable_ssh'
             ? 'SSH setup did not return a complete response. Check the SSH state below before retrying.'
             : (action === 'disable_ssh'
@@ -5954,15 +6282,21 @@ async function submitWizardForm(event) {
                 : 'The request could not be completed. Your browser stayed on this wizard; no navigation occurred.');
         showWizardNotice(message, true);
     } finally {
+        wizardFormRequests--;
         setButtonBusy(submitter, false);
+        if (!wizardFormRequests && everlompWizardStep === 3 && !everlompWizardState.realIp && !wizardRealIpStepChecked) {
+            wizardRealIpStepChecked = true;
+            startWizardRealIpCheck(true);
+        }
     }
 }
 
-function skipFileGator() { setWizardDecision('filegator-decided'); showWizardStep(5); }
+function skipFileGator() { if (deploymentOption('FILEGATOR') === 1) return; setWizardDecision('filegator-decided'); showWizardStep(5); }
 function completeFileGatorStep() { setWizardDecision('filegator-decided'); showWizardStep(5); }
-function skipHotPocket() { setWizardDecision('hotpocket-decided'); showWizardStep(7); }
+function skipHotPocket() { if (deploymentOption('HOTPOCKET') === 1) return; setWizardDecision('hotpocket-decided'); showWizardStep(7); }
 function completeHotPocketStep() { setWizardDecision('hotpocket-decided'); showWizardStep(7); }
 async function completeBackupStep() {
+    if (!requiredBackupsReady()) { showWizardNotice('Complete the required backup configuration first.', true); return; }
     setWizardDecision('backup-decided');
     await refreshWizardStep(8);
     showWizardStep(8);
@@ -6006,11 +6340,12 @@ async function openAppInstaller(app) {
         initializeDynamicControls(drawer);
         if (app === 'wordpress') {
             const selectedMode = drawer.querySelector('input[name="wordpress_setup_mode"]:checked');
-            toggleWordPressSetupMode(selectedMode ? selectedMode.value : 'fresh');
+            toggleWordPressSetupMode(deploymentOption('MIGRATION') === 1 ? 'migrate' : (selectedMode ? selectedMode.value : 'fresh'));
         }
         drawer.scrollIntoView({behavior:'smooth', block:'start'});
     } catch (error) {
         drawer.innerHTML = '<div class="notice error">' + escapeHtml(error && error.message ? error.message : 'Could not load the application installer.') + '</div>';
+        const retry = document.createElement('button'); retry.type='button'; retry.textContent='Retry loading installer'; retry.onclick=()=>openAppInstaller(app); drawer.appendChild(retry);
     }
 }
 
@@ -6029,6 +6364,7 @@ async function submitAppInstaller(event) {
         const data = new FormData(form);
         if (event.submitter && event.submitter.name) data.set(event.submitter.name, event.submitter.value);
         const response = await fetch(base + joiner + 'install=' + encodeURIComponent(app), {method:'POST',body:data,credentials:'same-origin',headers:{'X-Requested-With':'XMLHttpRequest'}});
+        if (!response.ok) { const denial = await response.json().catch(()=>({})); showWizardNotice(denial.message || 'Request rejected.', true); return; }
         const html = await response.text();
         const doc = new DOMParser().parseFromString(html,'text/html');
         const returnedState = readWizardStateFrom(doc);
@@ -6063,7 +6399,7 @@ async function submitAppInstaller(event) {
             initializeDynamicControls(drawer);
             if (app === 'wordpress') {
                 const selectedMode = drawer.querySelector('input[name="wordpress_setup_mode"]:checked');
-                toggleWordPressSetupMode(selectedMode ? selectedMode.value : 'fresh');
+                toggleWordPressSetupMode(deploymentOption('MIGRATION') === 1 ? 'migrate' : (selectedMode ? selectedMode.value : 'fresh'));
             }
         }
     } catch (error) {
@@ -6089,12 +6425,12 @@ function decorateBackupGrid(grid) {
     const ordered = [sql, kopia, replication, updates].filter(Boolean);
     ordered.forEach((section) => section.remove());
     const phase1 = document.createElement('div'); phase1.className='backup-phase'; phase1.innerHTML='<strong>1. Save the backup schedule</strong><span>Set SQL dump timing and retention before Kopia snapshots are configured.</span>';
-    grid.prepend(phase1);
+    if (sql) grid.prepend(phase1);
     if (sql) phase1.after(sql);
     if (kopia) {
-        const scheduleReady = !!everlompWizardState.backupScheduleConfigured || wizardDecision('backup-schedule-decided');
-        const phase2 = document.createElement('div'); phase2.className='backup-phase'; phase2.innerHTML='<strong>2. Install & configure Kopia</strong><span>Create encrypted snapshot storage, policies, and optional replication.</span>';
-        (sql || phase1).after(phase2); phase2.after(kopia);
+        const scheduleReady = deploymentOption('SQLBACKUP') === 0 || !!everlompWizardState.backupScheduleConfigured || wizardDecision('backup-schedule-decided');
+        const phase2 = document.createElement('div'); phase2.className='backup-phase'; phase2.innerHTML='<strong>'+(sql?'2':'1')+'. Install & configure Kopia</strong><span>Create encrypted snapshot storage, policies, and optional replication.</span>';
+        if (sql) sql.after(phase2); else grid.prepend(phase2); phase2.after(kopia);
         if (replication) kopia.after(replication);
         if (updates && !!everlompWizardState.kopia && !kopiaInstallInProgress) { const phase3=document.createElement('div'); phase3.className='backup-phase'; phase3.innerHTML='<strong>3. Optional Kopia maintenance</strong><span>Choose automatic source-update behavior after installation.</span>'; (replication || kopia).after(phase3); phase3.after(updates); } else if (updates) { updates.remove(); }
         if (!scheduleReady) {
@@ -6179,6 +6515,7 @@ async function submitBackupForm(event) {
         }
         if (!error && submittedAction === 'save_sql_backup_settings') {
             everlompWizardState.backupScheduleConfigured = true;
+            everlompWizardState.sqlEnabled = data.get('sql_enabled') === '1' || deploymentOption('SQLBACKUP') === 1;
             setWizardDecision('backup-schedule-decided');
         }
         if (!error && submittedAction === 'configure_kopia') {
@@ -6433,6 +6770,28 @@ function downloadHotPocketContractFromSelect(id) {
 }
 
 function initializeDynamicControls(root = document) {
+    const fixed = (selector, value, hide=true) => {
+        root.querySelectorAll(selector).forEach(input => {
+            if (input.type === 'checkbox') input.checked = !!value;
+            else if (input.type === 'radio') input.checked = input.value === String(value);
+            if (hide) { const label = input.closest('label'); if (label) label.style.display='none'; }
+        });
+    };
+    if (deploymentOption('SQLBACKUP') === 1) fixed('input[name="sql_enabled"]',true);
+    if (deploymentOption('REPLICATION') === 1) fixed('input[name="kopia_offsite_enabled"]',true);
+    if (deploymentOption('LOCAL') !== undefined) {
+        const local = deploymentOption('LOCAL') === 1;
+        fixed('input[name="local_file_only"], input[name="kopia_install_local_version"]',local);
+        fixed('input[name="drupal_installer_source"]',local?'local':'standard');
+        root.querySelectorAll('button[name="filegator_source"]').forEach(button=>{ if (button.value !== (local?'local':'remote')) button.style.display='none'; });
+        if (local) root.querySelectorAll('input[name="wp_themes[]"],input[name="wp_plugins[]"]').forEach(input=>{
+            const addon=input.closest('.addon-option');
+            if (!addon) return;
+            const source=addon.querySelector('input[name="wp_theme_install_local[]"],input[name="wp_plugin_install_local[]"]');
+            if (!source) { input.checked=false; input.disabled=true; } else { source.checked=input.checked; const label=source.closest('label'); if(label) label.style.display='none'; }
+        });
+    }
+
     initializeHotPocketSiteDirectoryChoosers(root);
     const repositoryMode = root.querySelector ? root.querySelector('#kopia-repository-mode') : null;
     if (repositoryMode) updateKopiaRepositoryMode(repositoryMode);
@@ -6466,7 +6825,9 @@ function initializeEverlompWizard() {
     const maxAllowed = wizardMaxAllowedStep();
     if (stored > maxAllowed) stored = maxAllowed;
     if (stored < Number(state.suggestedStep || 1)) stored = Math.min(Number(state.suggestedStep || 1), maxAllowed);
+    initializeDynamicControls(document);
     showWizardStep(stored, true);
+    if (state.terms && (!state.realIp || !state.domainOnly)) startWizardRealIpCheck();
 }
 
 document.addEventListener('input', (event) => {
@@ -6768,6 +7129,9 @@ async function pollEverlompKeyRestart() {
     everlompKeyPollTimer=setTimeout(pollEverlompKeyRestart, 3000);
 }
 
+<?php if (deploymentChoice('ENCRYPTION') === 1 && $keyMode === 'undecided' && !$keyValid): ?>
+document.addEventListener('DOMContentLoaded', () => { prepareEverlompKeyMode(); });
+<?php endif; ?>
 if (everlompInitialKeyStatus.mode === 'pending' || (everlompInitialKeyStatus.mode === 'enabled' && !everlompInitialKeyStatus.key_valid)) {
     document.addEventListener('DOMContentLoaded', () => { everlompKeyPollTimer=setTimeout(pollEverlompKeyRestart, 1000); });
 }
